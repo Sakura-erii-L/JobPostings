@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JobPostings</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "Microsoft YaHei", sans-serif; background: #f5f7fb; color: #172033; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    .shell { min-height: 100vh; display: flex; }
+    aside { width: 240px; padding: 28px 18px; background: linear-gradient(180deg, #111936, #1e2a58); color: #fff; }
+    .brand { font-weight: 800; font-size: 22px; letter-spacing: .5px; margin: 0 12px 35px; }
+    nav button { width: 100%; display: block; border: 0; background: transparent; color: #cbd3ef; padding: 13px 14px; border-radius: 12px; text-align: left; cursor: pointer; font-size: 14px; margin: 4px 0; }
+    nav button.active, nav button:hover { color: #fff; background: rgba(255,255,255,.13); }
+    main { flex: 1; padding: 34px clamp(20px, 5vw, 70px); max-width: 1500px; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }
+    h1 { margin: 0 0 8px; font-size: 30px; }
+    .muted { color: #71809b; font-size: 13px; }
+    .actions { display:flex; gap: 10px; }
+    button, input, textarea, select { font: inherit; }
+    .button { border: 0; border-radius: 10px; padding: 10px 15px; cursor: pointer; background: #315cf5; color: #fff; font-weight: 600; }
+    .button.secondary { background: #e8edff; color: #3150bd; }
+    .button.danger { background: #ffe6e8; color: #b2293a; }
+    .stats { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px; }
+    .stat, .card, .panel { background: #fff; border: 1px solid #e9edf5; box-shadow: 0 8px 26px rgba(36,54,92,.05); border-radius: 16px; }
+    .stat { padding: 18px; } .stat b { display:block; font-size: 28px; margin-top: 8px; }
+    .toolbar { display:flex; gap: 10px; margin-bottom: 17px; } .toolbar input { flex:1; }
+    input, textarea, select { border: 1px solid #dce3f0; border-radius: 10px; padding: 11px 12px; outline: none; background: #fff; }
+    input:focus, textarea:focus, select:focus { border-color:#6380f7; box-shadow: 0 0 0 3px #e9edff; }
+    .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+    .card { padding: 20px; cursor:pointer; transition: transform .15s, box-shadow .15s; } .card:hover { transform: translateY(-2px); box-shadow: 0 12px 30px rgba(36,54,92,.12); }
+    .card h3 { margin:0 0 8px; } .card p { line-height:1.6; color:#53627b; min-height:48px; }
+    .tags { display:flex; gap:6px; flex-wrap:wrap; } .tag { padding: 4px 8px; color:#4963c9; background:#edf1ff; border-radius: 99px; font-size:12px; }
+    .empty { padding: 55px; text-align:center; color:#8390a7; }
+    .panel { padding: 22px; margin-bottom: 18px; } .panel h2 { margin-top:0; }
+    .row { display:flex; align-items:center; justify-content:space-between; padding: 13px 0; border-bottom:1px solid #edf0f6; gap: 12px; } .row:last-child { border-bottom:0; }
+    .job-title { font-weight:700; } .job-meta { color:#70809b; font-size:13px; margin-top:5px; }
+    .toast { position:fixed; right:24px; bottom:24px; background:#172033; color:#fff; padding:13px 16px; border-radius:10px; display:none; }
+    @media(max-width:800px){ aside{width:72px;padding:18px 8px}.brand{font-size:0;margin:0 8px 28px}.brand:after{content:'JP';font-size:20px}.stats{grid-template-columns:repeat(2,1fr)} main{padding:25px 16px}nav button{font-size:0;text-align:center}nav button:before{content:'•';font-size:22px}}
+  </style>
+</head>
+<body>
+<div id="app"></div><div class="toast" id="toast"></div>
+<script>
+const state = { user:null, page:'companies', companies:[], jobs:[], query:'', selected:null };
+const api = async (path, options={}) => { const res=await fetch('/api/v1'+path,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options}); if(!res.ok) throw new Error((await res.json().catch(()=>({}))).detail||res.statusText); return res.json(); };
+const esc = s => String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const toast = s => { const el=document.getElementById('toast'); el.textContent=s; el.style.display='block'; setTimeout(()=>el.style.display='none',2800); };
+async function load(){ try{ state.user=(await api('/auth/me')).user; await loadData(); render(); const es=new EventSource('/api/v1/events'); es.onmessage=()=>loadData().then(render); es.addEventListener('job.created',()=>loadData().then(render)); } catch(e){ renderLogin(); } }
+async function loadData(){ [state.companies,state.jobs]=await Promise.all([api('/companies?q='+encodeURIComponent(state.query)),api('/jobs')]); }
+function renderLogin(){ document.getElementById('app').innerHTML=`<main style="max-width:500px;margin:12vh auto"><div class="panel"><h1>JobPostings</h1><p class="muted">本机招聘信息聚合与求职管理</p><input id="email" placeholder="邮箱" style="width:100%;margin:16px 0"><button class="button" onclick="sendCode()">发送验证码</button><div id="codebox"></div></div></main>`; }
+async function sendCode(){ try{ const email=document.getElementById('email').value; const r=await api('/auth/request-code',{method:'POST',body:JSON.stringify({email})}); document.getElementById('codebox').innerHTML=`<input id="code" placeholder="6位验证码" style="width:100%;margin:16px 0"><button class="button" onclick="verifyCode('${r.challenge_id}')">登录</button>`+(r.debug_code?`<p class="muted">开发验证码：${r.debug_code}</p>`:''); }catch(e){toast(e.message)} }
+async function verifyCode(id){ try{await api('/auth/verify-code',{method:'POST',body:JSON.stringify({challenge_id:id,code:document.getElementById('code').value})}); location.reload();}catch(e){toast(e.message)} }
+function nav(){return `<nav><button class="${state.page==='companies'?'active':''}" onclick="state.page='companies';render()">企业与岗位</button><button class="${state.page==='applications'?'active':''}" onclick="state.page='applications';render()">求职进度</button><button class="${state.page==='import'?'active':''}" onclick="state.page='import';render()">导入信息</button><button onclick="location.href='/docs'">API 文档</button></nav>`}
+function render(){ document.getElementById('app').innerHTML=`<div class="shell"><aside><div class="brand">JobPostings</div>${nav()}</aside><main>${state.page==='companies'?companiesPage():state.page==='applications'?applicationsPage():importPage()}</main></div>`; }
+function companiesPage(){return `<header><div><h1>企业与岗位</h1><div class="muted">一家公司一张卡片，点击查看岗位、来源和版本</div></div><div class="actions"><button class="button secondary" onclick="syncNow()">立即同步</button></div></header><section class="stats"><div class="stat"><span class="muted">企业</span><b>${state.companies.length}</b></div><div class="stat"><span class="muted">岗位</span><b>${state.jobs.length}</b></div><div class="stat"><span class="muted">有效岗位</span><b>${state.jobs.filter(x=>x.status==='active').length}</b></div><div class="stat"><span class="muted">待处理模型任务</span><b>—</b></div></section><div class="toolbar"><input value="${esc(state.query)}" placeholder="搜索企业、岗位、地点" onkeydown="if(event.key==='Enter'){state.query=this.value;loadData().then(render)}"><button class="button" onclick="state.query=document.querySelector('.toolbar input').value;loadData().then(render)">搜索</button></div><section class="grid">${state.companies.length?state.companies.map(companyCard).join(''):`<div class="panel empty" style="grid-column:1/-1">还没有招聘信息。请先在“导入信息”中粘贴文字，或在设置中连接 TraceMemo。</div>`}</section>`}
+function companyCard(c){return `<article class="card" onclick="openCompany('${c.id}')"><h3>${esc(c.display_name)}</h3><div class="tags"><span class="tag">${esc(c.primary_industry)}</span><span class="tag">${c.job_count||0} 个岗位</span></div><p>${esc(c.summary||'企业介绍将在联网检索或审核后补充。')}</p><div class="muted">更新于 ${esc(c.updated_at||'')}</div></article>`}
+async function openCompany(id){state.selected=await api('/companies/'+id);document.getElementById('app').innerHTML=`<main><button class="button secondary" onclick="render()">← 返回企业列表</button><header style="margin-top:22px"><div><h1>${esc(state.selected.display_name)}</h1><div class="muted">${esc(state.selected.primary_industry)} · ${state.selected.jobs.length} 个岗位</div></div></header><div class="panel"><h2>企业概览</h2><p>${esc(state.selected.summary||'暂无企业介绍')}</p><div class="tags">${(state.selected.aliases||[]).map(x=>`<span class="tag">${esc(x)}</span>`).join('')}</div></div><div class="panel"><h2>岗位</h2>${state.selected.jobs.length?state.selected.jobs.map(j=>`<div class="row"><div><div class="job-title">${esc(j.canonical_title)}</div><div class="job-meta">${esc(j.recruitment_type)} · ${esc(j.status)} · ${esc((j.locations||[]).join('、'))}</div></div><button class="button secondary" onclick="event.stopPropagation();changeState('${j.id}')">标记进度</button></div>`).join(''):'<div class="empty">暂无岗位</div>'}</div></main>`}
+async function changeState(id){try{await api('/me/jobs/'+id+'/state',{method:'PUT',body:JSON.stringify({state:'interested',favorite:true})});toast('已加入关注');}catch(e){toast('需要登录或权限不足')}}
+async function syncNow(){try{const r=await api('/admin/sync',{method:'POST'});toast(`同步完成：${r.fetched} 条`);await loadData();render()}catch(e){toast(e.message)}}
+function applicationsPage(){return `<header><div><h1>求职进度</h1><div class="muted">管理收藏、投递和面试时间线</div></div></header><div class="panel"><p class="muted">登录后收藏的岗位会出现在这里。</p></div>`}
+function importPage(){return `<header><div><h1>导入信息</h1><div class="muted">粘贴群消息或公开招聘链接，系统会进入统一处理队列</div></div></header><div class="panel"><h2>粘贴文字</h2><textarea id="importText" rows="9" style="width:100%" placeholder="粘贴招聘群消息……"></textarea><button class="button" style="margin-top:12px" onclick="submitText()">加入处理队列</button></div><div class="panel"><h2>公开链接</h2><input id="importUrl" placeholder="https://example.com/recruitment" style="width:100%"><button class="button" style="margin-top:12px" onclick="submitUrl()">抓取并加入队列</button></div>`}
+async function submitText(){try{await api('/imports/text',{method:'POST',body:JSON.stringify({text:document.getElementById('importText').value})});toast('已加入处理队列');document.getElementById('importText').value=''}catch(e){toast(e.message)}}
+async function submitUrl(){try{await api('/imports/url',{method:'POST',body:JSON.stringify({url:document.getElementById('importUrl').value})});toast('链接已加入处理队列')}catch(e){toast(e.message)}}
+load();
+</script>
+</body>
+</html>
+

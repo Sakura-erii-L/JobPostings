@@ -1,0 +1,42 @@
+[project]
+name = "jobpostings"
+version = "0.1.0"
+description = "Local-first recruitment information aggregation and job application tracker"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+  "httpx>=0.27,<1",
+  "python-multipart>=0.0.9,<1",
+  "cryptography>=43,<46",
+  "openpyxl>=3.1,<4",
+  "beautifulsoup4>=4.12,<5",
+  "email-validator>=2.1,<3",
+]
+
+[project.optional-dependencies]
+documents = [
+  "PyMuPDF>=1.24,<2",
+  "python-docx>=1.1,<2",
+  "rapidocr-onnxruntime>=1.0,<2",
+  "opencv-python-headless>=4.10,<5",
+]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.23,<1",
+  "httpx>=0.27,<1",
+]
+desktop = [
+  "pystray>=0.19,<1",
+  "pyinstaller>=6.10,<7",
+]
+
+[project.scripts]
+jobpostings = "app.main:run"
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["tests"]
+asyncio_mode = "auto"

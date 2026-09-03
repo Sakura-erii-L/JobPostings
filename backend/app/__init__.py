@@ -1,0 +1,2 @@
+"""JobPostings application package."""
+
