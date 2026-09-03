@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .catalog import apply_model_item
 from .db import connect, one, utc_now
-from .model_provider import classify_messages
+from .model_provider import classify_messages, get_setting
 from .parsers import extract_file, fetch_public_url, parse_message_payload, sha256_bytes
 
 
@@ -20,7 +20,7 @@ def message_hash(connector_id: str | None, group_id: str | None, message: dict[s
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def save_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: str | None = None) -> dict[str, Any]:
+def save_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: str | None = None, parsed: dict[str, Any] | None = None) -> dict[str, Any]:
     digest = sha256_bytes(data)
     from .config import config
 
@@ -28,7 +28,7 @@ def save_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: st
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
         target.write_bytes(data)
-    parsed = extract_file(filename, data)
+    parsed = parsed or extract_file(filename, data)
     with connect() as connection:
         artifact_id = str(uuid4())
         try:
@@ -42,6 +42,27 @@ def save_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: st
     return {"id": artifact_id, "sha256": digest, "path": str(target), **parsed}
 
 
+def attach_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: str | None = None) -> dict[str, Any]:
+    artifact = save_artifact(raw_message_id, filename, data, mime_type)
+    with connect() as connection:
+        raw = connection.execute("SELECT text_content,metadata_json FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone()
+        old_text = raw["text_content"] if raw else ""
+        extracted = artifact.get("text", "")
+        merged = "\n".join(value for value in (old_text, extracted) if value).strip()
+        metadata = {}
+        if raw:
+            try:
+                metadata = json.loads(raw["metadata_json"] or "{}")
+            except json.JSONDecodeError:
+                pass
+        metadata["artifact_id"] = artifact["id"]
+        connection.execute(
+            "UPDATE raw_messages SET text_content=?,metadata_json=? WHERE id=?",
+            (merged, json.dumps(metadata, ensure_ascii=False), raw_message_id),
+        )
+    return artifact
+
+
 def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: str | None) -> str | None:
     text, metadata = parse_message_payload(message)
     digest = message_hash(connector_id, group_id, message)
@@ -49,7 +70,11 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
     external_id = str(message.get("id") or message.get("messageId") or "") or None
     sent_at = str(message.get("sent_at") or message.get("time") or message.get("timestamp") or utc_now())
     raw_id = str(uuid4())
-    retention = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat(timespec="seconds")
+    try:
+        retention_days = max(1, int(get_setting("ordinary_retention_days", 30)))
+    except (TypeError, ValueError):
+        retention_days = 30
+    retention = (datetime.now(timezone.utc) + timedelta(days=retention_days)).isoformat(timespec="seconds")
     with connect() as connection:
         existing = connection.execute("SELECT id FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
         if existing:
@@ -72,8 +97,8 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
 def process_one_batch(limit: int = 100) -> dict[str, Any] | None:
     with connect() as connection:
         rows = connection.execute(
-            "SELECT p.id AS processing_id, r.* FROM processing_jobs p JOIN raw_messages r ON r.id=p.raw_message_id WHERE p.kind='classify' AND p.status='pending' ORDER BY p.created_at LIMIT ?",
-            (limit,),
+            "SELECT p.id AS processing_id, r.* FROM processing_jobs p JOIN raw_messages r ON r.id=p.raw_message_id WHERE p.kind='classify' AND (p.status='pending' OR (p.status='running' AND p.lease_until<?)) ORDER BY p.created_at LIMIT ?",
+            (utc_now(), limit),
         ).fetchall()
         if not rows:
             return None
@@ -129,7 +154,8 @@ def process_one_batch(limit: int = 100) -> dict[str, Any] | None:
 def process_one_enrichment() -> dict[str, Any] | None:
     with connect() as connection:
         row = connection.execute(
-            "SELECT p.id AS processing_id, p.raw_message_id FROM processing_jobs p WHERE p.kind='enrich_company' AND p.status='pending' ORDER BY p.created_at LIMIT 1"
+            "SELECT p.id AS processing_id, p.raw_message_id FROM processing_jobs p WHERE p.kind='enrich_company' AND (p.status='pending' OR (p.status='running' AND p.lease_until<?)) ORDER BY p.created_at LIMIT 1",
+            (utc_now(),),
         ).fetchone()
         if not row:
             return None
@@ -161,3 +187,21 @@ def import_text(text: str, source_group_id: str | None = None, metadata: dict[st
 def import_url(url: str, source_group_id: str | None = None) -> str | None:
     parsed = fetch_public_url(url)
     return ingest_message({"type": "article", "text": parsed.get("text", ""), "url": parsed.get("url", url), "title": parsed.get("title", "")}, "manual", source_group_id)
+
+
+def import_file(filename: str, data: bytes, mime_type: str | None = None, source_group_id: str | None = None) -> dict[str, Any]:
+    parsed = extract_file(filename, data)
+    raw_id = ingest_message(
+        {"type": "file", "text": parsed.get("text", ""), "filename": filename, "mime_type": mime_type, "qr_values": parsed.get("qr_values", [])},
+        "manual",
+        source_group_id,
+    )
+    if not raw_id:
+        raise RuntimeError("Unable to create import record")
+    artifact = save_artifact(raw_id, filename, data, mime_type, parsed=parsed)
+    with connect() as connection:
+        connection.execute(
+            "UPDATE raw_messages SET metadata_json=? WHERE id=?",
+            (json.dumps({"filename": filename, "mime_type": mime_type, "artifact_id": artifact["id"], "qr_values": parsed.get("qr_values", [])}, ensure_ascii=False), raw_id),
+        )
+    return {"raw_message_id": raw_id, "artifact": artifact}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +22,7 @@ from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
-from .processing import import_text, import_url, ingest_message, process_one_batch, process_one_enrichment, save_artifact
+from .processing import attach_artifact, import_file, import_text, import_url, ingest_message, process_one_batch, process_one_enrichment
 from .security import SecretVault, hash_value, token
 from .tracememo import TraceMemoClient
 
@@ -126,6 +127,63 @@ async def retention_loop() -> None:
         await asyncio.sleep(3600)
 
 
+async def notification_loop() -> None:
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            rows = all_rows(
+                "SELECT s.user_id,j.id,j.canonical_title,j.explicit_deadline,c.display_name FROM user_job_states s JOIN jobs j ON j.id=s.job_id JOIN companies c ON c.id=j.company_id WHERE s.favorite=1 AND j.explicit_deadline IS NOT NULL AND j.explicit_deadline>=? AND j.explicit_deadline<=?",
+                (now.date().isoformat(), (now + timedelta(days=7)).date().isoformat()),
+            )
+            with connect() as connection:
+                for row in rows:
+                    day = str(row["explicit_deadline"])
+                    try:
+                        days_left = (datetime.fromisoformat(day).date() - now.date()).days
+                    except ValueError:
+                        continue
+                    if days_left not in {7, 3, 1}:
+                        continue
+                    kind = f"deadline_d{days_left}"
+                    exists = connection.execute("SELECT id FROM notifications WHERE user_id=? AND kind=? AND body LIKE ?", (row["user_id"], kind, f"%{row['id']}%" )).fetchone()
+                    if not exists:
+                        connection.execute("INSERT INTO notifications(id,user_id,kind,title,body,created_at) VALUES(?,?,?,?,?,?)", (str(uuid4()), row["user_id"], kind, f"收藏岗位将在 D-{days_left} 截止", f"{row['canonical_title']}（{row['id']}）截止日期：{day}。", utc_now()))
+        except Exception:
+            pass
+        await asyncio.sleep(3600)
+
+
+async def auto_backup_loop() -> None:
+    last_run_day = ""
+    while True:
+        try:
+            backup = _setting_value("backup", {}) or {}
+            schedule = str(backup.get("schedule", "02:00"))
+            local_now = datetime.now()
+            day_key = local_now.strftime("%Y-%m-%d")
+            try:
+                scheduled_at = datetime.strptime(schedule, "%H:%M").replace(
+                    year=local_now.year, month=local_now.month, day=local_now.day
+                )
+            except ValueError:
+                raise RuntimeError("Backup schedule must use HH:MM")
+            if backup.get("enabled") and last_run_day != day_key:
+                latest = one("SELECT created_at FROM backups WHERE status='succeeded' ORDER BY created_at DESC LIMIT 1")
+                if latest:
+                    try:
+                        if datetime.fromisoformat(latest["created_at"]).astimezone().date().isoformat() == day_key:
+                            last_run_day = day_key
+                    except ValueError:
+                        pass
+            if backup.get("enabled") and local_now >= scheduled_at and last_run_day != day_key:
+                last_run_day = day_key
+                result = await asyncio.to_thread(create_backup)
+                await events.publish("backup.completed", result)
+        except Exception as exc:
+            await events.publish("backup.failed", {"error": str(exc)})
+        await asyncio.sleep(30)
+
+
 def _setting_value(key: str, default: Any) -> Any:
     row = one("SELECT value_json FROM system_settings WHERE key=?", (key,))
     if not row:
@@ -152,8 +210,18 @@ def sync_tracememo_once() -> dict[str, Any]:
         else:
             start = end - timedelta(days=int(_setting_value("initial_import_days", 30)))
         for message in client.messages(group["external_id"], start, end):
-            if ingest_message(message, row["id"], group["id"]):
+            raw_id = ingest_message(message, row["id"], group["id"])
+            if raw_id:
                 fetched += 1
+                message_type = str(message.get("type") or message.get("msgType") or "").lower()
+                media_id = str(message.get("media_id") or message.get("mediaId") or message.get("attachment_id") or (message.get("id") if message_type in {"image", "file", "attachment", "picture", "document"} else "") or "")
+                if media_id and message_type in {"image", "file", "attachment", "picture", "document"}:
+                    try:
+                        media, suggested_name = client.media(media_id)
+                        filename = str(message.get("filename") or message.get("fileName") or suggested_name or f"{media_id}.bin")
+                        attach_artifact(raw_id, filename, media, message.get("mime_type") or message.get("mimeType"))
+                    except Exception:
+                        pass
         with connect() as connection:
             connection.execute("INSERT OR REPLACE INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)", (group["id"], end.isoformat(), None, utc_now()))
     return {"status": "completed", "fetched": fetched, "groups": len(groups)}
@@ -180,7 +248,9 @@ async def lifespan(app: FastAPI):
     task1 = asyncio.create_task(worker_loop())
     task2 = asyncio.create_task(retention_loop())
     task3 = asyncio.create_task(auto_sync_loop())
-    background_tasks.update({task1, task2, task3})
+    task4 = asyncio.create_task(notification_loop())
+    task5 = asyncio.create_task(auto_backup_loop())
+    background_tasks.update({task1, task2, task3, task4, task5})
     yield
     for task in background_tasks:
         task.cancel()
@@ -369,7 +439,15 @@ def update_tracememo(body: dict[str, Any], _: dict[str, Any] = Depends(require_a
     connector_id = one("SELECT id FROM connectors WHERE kind='tracememo'")
     cid = connector_id["id"] if connector_id else str(uuid4())
     vault = SecretVault()
-    safe_config = {"token": vault.encrypt(body.get("token", "")) if body.get("token") else ""}
+    previous_config: dict[str, Any] = {}
+    if connector_id:
+        previous = one("SELECT config_json FROM connectors WHERE id=?", (cid,))
+        if previous:
+            try:
+                previous_config = json.loads(previous["config_json"] or "{}")
+            except json.JSONDecodeError:
+                previous_config = {}
+    safe_config = {"token": vault.encrypt(str(body["token"])) if body.get("token") else previous_config.get("token", "")}
     with connect() as connection:
         connection.execute("INSERT OR REPLACE INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)", (cid, "tracememo", base_url, int(bool(body.get("enabled", True))), json.dumps(safe_config), utc_now()))
     return {"id": cid, "kind": "tracememo", "base_url": base_url, "enabled": bool(body.get("enabled", True))}
@@ -414,6 +492,9 @@ def tracememo_groups(_: dict[str, Any] = Depends(require_admin)) -> list[dict[st
 
 @app.put("/api/v1/admin/source-groups")
 def select_groups(body: GroupSelection, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    selected_count = sum(1 for group in body.groups if group.get("selected"))
+    if selected_count > 20:
+        raise HTTPException(400, "At most 20 recruitment groups can be selected")
     with connect() as connection:
         for group in body.groups:
             connection.execute("UPDATE source_groups SET selected=?,enabled=?,updated_at=? WHERE id=?", (int(bool(group.get("selected", False))), int(bool(group.get("enabled", True))), utc_now(), group["id"]))
@@ -447,20 +528,14 @@ async def import_file_endpoint(file: UploadFile = File(...), _: dict[str, Any] =
     data = await file.read()
     if len(data) > 50 * 1024 * 1024:
         raise HTTPException(413, "File is larger than 50 MB")
-    raw_id = import_text(f"附件：{file.filename}", metadata={"filename": file.filename, "mime_type": file.content_type})
-    if raw_id:
-        artifact = save_artifact(raw_id, file.filename or "upload.bin", data, file.content_type)
-        with connect() as connection:
-            connection.execute(
-                "UPDATE raw_messages SET text_content=?,metadata_json=? WHERE id=?",
-                (artifact.get("text", ""), json.dumps({"filename": file.filename, "mime_type": file.content_type, "artifact_id": artifact["id"], "qr_values": artifact.get("qr_values", [])}, ensure_ascii=False), raw_id),
-            )
-        return {"raw_message_id": raw_id, "artifact": artifact}
-    raise HTTPException(500, "Unable to create import record")
+    try:
+        return import_file(file.filename or "upload.bin", data, file.content_type)
+    except Exception as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/v1/companies")
-def companies(q: str | None = None, industry: str | None = None, _: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
+def companies(q: str | None = None, industry: str | None = None, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> list[dict[str, Any]]:
     params: list[Any] = []
     sql = "SELECT c.*, COUNT(j.id) AS job_count FROM companies c LEFT JOIN jobs j ON j.company_id=c.id WHERE 1=1"
     if q:
@@ -481,7 +556,7 @@ def companies(q: str | None = None, industry: str | None = None, _: dict[str, An
 
 
 @app.get("/api/v1/companies/{company_id}")
-def company_detail(company_id: str, _: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> dict[str, Any]:
     company = one("SELECT * FROM companies WHERE id=?", (company_id,))
     if not company:
         raise HTTPException(404, "Company not found")
@@ -503,7 +578,7 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_user)) -
 
 
 @app.get("/api/v1/jobs")
-def jobs(q: str | None = None, state: str | None = None, _: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
+def jobs(q: str | None = None, state: str | None = None, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> list[dict[str, Any]]:
     params: list[Any] = []
     sql = "SELECT j.*, c.display_name AS company_name FROM jobs j JOIN companies c ON c.id=j.company_id WHERE 1=1"
     if q:
@@ -652,8 +727,8 @@ def validate_backup(body: BackupValidationRequest, _: dict[str, Any] = Depends(r
 
 @app.get("/api/v1/exports/download/{filename}")
 def download_export(filename: str, _: dict[str, Any] = Depends(require_user)) -> FileResponse:
-    path = (config.export_dir / filename).resolve()
-    if path.parent != config.export_dir.resolve() or not path.exists():
+    path = (config.download_dir / filename).resolve()
+    if path.parent != config.download_dir.resolve() or not path.exists():
         raise HTTPException(404, "Export not found")
     return FileResponse(path)
 
@@ -688,17 +763,31 @@ async def event_stream(_: dict[str, Any] = Depends(require_user)) -> StreamingRe
     return StreamingResponse(events.stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+def _runtime_path(*parts: str) -> Path:
+    roots = [Path(__file__).resolve().parents[2]]
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        roots.append(Path(bundle_root))
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+    for root in roots:
+        candidate = root.joinpath(*parts)
+        if candidate.exists():
+            return candidate
+    return roots[0].joinpath(*parts)
+
+
 STATIC_DIR = Path(__file__).parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-DIST_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+DIST_DIR = _runtime_path("frontend", "dist")
 if (DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="frontend-assets")
 
 
 @app.get("/{path:path}", response_class=HTMLResponse, response_model=None)
 def frontend(path: str = "") -> HTMLResponse | FileResponse:
-    dist_index = Path(__file__).resolve().parents[2] / "frontend" / "dist" / "index.html"
+    dist_index = DIST_DIR / "index.html"
     if dist_index.exists():
         return FileResponse(dist_index)
     fallback = STATIC_DIR / "index.html"

@@ -11,7 +11,7 @@ from .db import connect, utc_now
 
 
 def export_jobs(fmt: str, user_id: str | None = None) -> Path:
-    config.export_dir.mkdir(parents=True, exist_ok=True)
+    config.download_dir.mkdir(parents=True, exist_ok=True)
     with connect() as connection:
         rows = connection.execute(
             "SELECT c.display_name AS company_name, c.primary_industry, j.* "
@@ -27,7 +27,7 @@ def export_jobs(fmt: str, user_id: str | None = None) -> Path:
                 except json.JSONDecodeError:
                     value[key[:-5]] = value.pop(key)
         records.append(value)
-    path = config.export_dir / f"jobs-{utc_now().replace(':', '-')}-{uuid4().hex[:6]}.{fmt}"
+    path = config.download_dir / f"jobs-{utc_now().replace(':', '-')}-{uuid4().hex[:6]}.{fmt}"
     if fmt == "json":
         path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
     elif fmt == "csv":
@@ -51,4 +51,3 @@ def export_jobs(fmt: str, user_id: str | None = None) -> Path:
     else:
         raise ValueError("format must be xlsx, csv or json")
     return path
-

@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react'
+import { createRoot } from 'react-dom/client'
 import './styles.css'
 
 type User = { id: string; email: string; role: string }
@@ -6,6 +7,8 @@ type Company = { id: string; display_name: string; summary?: string; primary_ind
 type Job = { id: string; canonical_title: string; recruitment_type: string; employment_type: string; status: string; locations_json?: string; locations?: string[]; company_name?: string; updated_at?: string }
 type Application = Job & { state: string; favorite: number; updated_at: string }
 type CompanyDetail = Company & { aliases: string[]; jobs: Job[]; evidences: { source_url?: string; source_type: string; excerpt?: string }[] }
+type Notification = { id: string; title: string; body: string; read_at?: string | null }
+type ReviewItem = { id: string; kind: string; entity_type?: string; entity_id?: string; payload: Record<string, any> }
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isForm = options.body instanceof FormData
@@ -25,23 +28,26 @@ function App() {
   const [initialized, setInitialized] = useState<boolean | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [page, setPage] = useState<'companies' | 'applications' | 'import' | 'settings'>('companies')
+  const [page, setPage] = useState<'companies' | 'applications' | 'import' | 'settings' | 'review'>('companies')
   const [companies, setCompanies] = useState<Company[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [applications, setApplications] = useState<Application[]>([])
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<CompanyDetail | null>(null)
   const [notice, setNotice] = useState('')
+  const [notifications, setNotifications] = useState<Notification[]>([])
 
   const loadData = async () => {
-    const [companyData, jobData, applicationData] = await Promise.all([
+    const [companyData, jobData, applicationData, notificationData] = await Promise.all([
       api<Company[]>(`/companies?q=${encodeURIComponent(query)}`),
       api<Job[]>('/jobs'),
       api<Application[]>('/me/applications'),
+      api<Notification[]>('/notifications'),
     ])
     setCompanies(companyData)
     setJobs(jobData)
     setApplications(applicationData)
+    setNotifications(notificationData)
   }
 
   useEffect(() => {
@@ -85,13 +91,21 @@ function App() {
     try { setSelected(await api<CompanyDetail>(`/companies/${id}`)) }
     catch (e) { setError((e as Error).message) }
   }
-  const updateState = async (jobId: string, state: string, favorite = false) => {
-    try { await api(`/me/jobs/${jobId}/state`, { method: 'PUT', body: JSON.stringify({ state, favorite }) }); flash('求职进度已更新'); await loadData() }
+  const updateState = async (jobId: string, state: string, favorite?: boolean) => {
+    try { await api(`/me/jobs/${jobId}/state`, { method: 'PUT', body: JSON.stringify({ state, ...(favorite === undefined ? {} : { favorite }) }) }); flash('求职进度已更新'); await loadData() }
     catch (e) { setError((e as Error).message) }
   }
   const followCompany = async (companyId: string, followed = true) => {
     try { await api(`/me/companies/${companyId}/follow`, { method: 'PUT', body: JSON.stringify({ followed }) }); flash(followed ? '已关注企业' : '已取消关注') }
     catch (e) { setError((e as Error).message) }
+  }
+  const exportJobs = async (format: 'xlsx' | 'csv' | 'json') => {
+    try { const result = await api<{ download_url: string }>('/exports?fmt=' + format, { method: 'POST' }); window.open(result.download_url, '_blank', 'noopener,noreferrer'); flash('导出文件已生成') }
+    catch (e) { setError((e as Error).message) }
+  }
+  const markNotificationRead = async (id: string) => {
+    await api(`/notifications/${id}/read`, { method: 'POST' })
+    setNotifications(current => current.map(item => item.id === id ? { ...item, read_at: new Date().toISOString() } : item))
   }
 
   return <div className="app-shell">
@@ -103,13 +117,15 @@ function App() {
         <NavButton active={page === 'applications'} onClick={() => { setPage('applications'); setSelected(null) }} icon="✓">求职进度</NavButton>
         <NavButton active={page === 'import'} onClick={() => { setPage('import'); setSelected(null) }} icon="＋">导入信息</NavButton>
         {user.role === 'admin' && <NavButton active={page === 'settings'} onClick={() => { setPage('settings'); setSelected(null) }} icon="⚙">系统设置</NavButton>}
+        {user.role === 'admin' && <NavButton active={page === 'review'} onClick={() => { setPage('review'); setSelected(null) }} icon="!">待审核</NavButton>}
       </nav>
       <div className="sidebar-bottom"><div className="user-avatar">{user.email.slice(0, 1).toUpperCase()}</div><div><strong>{user.email}</strong><small>{user.role === 'admin' ? '管理员' : '受邀用户'}</small></div><button className="logout" onClick={async () => { await api('/auth/logout', { method: 'POST' }); location.reload() }}>↗</button></div>
     </aside>
     <main className="content">
       {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
       {notice && <div className="notice">{notice}</div>}
-      {selected ? <CompanyView company={selected} onBack={() => setSelected(null)} onState={updateState} onFollow={followCompany} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={sync} onOpen={openCompany} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData() }} /> : <SettingsPage onSaved={flash} />}
+      {!selected && notifications.filter(item => !item.read_at).slice(0, 3).map(item => <div className="notification-strip" key={item.id}><div><strong>{item.title}</strong><span>{item.body}</span></div><button onClick={() => markNotificationRead(item.id)}>知道了</button></div>)}
+      {selected ? <CompanyView company={selected} onBack={() => setSelected(null)} onState={updateState} onFollow={followCompany} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={user.role === 'admin' ? sync : undefined} onOpen={openCompany} onExport={exportJobs} onImport={() => setPage('import')} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData() }} /> : page === 'review' ? <ReviewPage onResolved={async () => { flash('审核项已处理'); await loadData() }} /> : <SettingsPage onSaved={flash} />}
     </main>
   </div>
 }
@@ -137,8 +153,8 @@ function Bootstrap({ onLoggedIn }: { onLoggedIn: (user: User) => void }) {
 
 function AuthFrame({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) { return <div className="auth-page"><div className="auth-glow" /><div className="auth-card"><div className="auth-logo"><span className="logo-mark">J</span>JobPostings</div><h1>{title}</h1><p>{subtitle}</p>{children}</div></div> }
 
-function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onSync, onOpen }: { companies: Company[]; jobs: Job[]; query: string; setQuery: (value: string) => void; onSearch: () => void; onSync: () => void; onOpen: (id: string) => void }) {
-  return <><PageHeader eyebrow="招聘知识库" title="企业与岗位" description="把分散在群聊、公众号和文件里的招聘信息，整理成可以行动的机会。"><button className="secondary" onClick={onSync}>↻ 立即同步</button><button className="primary" onClick={() => document.querySelector<HTMLInputElement>('.search-input')?.focus()}>＋ 快速导入</button></PageHeader><div className="metrics"><Metric label="企业" value={companies.length} tone="blue" /><Metric label="岗位" value={jobs.length} tone="violet" /><Metric label="有效岗位" value={jobs.filter(j => j.status === 'active').length} tone="green" /><Metric label="最近更新" value={jobs[0]?.updated_at?.slice(5, 10) || '—'} tone="orange" /></div><div className="toolbar"><div className="search"><span>⌕</span><input className="search-input" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && onSearch()} placeholder="搜索企业、岗位、地点或专业" /></div><button className="filter">筛选　⌄</button><button className="filter">排序：最近更新　⌄</button></div>{companies.length ? <div className="company-grid">{companies.map(company => <CompanyCard key={company.id} company={company} onClick={() => onOpen(company.id)} />)}</div> : <EmptyState />}</>
+function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onSync, onOpen, onExport, onImport }: { companies: Company[]; jobs: Job[]; query: string; setQuery: (value: string) => void; onSearch: () => void; onSync?: () => void; onOpen: (id: string) => void; onExport: (format: 'xlsx' | 'csv' | 'json') => void; onImport: () => void }) {
+  return <><PageHeader eyebrow="招聘知识库" title="企业与岗位" description="把分散在群聊、公众号和文件里的招聘信息，整理成可以行动的机会。">{onSync && <button className="secondary" onClick={onSync}>↻ 立即同步</button>}<button className="secondary" onClick={() => onExport('csv')}>导出 CSV</button><button className="secondary" onClick={() => onExport('xlsx')}>导出 Excel</button><button className="primary" onClick={onImport}>＋ 快速导入</button></PageHeader><div className="metrics"><Metric label="企业" value={companies.length} tone="blue" /><Metric label="岗位" value={jobs.length} tone="violet" /><Metric label="有效岗位" value={jobs.filter(j => j.status === 'active').length} tone="green" /><Metric label="最近更新" value={jobs[0]?.updated_at?.slice(5, 10) || '—'} tone="orange" /></div><div className="toolbar"><div className="search"><span>⌕</span><input className="search-input" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && onSearch()} placeholder="搜索企业、岗位、地点或专业" /></div><button className="filter">筛选　⌄</button><button className="filter">排序：最近更新　⌄</button></div>{companies.length ? <div className="company-grid">{companies.map(company => <CompanyCard key={company.id} company={company} onClick={() => onOpen(company.id)} />)}</div> : <EmptyState />}</>
 }
 
 function Metric({ label, value, tone }: { label: string; value: string | number; tone: string }) { return <div className="metric"><div className={`metric-icon ${tone}`}>{tone === 'blue' ? '◈' : tone === 'violet' ? '▣' : tone === 'green' ? '✓' : '◷'}</div><div><small>{label}</small><strong>{value}</strong></div></div> }
@@ -151,10 +167,65 @@ function JobRow({ job, onState }: { job: Job; onState: (id: string, state: strin
 function ApplicationsPage({ applications, onState }: { applications: Application[]; onState: (id: string, state: string, favorite?: boolean) => void }) { const columns = [['interested', '感兴趣'], ['applied', '已投递'], ['interview', '面试中'], ['offer', 'Offer']] as const; return <><PageHeader eyebrow="我的行动" title="求职进度" description="把感兴趣的岗位，从看到变成投递和面试。" /><div className="kanban">{columns.map(([state, title]) => <ApplicationColumn key={state} title={title} state={state} jobs={applications.filter(job => job.state === state)} onState={onState} />)}</div>{!applications.length && <div className="empty-state compact"><div className="empty-icon">✓</div><h3>收藏岗位后，它们会出现在这里</h3><p>在企业详情中点击星标，即可开始记录求职进度。</p></div>}</> }
 function ApplicationColumn({ title, state, jobs, onState }: { title: string; state: string; jobs: Job[]; onState: (id: string, state: string, favorite?: boolean) => void }) { return <div className="kanban-column"><div className="column-head"><strong>{title}</strong><span>{jobs.length}</span></div>{jobs.map(job => <button className="application-card" key={job.id} onClick={() => onState(job.id, state)}><strong>{job.canonical_title}</strong><small>{job.company_name}</small></button>)}<button className="add-card">＋ 添加岗位</button></div> }
 
+function ReviewPage({ onResolved }: { onResolved: () => Promise<void> }) {
+  const [items, setItems] = useState<ReviewItem[]>([])
+  const [message, setMessage] = useState('')
+  const load = async () => {
+    try { setItems(await api<ReviewItem[]>('/admin/review-items')); setMessage('') }
+    catch (e) { setMessage((e as Error).message) }
+  }
+  useEffect(() => { load() }, [])
+  const resolve = async (id: string, action: 'resolved' | 'rejected') => {
+    try { await api(`/admin/review-items/${id}/resolve`, { method: 'POST', body: JSON.stringify({ action }) }); setItems(current => current.filter(item => item.id !== id)); await onResolved() }
+    catch (e) { setMessage((e as Error).message) }
+  }
+  return <><PageHeader eyebrow="管理员" title="待审核" description="低置信度识别、字段冲突和处理失败会在这里保留原始上下文。"><button className="secondary" onClick={load}>↻ 刷新</button></PageHeader>{message && <div className="setting-help">{message}</div>}{items.length ? <div className="review-list">{items.map(item => <div className="detail-card review-card" key={item.id}><div className="review-head"><div><strong>{item.kind}</strong><span>{item.entity_type || 'unknown'} / {item.entity_id || '—'}</span></div><div><button className="secondary" onClick={() => resolve(item.id, 'rejected')}>保留待查</button><button className="primary" onClick={() => resolve(item.id, 'resolved')}>标记已处理</button></div></div><pre>{JSON.stringify(item.payload, null, 2)}</pre></div>)}</div> : <div className="empty-state compact"><div className="empty-icon">✓</div><h3>当前没有待审核项</h3><p>自动识别产生低置信度结果或字段冲突后，会在这里显示。</p></div>}</>
+}
+
 function ImportPage({ onImported }: { onImported: () => Promise<void> }) { const [text, setText] = useState(''); const [url, setUrl] = useState(''); const [busy, setBusy] = useState(false); const submitText = async () => { if (!text.trim()) return; setBusy(true); try { await api('/imports/text', { method: 'POST', body: JSON.stringify({ text }) }); setText(''); await onImported() } catch (e) { alert((e as Error).message) } finally { setBusy(false) } }; const submitUrl = async () => { if (!url.trim()) return; setBusy(true); try { await api('/imports/url', { method: 'POST', body: JSON.stringify({ url }) }); setUrl(''); await onImported() } catch (e) { alert((e as Error).message) } finally { setBusy(false) } }; const submitFile = async (file: File) => { setBusy(true); try { const form = new FormData(); form.append('file', file); await api('/imports/files', { method: 'POST', body: form }); await onImported() } catch (e) { alert((e as Error).message) } finally { setBusy(false) } }; return <><PageHeader eyebrow="数据入口" title="导入招聘信息" description="先把信息放进来，系统会自动解析、分类、去重并保留来源。" /><div className="import-grid"><div className="detail-card import-card"><div className="import-icon blue">✎</div><h2>粘贴群聊文字</h2><p>适合复制微信群中的招聘消息、合并转发和招聘说明。</p><textarea value={text} onChange={e => setText(e.target.value)} rows={10} placeholder="粘贴招聘群消息……" /><button className="primary" disabled={busy || !text.trim()} onClick={submitText}>{busy ? '提交中…' : '加入处理队列 →'}</button></div><div className="detail-card import-card"><div className="import-icon violet">↗</div><h2>公开链接与文件</h2><p>公众号文章、企业官网、招聘平台和其他公开页面均可。</p><input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://example.com/recruitment" /><div className="dropzone">将网页 URL 粘贴到上方<br /><span>验证码、登录页和小程序请手工补录</span></div><button className="secondary" disabled={busy || !url.trim()} onClick={submitUrl}>抓取并加入队列 →</button><label className="file-input">选择 PDF、DOCX、XLSX、CSV、TXT 或图片<input type="file" accept=".pdf,.docx,.xlsx,.csv,.txt,.png,.jpg,.jpeg,.webp" onChange={e => e.target.files?.[0] && submitFile(e.target.files[0])} /></label></div></div></> }
 
-function SettingsPage({ onSaved }: { onSaved: (message: string) => void }) { const [settings, setSettings] = useState<Record<string, any>>({}); const [loaded, setLoaded] = useState(false); useEffect(() => { api<Record<string, any>>('/admin/settings').then(value => { setSettings(value); setLoaded(true) }).catch(() => undefined) }, []); const set = (key: string, value: any) => setSettings(current => ({ ...current, [key]: value })); const save = async () => { await api('/admin/settings', { method: 'PUT', body: JSON.stringify({ values: settings }) }); onSaved('设置已保存') }; if (!loaded) return <div className="loading-inline">加载设置…</div>; const provider = settings.llm_provider || {}; return <><PageHeader eyebrow="管理员" title="系统设置" description="连接 TraceMemo、通用模型、SMTP 和 AList WebDAV。"><button className="primary" onClick={save}>保存设置</button></PageHeader><div className="settings-grid"><section className="detail-card setting-section"><h2>同步与隐私</h2><label>同步间隔（分钟）<input type="number" min="1" value={settings.sync_interval_minutes || 10} onChange={e => set('sync_interval_minutes', Number(e.target.value))} /></label><label>首次导入天数<input type="number" min="1" value={settings.initial_import_days || 30} onChange={e => set('initial_import_days', Number(e.target.value))} /></label><label className="check"><input type="checkbox" checked={Boolean(settings.redaction_enabled)} onChange={e => set('redaction_enabled', e.target.checked)} />发送云模型前启用脱敏（默认关闭）</label></section><section className="detail-card setting-section"><h2>通用模型 API</h2><label className="check"><input type="checkbox" checked={Boolean(provider.enabled)} onChange={e => set('llm_provider', { ...provider, enabled: e.target.checked })} />启用云模型处理</label><label>API 风格<select value={provider.api_style || 'chat_completions'} onChange={e => set('llm_provider', { ...provider, api_style: e.target.value })}><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label><label>Base URL<input value={provider.base_url || ''} onChange={e => set('llm_provider', { ...provider, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label><label>模型名称<input value={provider.model || provider.text_model || ''} onChange={e => set('llm_provider', { ...provider, model: e.target.value, text_model: e.target.value })} /></label><label>API Key<input type="password" placeholder={provider.api_key_configured ? '已配置，留空保持不变' : '输入 API Key'} onChange={e => set('llm_provider', { ...provider, api_key: e.target.value })} /></label></section><section className="detail-card setting-section"><h2>Agent API</h2><label className="check"><input type="checkbox" checked={Boolean(settings.agent_api_enabled)} onChange={e => set('agent_api_enabled', e.target.checked)} />允许创建受限 Agent Token</label><p className="setting-help">Token 默认只允许读取招聘目录和操作自己的求职进度，不能读取原始群消息或系统密钥。</p></section></div></> }
+function SettingsPage({ onSaved }: { onSaved: (message: string) => void }) {
+  const [settings, setSettings] = useState<Record<string, any>>({})
+  const [trace, setTrace] = useState({ base_url: 'http://127.0.0.1:6131/api/v1', enabled: false })
+  const [traceToken, setTraceToken] = useState('')
+  const [loaded, setLoaded] = useState(false)
+  useEffect(() => {
+    Promise.all([api<Record<string, any>>('/admin/settings'), api<any[]>('/admin/connectors')]).then(([value, connectors]) => {
+      setSettings(value)
+      const connector = connectors.find(item => item.kind === 'tracememo')
+      if (connector) setTrace({ base_url: connector.base_url, enabled: Boolean(connector.enabled) })
+      setLoaded(true)
+    }).catch(() => undefined)
+  }, [])
+  const set = (key: string, value: any) => setSettings(current => ({ ...current, [key]: value }))
+  const save = async () => {
+    await api('/admin/settings', { method: 'PUT', body: JSON.stringify({ values: settings }) })
+    await api('/admin/connectors/tracememo', { method: 'PUT', body: JSON.stringify({ ...trace, ...(traceToken ? { token: traceToken } : {}) }) })
+    onSaved('设置已保存')
+  }
+  if (!loaded) return <div className="loading-inline">加载设置…</div>
+  const provider = settings.llm_provider || {}
+  const backup = settings.backup || {}
+  const smtp = settings.smtp || {}
+  return <><PageHeader eyebrow="管理员" title="系统设置" description="连接 TraceMemo、通用模型、SMTP 和 AList WebDAV。"><button className="primary" onClick={save}>保存设置</button></PageHeader><div className="settings-grid"><section className="detail-card setting-section"><h2>同步与隐私</h2><label>同步间隔（分钟）<input type="number" min="1" value={settings.sync_interval_minutes || 10} onChange={e => set('sync_interval_minutes', Number(e.target.value))} /></label><label>首次导入天数<input type="number" min="1" value={settings.initial_import_days || 30} onChange={e => set('initial_import_days', Number(e.target.value))} /></label><label className="check"><input type="checkbox" checked={Boolean(settings.redaction_enabled)} onChange={e => set('redaction_enabled', e.target.checked)} />发送云模型前启用脱敏（默认关闭）</label></section><section className="detail-card setting-section"><h2>TraceMemo</h2><label className="check"><input type="checkbox" checked={Boolean(trace.enabled)} onChange={e => setTrace({ ...trace, enabled: e.target.checked })} />启用自动同步</label><label>API 地址<input value={trace.base_url} onChange={e => setTrace({ ...trace, base_url: e.target.value })} /></label><label>Bearer Token<input type="password" value={traceToken} placeholder="已配置时留空保持不变" onChange={e => setTraceToken(e.target.value)} /></label><p className="setting-help">保存后可在后端接口读取群聊列表并手工选择招聘群，默认每 10 分钟轮询。</p><TraceMemoGroups /></section><section className="detail-card setting-section"><h2>通用模型 API</h2><label className="check"><input type="checkbox" checked={Boolean(provider.enabled)} onChange={e => set('llm_provider', { ...provider, enabled: e.target.checked })} />启用云模型处理</label><label>API 风格<select value={provider.api_style || 'chat_completions'} onChange={e => set('llm_provider', { ...provider, api_style: e.target.value })}><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label><label>Base URL<input value={provider.base_url || ''} onChange={e => set('llm_provider', { ...provider, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label><label>模型名称<input value={provider.model || provider.text_model || ''} onChange={e => set('llm_provider', { ...provider, model: e.target.value, text_model: e.target.value })} /></label><label>API Key<input type="password" placeholder={provider.api_key_configured ? '已配置，留空保持不变' : '输入 API Key'} onChange={e => set('llm_provider', { ...provider, api_key: e.target.value })} /></label><button className="secondary" onClick={async () => { try { await api('/admin/models/test', { method: 'POST' }); onSaved('模型连接成功') } catch (e) { alert((e as Error).message) } }}>测试模型连接</button></section><section className="detail-card setting-section"><h2>AList WebDAV 备份</h2><label className="check"><input type="checkbox" checked={Boolean(backup.enabled)} onChange={e => set('backup', { ...backup, enabled: e.target.checked })} />启用每日备份</label><label>WebDAV URL<input value={backup.webdav_url || ''} onChange={e => set('backup', { ...backup, webdav_url: e.target.value })} placeholder="https://alist.example.com/dav/" /></label><label>用户名<input value={backup.username || ''} onChange={e => set('backup', { ...backup, username: e.target.value })} /></label><label>远端目录<input value={backup.remote_directory || '/JobPostings'} onChange={e => set('backup', { ...backup, remote_directory: e.target.value })} /></label><label>WebDAV 密码<input type="password" placeholder={backup.webdav_password_configured ? '已配置，留空保持不变' : '输入 WebDAV 密码'} onChange={e => set('backup', { ...backup, webdav_password: e.target.value })} /></label><label>备份密码<input type="password" placeholder={backup.backup_password_configured ? '已配置，留空保持不变' : '输入独立备份密码'} onChange={e => set('backup', { ...backup, backup_password: e.target.value })} /></label><div className="button-row"><button className="secondary" onClick={async () => { try { await api('/admin/backups/test', { method: 'POST' }); onSaved('WebDAV 连接成功') } catch (e) { alert((e as Error).message) } }}>测试 WebDAV</button><button className="secondary" onClick={async () => { try { await api('/admin/backups/run', { method: 'POST' }); onSaved('备份已完成') } catch (e) { alert((e as Error).message) } }}>立即备份</button></div></section><section className="detail-card setting-section"><h2>SMTP 邮件</h2><label className="check"><input type="checkbox" checked={Boolean(smtp.enabled)} onChange={e => set('smtp', { ...smtp, enabled: e.target.checked })} />启用邀请和验证码邮件</label><label>SMTP 主机<input value={smtp.host || ''} onChange={e => set('smtp', { ...smtp, host: e.target.value })} placeholder="smtp.example.com" /></label><label>端口<input type="number" value={smtp.port || 587} onChange={e => set('smtp', { ...smtp, port: Number(e.target.value) })} /></label><label>发件人邮箱<input type="email" value={smtp.from_email || ''} onChange={e => set('smtp', { ...smtp, from_email: e.target.value })} /></label><label>用户名<input value={smtp.username || ''} onChange={e => set('smtp', { ...smtp, username: e.target.value })} /></label><label>SMTP 密码<input type="password" placeholder={smtp.password_configured ? '已配置，留空保持不变' : '输入 SMTP 密码'} onChange={e => set('smtp', { ...smtp, password: e.target.value })} /></label><label className="check"><input type="checkbox" checked={smtp.starttls !== false} onChange={e => set('smtp', { ...smtp, starttls: e.target.checked })} />使用 STARTTLS</label></section><section className="detail-card setting-section"><h2>Agent API</h2><label className="check"><input type="checkbox" checked={Boolean(settings.agent_api_enabled)} onChange={e => set('agent_api_enabled', e.target.checked)} />允许创建受限 Agent Token</label><p className="setting-help">Token 默认只允许读取招聘目录和操作自己的求职进度，不能读取原始群消息或系统密钥。</p></section></div></>
+}
+
+function TraceMemoGroups() {
+  const [groups, setGroups] = useState<Array<{ id: string; name: string; selected: boolean }>>([])
+  const [message, setMessage] = useState('')
+  const refresh = async () => {
+    try { setGroups(await api<Array<{ id: string; name: string; selected: boolean }>>('/admin/connectors/tracememo/groups')); setMessage('') }
+    catch (e) { setMessage((e as Error).message) }
+  }
+  const save = async () => {
+    try { await api('/admin/source-groups', { method: 'PUT', body: JSON.stringify({ groups }) }); setMessage('群组选择已保存') }
+    catch (e) { setMessage((e as Error).message) }
+  }
+  return <div className="group-picker"><div className="group-picker-head"><strong>招聘群选择</strong><span>{groups.filter(group => group.selected).length}/20</span></div><div className="group-picker-actions"><button className="secondary" onClick={refresh}>读取群列表</button><button className="secondary" onClick={save} disabled={!groups.length}>保存选择</button></div>{groups.map(group => <label className="check" key={group.id}><input type="checkbox" checked={group.selected} onChange={event => setGroups(current => current.map(item => item.id === group.id ? { ...item, selected: event.target.checked } : item))} />{group.name}</label>)}{message && <p className="setting-help">{message}</p>}</div>
+}
 
 function PageHeader({ eyebrow, title, description, children }: { eyebrow: string; title: string; description: string; children?: React.ReactNode }) { return <header className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div><div className="header-actions">{children}</div></header> }
 
 export default App
+
+createRoot(document.getElementById('root')!).render(<App />)

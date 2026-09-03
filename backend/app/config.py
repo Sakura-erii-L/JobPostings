@@ -56,6 +56,14 @@ class AppConfig(BaseModel):
     def export_dir(self) -> Path:
         return self.data_dir / "exports"
 
+    @property
+    def download_dir(self) -> Path:
+        configured = os.getenv("JOBPOSTINGS_DOWNLOAD_DIR")
+        if configured:
+            return _expand_path(configured)
+        user_profile = os.getenv("USERPROFILE")
+        return (Path(user_profile) if user_profile else Path.home()) / "Downloads" / "JobPostings"
+
     def ensure_dirs(self) -> None:
         for path in (self.db_path.parent, self.blob_dir, self.secret_path.parent, self.log_dir, self.export_dir):
             path.mkdir(parents=True, exist_ok=True)

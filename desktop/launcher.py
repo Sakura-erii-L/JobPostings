@@ -23,9 +23,13 @@ def _root() -> Path:
 
 def _backend_command() -> list[str]:
     root = _root()
-    packaged = root / "jobpostings-server.exe"
-    if packaged.exists():
-        return [str(packaged), "--host", HOST, "--port", str(PORT)]
+    packaged_candidates = [
+        root / "jobpostings-server" / "jobpostings-server.exe",
+        root / "jobpostings-server.exe",
+    ]
+    for packaged in packaged_candidates:
+        if packaged.exists():
+            return [str(packaged), "--host", HOST, "--port", str(PORT)]
     return [sys.executable, "-m", "uvicorn", "app.main:app", "--host", HOST, "--port", str(PORT)]
 
 
@@ -83,4 +87,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

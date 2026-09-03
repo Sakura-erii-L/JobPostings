@@ -7,24 +7,16 @@ from urllib.parse import quote_plus
 import httpx
 
 from .db import connect, one, utc_now
-from .model_provider import summarize_company
-from .parsers import extract_html
+from .model_provider import get_setting, summarize_company
+from .parsers import extract_html, fetch_public_http, validate_public_url
 
 
 def _safe_url(url: str) -> bool:
-    from urllib.parse import urlparse
-    import ipaddress
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return False
-    host = parsed.hostname.lower()
-    if host in {"localhost", "metadata.google.internal"}:
-        return False
     try:
-        address = ipaddress.ip_address(host)
-        return not (address.is_private or address.is_loopback or address.is_link_local or address.is_reserved)
-    except ValueError:
+        validate_public_url(url)
         return True
+    except (OSError, ValueError):
+        return False
 
 
 def _extract_result_links(html: str) -> list[tuple[str, str]]:
@@ -62,10 +54,7 @@ def fetch_search_sources(results: list[dict[str, Any]], max_pages: int = 5) -> l
     sources = []
     for result in results[:max_pages]:
         try:
-            response = httpx.get(result["url"], headers={"User-Agent": "Mozilla/5.0 JobPostings/0.1"}, timeout=30, follow_redirects=True)
-            response.raise_for_status()
-            if len(response.content) > 10 * 1024 * 1024:
-                continue
+            response = fetch_public_http(result["url"], timeout=30)
             parsed = extract_html(response.text)
             if parsed["text"]:
                 sources.append({**result, "final_url": str(response.url), "text": parsed["text"][:50_000]})
@@ -79,6 +68,9 @@ def enrich_company(company_id: str) -> dict[str, Any]:
     company = one("SELECT * FROM companies WHERE id=?", (company_id,))
     if not company:
         return {"company_id": company_id, "status": "missing"}
+    search_settings = get_setting("search", {}) or {}
+    if not search_settings.get("enabled", True):
+        return {"company_id": company_id, "status": "disabled"}
     recent = one(
         "SELECT retrieved_at FROM company_claims WHERE company_id=? ORDER BY retrieved_at DESC LIMIT 1",
         (company_id,),
@@ -87,7 +79,8 @@ def enrich_company(company_id: str) -> dict[str, Any]:
         from datetime import datetime, timedelta, timezone
 
         try:
-            if datetime.fromisoformat(recent["retrieved_at"]) > datetime.now(timezone.utc) - timedelta(days=30):
+            cache_days = max(1, int(search_settings.get("cache_days", 30)))
+            if datetime.fromisoformat(recent["retrieved_at"]) > datetime.now(timezone.utc) - timedelta(days=cache_days):
                 return {"company_id": company_id, "status": "cached"}
         except ValueError:
             pass

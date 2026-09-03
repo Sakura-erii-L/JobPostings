@@ -62,10 +62,16 @@ def _company_for(connection, company_data: dict[str, Any]) -> str:
         company_id = existing["id"]
         old_aliases = json.loads(existing["aliases_json"])
         merged_aliases = list(dict.fromkeys(old_aliases + [x for x in aliases if x]))
-        connection.execute(
-            "UPDATE companies SET legal_name=COALESCE(?,legal_name), aliases_json=?, primary_industry=?, updated_at=? WHERE id=?",
-            (legal_name, json_text(merged_aliases, []), primary, now, company_id),
-        )
+        if industries:
+            connection.execute(
+                "UPDATE companies SET legal_name=COALESCE(?,legal_name), aliases_json=?, primary_industry=?, secondary_industries_json=?, updated_at=? WHERE id=?",
+                (legal_name, json_text(merged_aliases, []), primary, json_text(industries[1:], []), now, company_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE companies SET legal_name=COALESCE(?,legal_name), aliases_json=?, updated_at=? WHERE id=?",
+                (legal_name, json_text(merged_aliases, []), now, company_id),
+            )
         return company_id
     company_id = str(uuid4())
     connection.execute(
@@ -102,10 +108,20 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         recruitment_type = "unknown"
     employment_type = str(job_data.get("employment_type") or "unknown")
     locations = job_data.get("locations") or []
-    row = connection.execute(
+    location_key = sorted(str(value).strip().lower() for value in locations)
+    candidates = connection.execute(
         "SELECT * FROM jobs WHERE company_id=? AND normalized_title=? AND recruitment_type=? AND employment_type=?",
         (company_id, normalized, recruitment_type, employment_type),
-    ).fetchone()
+    ).fetchall()
+    row = None
+    for candidate in candidates:
+        try:
+            candidate_locations = sorted(str(value).strip().lower() for value in json.loads(candidate["locations_json"] or "[]"))
+        except json.JSONDecodeError:
+            candidate_locations = []
+        if candidate_locations == location_key:
+            row = candidate
+            break
     now = utc_now()
     explicit_deadline = job_data.get("deadline") or job_data.get("explicit_deadline")
     payload = dict(job_data)
@@ -123,6 +139,19 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
             "UPDATE jobs SET batch_id=COALESCE(?,batch_id), last_effective_posted_at=?, explicit_deadline=COALESCE(?,explicit_deadline), status=?, updated_at=? WHERE id=?",
             (batch_id, last, explicit_deadline, status, now, job_id),
         )
+        conflicts: dict[str, Any] = {}
+        old_locations = json.loads(row["locations_json"] or "[]")
+        if old_locations != locations:
+            conflicts["locations"] = {"old": old_locations, "new": locations}
+        if row["requirements"] and job_data.get("requirements") and row["requirements"] != job_data.get("requirements"):
+            conflicts["requirements"] = {"old": row["requirements"], "new": job_data.get("requirements")}
+        if row["explicit_deadline"] and explicit_deadline and row["explicit_deadline"] != explicit_deadline:
+            conflicts["explicit_deadline"] = {"old": row["explicit_deadline"], "new": explicit_deadline}
+        if conflicts:
+            connection.execute(
+                "INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+                (str(uuid4()), "job_field_conflict", "job", job_id, json.dumps(conflicts, ensure_ascii=False), now),
+            )
     else:
         job_id = str(uuid4())
         status = "active" if explicit_deadline is None or str(explicit_deadline) >= now[:10] else "expired"
@@ -131,6 +160,9 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
             (job_id, company_id, batch_id, title, normalized, job_data.get("department"), json_text(locations, []), recruitment_type, employment_type, job_data.get("headcount"), json_text(job_data.get("education"), []), json_text(job_data.get("majors"), []), job_data.get("experience_requirement"), json_text(job_data.get("salary"), {}), job_data.get("responsibilities"), job_data.get("requirements"), json_text(job_data.get("benefits"), []), json_text(job_data.get("application_methods"), []), json_text(job_data.get("contacts"), []), explicit_deadline, observed_at, observed_at, status, json_text(job_data.get("industry_codes"), []), json_text([x for x in job_data.get("job_function_codes", []) if x in JOB_FUNCTIONS], []), float(job_data.get("confidence", 0)), now, now),
         )
         connection.execute("INSERT INTO search_index(entity_type,entity_id,title,body) VALUES('job',?,?,?)", (job_id, title, f"{title} {job_data.get('requirements','')} {job_data.get('responsibilities','')}"))
+        followers = connection.execute("SELECT user_id FROM user_follows WHERE company_id=?", (company_id,)).fetchall()
+        for follower in followers:
+            connection.execute("INSERT INTO notifications(id,user_id,kind,title,body,created_at) VALUES(?,?,?,?,?,?)", (str(uuid4()), follower["user_id"], "new_job", f"{title} 有新岗位", f"{title} 已加入招聘知识库。", now))
     version_id = str(uuid4())
     try:
         connection.execute(
@@ -142,12 +174,23 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         pass
     evidence_id = str(uuid4())
     evidence_raw_message_id = None
+    source_type = "wechat_group"
+    source_url = None
     if raw_message_id:
-        raw_row = connection.execute("SELECT id FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone()
+        raw_row = connection.execute("SELECT id,connector_id,message_type,metadata_json FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone()
         evidence_raw_message_id = raw_row["id"] if raw_row else None
+        if raw_row and raw_row["connector_id"] == "manual":
+            source_type = "manual_import"
+        if raw_row and raw_row["message_type"] in {"article", "link", "url"}:
+            source_type = "public_web"
+        if raw_row:
+            try:
+                source_url = json.loads(raw_row["metadata_json"] or "{}").get("url")
+            except json.JSONDecodeError:
+                source_url = None
     connection.execute(
-        "INSERT INTO evidences(id,job_id,raw_message_id,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?)",
-        (evidence_id, job_id, evidence_raw_message_id, "wechat_group", json.dumps(payload, ensure_ascii=False)[:4000], observed_at),
+        "INSERT INTO evidences(id,job_id,raw_message_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?)",
+        (evidence_id, job_id, evidence_raw_message_id, source_url, source_type, json.dumps(payload, ensure_ascii=False)[:4000], observed_at),
     )
     return job_id
 

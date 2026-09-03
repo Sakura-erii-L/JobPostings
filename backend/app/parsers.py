@@ -7,10 +7,11 @@ import ipaddress
 import json
 import mimetypes
 import re
+import socket
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -157,13 +158,19 @@ def process_image(data: bytes, image_format: str) -> dict[str, Any]:
         return {"text": "", "metadata": {"format": image_format, "ocr_error": str(exc)}, "qr_values": []}
 
 
-def fetch_public_url(url: str) -> dict[str, Any]:
+def validate_public_url(url: str) -> str:
     parsed_url = urlparse(url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.hostname:
         raise ValueError("Only public HTTP(S) URLs are supported")
+    if parsed_url.username or parsed_url.password:
+        raise ValueError("URLs with embedded credentials are not supported")
     host = parsed_url.hostname.lower()
     if host in {"localhost", "metadata.google.internal"}:
         raise ValueError("Local and metadata hosts are blocked")
+    try:
+        port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError("Invalid URL port") from exc
     try:
         address = ipaddress.ip_address(host)
         if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved:
@@ -171,15 +178,44 @@ def fetch_public_url(url: str) -> dict[str, Any]:
     except ValueError as exc:
         if str(exc) == "Private network targets are blocked":
             raise
-    response = httpx.get(
-        url,
-        timeout=30,
-        follow_redirects=True,
-        headers={"User-Agent": "JobPostings/0.1 (+local recruitment archive)"},
-    )
-    response.raise_for_status()
-    if len(response.content) > 10 * 1024 * 1024:
-        raise ValueError("Web page is larger than 10 MB")
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}
+        if not addresses:
+            raise ValueError("Unable to resolve public URL")
+        for resolved in addresses:
+            address = ipaddress.ip_address(resolved)
+            if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved:
+                raise ValueError("URL resolves to a private network target")
+    except socket.gaierror as exc:
+        raise ValueError("Unable to resolve public URL") from exc
+    return url
+
+
+def fetch_public_http(url: str, timeout: float = 30, max_bytes: int = 10 * 1024 * 1024) -> httpx.Response:
+    current_url = url
+    for _ in range(6):
+        validate_public_url(current_url)
+        response = httpx.get(
+            current_url,
+            timeout=timeout,
+            follow_redirects=False,
+            headers={"User-Agent": "JobPostings/0.1 (+local recruitment archive)"},
+        )
+        if 300 <= response.status_code < 400:
+            location = response.headers.get("location")
+            if not location:
+                raise ValueError("Redirect response has no location")
+            current_url = urljoin(current_url, location)
+            continue
+        response.raise_for_status()
+        if len(response.content) > max_bytes:
+            raise ValueError(f"Response is larger than {max_bytes // (1024 * 1024)} MB")
+        return response
+    raise ValueError("Too many redirects")
+
+
+def fetch_public_url(url: str) -> dict[str, Any]:
+    response = fetch_public_http(url)
     content_type = response.headers.get("content-type", "")
     if "html" not in content_type and not response.text.lstrip().startswith("<"):
         return {"url": str(response.url), "text": response.text[:2_000_000], "content_type": content_type}

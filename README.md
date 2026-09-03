@@ -15,6 +15,8 @@ $env:PYTHONPATH = "backend"
 
 浏览器打开 `http://127.0.0.1:17879`。
 
+系统使用本地 SQLite，不需要单独安装 MySQL、PostgreSQL 等数据库服务。导出文件默认写入 `%USERPROFILE%\Downloads\JobPostings`，可用 `JOBPOSTINGS_DOWNLOAD_DIR` 覆盖；数据库、密钥和附件仍保存在 `%LOCALAPPDATA%\JobPostings`。
+
 ## 外部服务
 
 - TraceMemo 默认地址：`http://127.0.0.1:6131/api/v1`。
@@ -24,3 +26,10 @@ $env:PYTHONPATH = "backend"
 
 首次启动只能从本机创建管理员。开发环境未配置 SMTP 时，可使用 `JOBPOSTINGS_DEV_SHOW_OTP=true` 在 API 响应中查看验证码；生产环境必须关闭该选项并配置 SMTP。
 
+生成 Windows 可执行文件：
+
+```powershell
+.\scripts\build.ps1
+```
+
+该脚本生成 `build\jobpostings-server` 和 `build\JobPostings.exe`。若需要 `Setup.exe`，需另行安装 Inno Setup 后编译 `installer\jobpostings.iss`。

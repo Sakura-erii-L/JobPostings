@@ -141,7 +141,10 @@ def create_backup() -> dict:
         verified = client.get(record_path)
         if verified != encrypted:
             raise RuntimeError("Remote backup verification failed")
-        retention = int(settings.get("retention_count", 30))
+        try:
+            retention = max(1, int(settings.get("retention_count", 30)))
+        except (TypeError, ValueError):
+            retention = 30
         with connect() as connection:
             old = connection.execute("SELECT id,remote_path FROM backups WHERE status='succeeded' ORDER BY created_at DESC").fetchall()
             for row in old[retention - 1 :]:

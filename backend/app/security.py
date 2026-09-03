@@ -116,6 +116,7 @@ def redact_text(text: str, index_key: bytes) -> str:
         (r"(?<!\d)1[3-9]\d{9}(?!\d)", "PHONE"),
         (r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "EMAIL"),
         (r"(?i)(微信|vx|v信|qq)\s*[:：]?\s*[\w-]{4,}", "CONTACT"),
+        (r"(?<!\d)\d{17}[\dXx](?!\d)", "ID"),
     ]
     result = text
     for pattern, kind in patterns:

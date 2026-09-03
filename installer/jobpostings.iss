@@ -8,7 +8,7 @@ AppId={{C4B6DCC4-EE1B-4D45-93F0-9FDFE6D6F2B7}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\JobPostings
+DefaultDirName={localappdata}\Programs\JobPostings
 DefaultGroupName={#MyAppName}
 OutputDir=output
 OutputBaseFilename=JobPostings-Setup-{#MyAppVersion}
@@ -25,7 +25,7 @@ Source: "..\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs 
 
 [Icons]
 Name: "{group}\JobPostings"; Filename: "{app}\JobPostings.exe"
-Name: "{commondesktop}\JobPostings"; Filename: "{app}\JobPostings.exe"; Tasks: desktopicon
+Name: "{userdesktop}\JobPostings"; Filename: "{app}\JobPostings.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："
@@ -36,4 +36,3 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\JobPostings.exe"; Description: "启动 JobPostings"; Flags: nowait postinstall skipifsilent
-

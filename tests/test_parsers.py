@@ -1,4 +1,6 @@
-from app.parsers import extract_html, extract_file
+import pytest
+
+from app.parsers import extract_html, extract_file, fetch_public_url
 
 
 def test_html_extraction():
@@ -11,3 +13,7 @@ def test_text_file_extraction():
     result = extract_file("notice.txt", "招聘岗位：测试工程师".encode("utf-8"))
     assert "测试工程师" in result["text"]
 
+
+def test_private_url_is_rejected():
+    with pytest.raises(ValueError, match="blocked"):
+        fetch_public_url("http://127.0.0.1/internal")
