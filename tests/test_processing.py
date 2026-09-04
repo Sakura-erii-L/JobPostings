@@ -58,3 +58,29 @@ def test_message_processing_creates_catalog_and_consolidation_job(tmp_path, monk
     assert db.one("SELECT canonical_title FROM jobs")['canonical_title'] == "算法工程师"
     assert db.one("SELECT source_type FROM evidences WHERE raw_message_id=?", (raw_id,))["source_type"] == "wechat_group"
     assert db.one("SELECT kind FROM processing_jobs WHERE kind='consolidate_company'")["kind"] == "consolidate_company"
+
+
+def test_ingest_message_updates_external_id_and_requeues_changed_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    message = {"id": "m-1", "type": "text", "text": "旧招聘信息"}
+    raw_id = ingest_message(message, "tracememo", "group-1")
+    assert raw_id
+    with db.connect() as connection:
+        connection.execute("UPDATE processing_jobs SET status='canceled',stage='canceled' WHERE raw_message_id=?", (raw_id,))
+
+    stats: dict[str, int] = {}
+    updated_id = ingest_message({**message, "text": "新招聘信息"}, "tracememo", "group-1", stats)
+    assert updated_id == raw_id
+    assert stats == {"updated": 1}
+    assert db.one("SELECT text_content FROM raw_messages WHERE id=?", (raw_id,))["text_content"] == "新招聘信息"
+    assert dict(db.one("SELECT status,stage,cancel_requested FROM processing_jobs WHERE raw_message_id=?", (raw_id,))) == {
+        "status": "pending",
+        "stage": "queued",
+        "cancel_requested": 0,
+    }
+
+    duplicate_stats: dict[str, int] = {}
+    assert ingest_message({**message, "text": "新招聘信息"}, "tracememo", "group-1", duplicate_stats) == raw_id
+    assert duplicate_stats == {"duplicates": 1}

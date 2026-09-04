@@ -250,6 +250,7 @@ def sync_tracememo_once() -> dict[str, Any]:
             "message": "没有已选中的微信群，请先读取并保存招聘群选择",
         }
     fetched = 0
+    ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "ignored": 0}
     for group in groups:
         cursor = one("SELECT * FROM sync_cursors WHERE source_group_id=?", (group["id"],))
         end = datetime.now(timezone.utc)
@@ -258,9 +259,12 @@ def sync_tracememo_once() -> dict[str, Any]:
         else:
             start = end - timedelta(days=int(_setting_value("initial_import_days", 30)))
         for message in client.messages(group["external_id"], start, end):
-            raw_id = ingest_message(message, row["id"], group["id"])
+            if not isinstance(message, dict):
+                ingest_stats["ignored"] += 1
+                continue
+            fetched += 1
+            raw_id = ingest_message(message, row["id"], group["id"], ingest_stats)
             if raw_id:
-                fetched += 1
                 message_type = str(message.get("type") or message.get("msgType") or "").lower()
                 media_id = str(message.get("media_id") or message.get("mediaId") or message.get("attachment_id") or (message.get("id") if message_type in {"image", "file", "attachment", "picture", "document"} else "") or "")
                 if media_id and message_type in {"image", "file", "attachment", "picture", "document"}:
@@ -272,7 +276,16 @@ def sync_tracememo_once() -> dict[str, Any]:
                         pass
         with connect() as connection:
             connection.execute("INSERT OR REPLACE INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)", (group["id"], end.isoformat(), None, utc_now()))
-    return {"status": "completed", "fetched": fetched, "groups": len(groups)}
+    return {
+        "status": "completed",
+        "fetched": fetched,
+        "added": ingest_stats["created"] + ingest_stats["updated"],
+        "created": ingest_stats["created"],
+        "updated": ingest_stats["updated"],
+        "duplicates": ingest_stats["duplicates"],
+        "ignored": ingest_stats["ignored"],
+        "groups": len(groups),
+    }
 
 
 async def auto_sync_loop() -> None:
@@ -646,12 +659,12 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     if status and status not in allowed_statuses:
         raise HTTPException(400, f"Unknown processing status: {status}")
     limit = min(max(limit, 1), 200)
-    params: list[Any] = []
-    where = ""
+    query_params: list[Any] = []
+    where = "WHERE p.status <> 'canceled'"
     if status:
         where = "WHERE p.status=?"
-        params.append(status)
-    params.append(limit)
+        query_params.append(status)
+    params = [*query_params, limit]
     rows = all_rows(
         f"""
         SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
@@ -672,7 +685,8 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     for row in all_rows("SELECT status,COUNT(*) AS count FROM processing_jobs GROUP BY status"):
         stats[row["status"]] = row["count"]
     control = one("SELECT state,updated_at FROM queue_control WHERE id=1")
-    return {"state": control["state"] if control else "paused", "state_updated_at": control["updated_at"] if control else None, "stats": stats, "items": [dict(row) for row in rows], "total": sum(stats.values())}
+    total_row = one(f"SELECT COUNT(*) AS count FROM processing_jobs p {where}", tuple(query_params))
+    return {"state": control["state"] if control else "paused", "state_updated_at": control["updated_at"] if control else None, "stats": stats, "items": [dict(row) for row in rows], "total": total_row["count"] if total_row else 0}
 
 
 @app.post("/api/v1/admin/processing-queue/control")

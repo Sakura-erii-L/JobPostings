@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -63,7 +64,34 @@ def attach_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: 
     return artifact
 
 
-def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: str | None) -> str | None:
+def _increment_ingest_stat(stats: dict[str, int] | None, key: str) -> None:
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + 1
+
+
+def _queue_classification(connection: Any, raw_id: str) -> None:
+    job = connection.execute(
+        "SELECT id,status FROM processing_jobs WHERE raw_message_id=? AND kind='classify' ORDER BY created_at DESC LIMIT 1",
+        (raw_id,),
+    ).fetchone()
+    if not job:
+        connection.execute(
+            "INSERT INTO processing_jobs(id,kind,raw_message_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (str(uuid4()), "classify", raw_id, "pending", utc_now(), utc_now()),
+        )
+        return
+    if job["status"] != "running":
+        connection.execute(
+            """UPDATE processing_jobs
+               SET status='pending',stage='queued',attempts=0,cancel_requested=0,lease_until=NULL,
+                   next_attempt_at=NULL,processor=NULL,result_json=NULL,error=NULL,started_at=NULL,
+                   finished_at=NULL,updated_at=?
+               WHERE id=?""",
+            (utc_now(), job["id"]),
+        )
+
+
+def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: str | None, stats: dict[str, int] | None = None) -> str | None:
     text, metadata = parse_message_payload(message)
     digest = message_hash(connector_id, group_id, message)
     message_type = str(message.get("type") or message.get("msgType") or "text").lower()
@@ -78,19 +106,55 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
     with connect() as connection:
         existing = connection.execute("SELECT id FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
         if existing:
+            _increment_ingest_stat(stats, "duplicates")
             return existing["id"]
+        existing_external = None
+        if connector_id and group_id and external_id:
+            existing_external = connection.execute(
+                "SELECT id,text_content,metadata_json FROM raw_messages WHERE connector_id=? AND source_group_id=? AND external_message_id=?",
+                (connector_id, group_id, external_id),
+            ).fetchone()
+        if existing_external:
+            old_metadata: dict[str, Any] = {}
+            try:
+                loaded_metadata = json.loads(existing_external["metadata_json"] or "{}")
+                if isinstance(loaded_metadata, dict):
+                    old_metadata = loaded_metadata
+            except (TypeError, json.JSONDecodeError):
+                pass
+            merged_metadata = {**old_metadata, **metadata}
+            connection.execute(
+                """UPDATE raw_messages
+                   SET sender=?,sent_at=?,message_type=?,text_content=?,metadata_json=?,content_hash=?,
+                       is_recruitment=NULL,retention_until=?
+                   WHERE id=?""",
+                (
+                    str(message.get("sender") or message.get("talker") or ""),
+                    sent_at,
+                    message_type,
+                    text or existing_external["text_content"] or "",
+                    json.dumps(merged_metadata, ensure_ascii=False),
+                    digest,
+                    retention,
+                    existing_external["id"],
+                ),
+            )
+            _queue_classification(connection, existing_external["id"])
+            _increment_ingest_stat(stats, "updated")
+            return existing_external["id"]
         try:
             connection.execute(
                 "INSERT INTO raw_messages(id,connector_id,source_group_id,external_message_id,sender,sent_at,message_type,text_content,metadata_json,content_hash,retention_until,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (raw_id, connector_id, group_id, external_id, str(message.get("sender") or message.get("talker") or ""), sent_at, message_type, text, json.dumps(metadata, ensure_ascii=False), digest, retention, utc_now()),
             )
-            connection.execute(
-                "INSERT INTO processing_jobs(id,kind,raw_message_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (str(uuid4()), "classify", raw_id, "pending", utc_now(), utc_now()),
-            )
-        except Exception:
+            _queue_classification(connection, raw_id)
+            _increment_ingest_stat(stats, "created")
+        except sqlite3.IntegrityError:
             existing = connection.execute("SELECT id FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
-            return existing["id"] if existing else None
+            if existing:
+                _increment_ingest_stat(stats, "duplicates")
+                return existing["id"]
+            raise
     return raw_id
 
 

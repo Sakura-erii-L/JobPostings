@@ -158,6 +158,12 @@ def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
         assert canceled.json()["canceled"] == 1
         assert db.one("SELECT status FROM processing_jobs WHERE id=?", (job["id"],))["status"] == "canceled"
         assert db.one("SELECT stage FROM processing_logs WHERE processing_job_id=?", (job["id"],))["stage"] == "canceled"
+        visible = client.get("/api/v1/admin/processing-queue")
+        assert visible.status_code == 200
+        assert all(item["id"] != job["id"] for item in visible.json()["items"])
+        canceled_view = client.get("/api/v1/admin/processing-queue?status=canceled")
+        assert canceled_view.status_code == 200
+        assert canceled_view.json()["items"][0]["id"] == job["id"]
 
         retried = client.post(f"/api/v1/admin/processing-queue/{job['id']}/retry")
         assert retried.status_code == 200
