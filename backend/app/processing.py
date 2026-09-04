@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 from urllib.parse import urlparse
 
+from .browser import fetch_public_browser
 from .catalog import apply_model_item
 from .db import connect, one, utc_now
 from .model_provider import classify_messages, consolidate_company_profile, get_setting
@@ -281,6 +282,52 @@ def _artifact_rows(raw_message_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in _all_rows("SELECT * FROM artifacts WHERE raw_message_id=? ORDER BY created_at", (raw_message_id,))]
 
 
+def _is_wechat_public_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "mp.weixin.qq.com" or host.endswith(".weixin.qq.com")
+
+
+def _should_render_in_browser(url: str, parsed: dict[str, Any]) -> bool:
+    if not _is_wechat_public_url(url):
+        return False
+    text = str(parsed.get("text") or "").strip()
+    return bool(parsed.get("access_challenge")) or len(text) < 300
+
+
+def _merge_browser_result(parsed: dict[str, Any], browser_result: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(parsed)
+    if not browser_result.get("browser_rendered"):
+        return merged
+    for key in (
+        "url",
+        "title",
+        "text",
+        "content_type",
+        "links",
+        "images",
+        "image_data",
+        "screenshot_data",
+        "browser_rendered",
+        "browser_image_count",
+        "browser_loaded_image_count",
+        "browser_downloaded_image_count",
+        "browser_article_text_chars",
+    ):
+        if key in browser_result:
+            merged[key] = browser_result[key]
+    browser_text = str(browser_result.get("text") or "").strip()
+    browser_has_content = bool(browser_text) or bool(browser_result.get("images")) or bool(browser_result.get("image_data"))
+    if parsed.get("access_challenge") and not browser_has_content:
+        return merged
+    if browser_result.get("access_challenge"):
+        merged["access_challenge"] = True
+        merged["access_error"] = browser_result.get("access_error") or "浏览器页面要求环境验证"
+    else:
+        merged.pop("access_challenge", None)
+        merged.pop("access_error", None)
+    return merged
+
+
 def _all_rows(sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
     with connect() as connection:
         return connection.execute(sql, params).fetchall()
@@ -398,6 +445,12 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
     ocr_texts: list[str] = []
     artifact_ids: list[str] = []
     image_urls = [str(value) for value in parsed.get("images") or [] if value]
+    browser_image_data = [
+        value
+        for value in parsed.get("image_data") or []
+        if isinstance(value, dict) and isinstance(value.get("data"), bytes) and value.get("data")
+    ]
+    processed_image_urls: set[str] = set()
     downloaded = 0
     direct_data = parsed.get("data")
     if isinstance(direct_data, bytes) and direct_data:
@@ -414,7 +467,26 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
             downloaded += 1
         except Exception as exc:
             log_processing(job["id"], "extracting", "网页本身为图片，但图片提取失败", "warning", {"error": str(exc)})
-    for index, image_url in enumerate(image_urls[:12], start=1):
+    for index, image in enumerate(browser_image_data[:24], start=1):
+        image_url = str(image.get("url") or "")
+        try:
+            artifact = attach_artifact(
+                raw["id"],
+                _web_image_filename(image_url, str(image.get("content_type") or ""), index, detect_image_suffix(image["data"])),
+                image["data"],
+                str(image.get("content_type") or "") or None,
+            )
+            artifact_ids.append(artifact["id"])
+            qr_values.extend(artifact.get("qr_values") or [])
+            ocr_texts.append(str(artifact.get("text") or ""))
+            processed_image_urls.add(image_url)
+            downloaded += 1
+        except Exception as exc:
+            log_processing(job["id"], "extracting", "浏览器图片提取失败", "warning", {"url": image_url, "error": str(exc)})
+    image_urls = list(dict.fromkeys([*image_urls, *(str(image.get("url") or "") for image in browser_image_data if image.get("url"))]))
+    for index, image_url in enumerate(image_urls[:24], start=1):
+        if image_url in processed_image_urls:
+            continue
         try:
             response = fetch_public_http(image_url, timeout=30, max_bytes=10 * 1024 * 1024)
             content_type = response.headers.get("content-type", "")
@@ -435,7 +507,17 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
         except Exception as exc:
             log_processing(job["id"], "extracting", "网页图片提取失败", "warning", {"url": image_url, "error": str(exc)})
     if image_urls:
-        metadata["linked_image_urls"] = image_urls[:12]
+        metadata["linked_image_urls"] = image_urls[:24]
+    screenshot_data = parsed.get("screenshot_data")
+    if isinstance(screenshot_data, bytes) and screenshot_data and not _merge_texts(*ocr_texts).strip():
+        try:
+            artifact = attach_artifact(raw["id"], "webpage-screenshot.png", screenshot_data, "image/png")
+            artifact_ids.append(artifact["id"])
+            qr_values.extend(artifact.get("qr_values") or [])
+            ocr_texts.append(str(artifact.get("text") or ""))
+            metadata["browser_screenshot_ocr"] = True
+        except Exception as exc:
+            log_processing(job["id"], "extracting", "网页截图 OCR 失败", "warning", {"error": str(exc)})
     if artifact_ids:
         metadata["artifact_id"] = artifact_ids[-1]
         metadata["artifact_ids"] = list(dict.fromkeys([*(metadata.get("artifact_ids") or []), *artifact_ids]))
@@ -462,8 +544,39 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
     if is_link_message(raw["message_type"], metadata) and url:
         try:
             parsed = fetch_public_url(str(url))
+            direct_resolved_url = str(parsed.get("url") or url)
+            if _should_render_in_browser(str(url), parsed):
+                metadata["browser_attempted"] = True
+                _stage(job["id"], "extracting", "公众号普通抓取不足，启动浏览器渲染", "playwright")
+                try:
+                    browser_result = fetch_public_browser(str(url))
+                    parsed = _merge_browser_result(parsed, browser_result)
+                    if browser_result.get("browser_rendered"):
+                        metadata.update({
+                            "browser_rendered": True,
+                            "browser_image_count": browser_result.get("browser_image_count", 0),
+                            "browser_loaded_image_count": browser_result.get("browser_loaded_image_count", 0),
+                            "browser_downloaded_image_count": browser_result.get("browser_downloaded_image_count", 0),
+                            "browser_article_text_chars": browser_result.get("browser_article_text_chars", 0),
+                            "browser_screenshot_captured": bool(browser_result.get("screenshot_data")),
+                        })
+                        log_processing(
+                            job["id"],
+                            "extracting",
+                            "浏览器渲染完成，继续处理页面文字和图片",
+                            details={
+                                "images": browser_result.get("browser_image_count", 0),
+                                "loaded_images": browser_result.get("browser_loaded_image_count", 0),
+                                "downloaded_images": browser_result.get("browser_downloaded_image_count", 0),
+                                "article_text_characters": browser_result.get("browser_article_text_chars", 0),
+                            },
+                        )
+                except Exception as exc:
+                    metadata["browser_error"] = str(exc)
+                    log_processing(job["id"], "extracting", "浏览器渲染失败，保留普通抓取结果", "warning", {"error": str(exc)})
             access_challenge = bool(parsed.get("access_challenge"))
-            resolved_url = str(parsed.get("url") or url)
+            browser_resolved_url = str(parsed.get("url") or url)
+            resolved_url = direct_resolved_url if direct_resolved_url != url else browser_resolved_url
             metadata.update({
                 "source_url": url,
                 "url": url,

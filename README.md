@@ -10,10 +10,12 @@
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e ".[dev,documents]"
 $env:PYTHONPATH = "backend"
-\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 17879
+.\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 17879
 ```
 
 浏览器打开 `http://127.0.0.1:17879`。
+
+公众号等动态网页会在临时 Chrome 上下文中渲染并触发图片懒加载，再提取正文、图片和二维码。程序会优先使用本机 Chrome；也可以通过 `JOBPOSTINGS_BROWSER_EXECUTABLE` 指定浏览器路径。若本机没有 Chrome，可执行 `.\.venv\Scripts\python -m playwright install chromium` 安装 Playwright 浏览器。
 
 系统使用本地 SQLite，不需要单独安装 MySQL、PostgreSQL 等数据库服务。导出文件默认写入 `%USERPROFILE%\Downloads\JobPostings`，可用 `JOBPOSTINGS_DOWNLOAD_DIR` 覆盖；数据库、密钥和附件仍保存在 `%LOCALAPPDATA%\JobPostings`。
 

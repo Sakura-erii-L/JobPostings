@@ -201,6 +201,115 @@ def test_link_page_images_are_ocr_and_qr_processed(tmp_path, monkeypatch):
     assert metadata["qr_values"] == ["https://apply.example.com"]
 
 
+def test_wechat_browser_rendered_images_are_processed_after_http_challenge(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    original_url = "https://mp.weixin.qq.com/s/browser-link"
+    challenge_url = "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=temporary&target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fbrowser-link"
+    image_url = "https://mmbiz.qpic.cn/mmbiz_png/example/poster.png"
+    raw_id = ingest_message({
+        "id": "wechat-browser-1",
+        "type": "公众号链接",
+        "text": "公众号招聘",
+        "contentData": {"type": "share", "title": "公众号招聘", "url": original_url},
+    }, "tracememo", "group-1")
+    assert raw_id
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    monkeypatch.setattr("app.processing.fetch_public_url", lambda url: {
+        "url": challenge_url,
+        "text": "",
+        "content_type": "text/html",
+        "images": [],
+        "access_challenge": True,
+        "access_error": "微信返回环境验证页面",
+    })
+    monkeypatch.setattr("app.processing.fetch_public_browser", lambda url: {
+        "url": original_url,
+        "title": "公众号招聘正文",
+        "text": "",
+        "content_type": "text/html; charset=UTF-8",
+        "images": [image_url],
+        "image_data": [{"url": image_url, "data": b"browser-image", "content_type": "image/png"}],
+        "screenshot_data": b"browser-screenshot",
+        "browser_rendered": True,
+        "browser_image_count": 1,
+        "browser_loaded_image_count": 1,
+        "browser_downloaded_image_count": 1,
+        "browser_article_text_chars": 0,
+        "access_challenge": False,
+    })
+    artifact_calls: list[str] = []
+
+    def fake_attach(raw_message_id, filename, data, mime_type=None):
+        artifact_calls.append(filename)
+        return {"id": f"artifact-{len(artifact_calls)}", "text": "图片 OCR 招聘正文", "qr_values": ["https://apply.example.com"]}
+
+    monkeypatch.setattr("app.processing.attach_artifact", fake_attach)
+    text, metadata = _extract_source_text(job, raw)
+    assert "图片 OCR 招聘正文" in text
+    assert metadata["browser_attempted"] is True
+    assert metadata["browser_rendered"] is True
+    assert metadata["browser_loaded_image_count"] == 1
+    assert metadata["browser_screenshot_captured"] is True
+    assert metadata["source_url"] == original_url
+    assert metadata["resolved_url"] == challenge_url
+    assert metadata["web_access_status"] == "ok"
+    assert metadata["linked_image_urls"] == [image_url]
+    assert metadata["qr_values"] == ["https://apply.example.com"]
+    assert artifact_calls == ["linked-image-1.png"]
+
+
+def test_browser_screenshot_is_used_when_image_ocr_has_no_text(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    original_url = "https://mp.weixin.qq.com/s/browser-screenshot"
+    raw_id = ingest_message({
+        "id": "wechat-browser-screenshot",
+        "type": "公众号链接",
+        "text": "图片招聘",
+        "contentData": {"type": "share", "title": "图片招聘", "url": original_url},
+    }, "tracememo", "group-1")
+    assert raw_id
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    monkeypatch.setattr("app.processing.fetch_public_url", lambda url: {
+        "url": url,
+        "text": "",
+        "content_type": "text/html",
+        "images": [],
+    })
+    monkeypatch.setattr("app.processing.fetch_public_browser", lambda url: {
+        "url": url,
+        "title": "图片招聘",
+        "text": "",
+        "content_type": "text/html",
+        "images": [],
+        "image_data": [],
+        "screenshot_data": b"browser-screenshot",
+        "browser_rendered": True,
+        "browser_image_count": 0,
+        "browser_loaded_image_count": 0,
+        "browser_downloaded_image_count": 0,
+        "browser_article_text_chars": 0,
+    })
+    artifact_calls: list[str] = []
+
+    def fake_attach(raw_message_id, filename, data, mime_type=None):
+        artifact_calls.append(filename)
+        return {"id": "screenshot-artifact", "text": "截图 OCR 招聘正文包含更多岗位信息", "qr_values": ["https://qr.example.com"]}
+
+    monkeypatch.setattr("app.processing.attach_artifact", fake_attach)
+    text, metadata = _extract_source_text(job, raw)
+    assert text == "图片招聘\n截图 OCR 招聘正文包含更多岗位信息"
+    assert metadata["browser_screenshot_ocr"] is True
+    assert metadata["artifact_id"] == "screenshot-artifact"
+    assert metadata["qr_values"] == ["https://qr.example.com"]
+    assert artifact_calls == ["webpage-screenshot.png"]
+
+
 def test_wechat_environment_challenge_uses_codex_fallback(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
@@ -223,6 +332,15 @@ def test_wechat_environment_challenge_uses_codex_fallback(tmp_path, monkeypatch)
         "images": [],
         "access_challenge": True,
         "access_error": "微信返回环境验证页面",
+    })
+    monkeypatch.setattr("app.processing.fetch_public_browser", lambda url: {
+        "url": url,
+        "text": "",
+        "content_type": "text/html",
+        "images": [],
+        "image_data": [],
+        "screenshot_data": b"challenge-screenshot",
+        "browser_rendered": True,
     })
     captured: dict[str, object] = {}
 
