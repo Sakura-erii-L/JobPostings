@@ -65,6 +65,11 @@ def test_admin_can_create_and_list_invitations(tmp_path, monkeypatch):
         assert logged_in.status_code == 200
         assert logged_in.json()["user"]["role"] == "member"
         assert db.one("SELECT used_at FROM invitations WHERE email=?", ("member@example.com",))["used_at"] is not None
+        for path in ("/api/v1/admin/settings", "/api/v1/admin/connectors", "/api/v1/admin/processing-queue", "/api/v1/admin/review-items"):
+            assert client.get(path).status_code == 403
+        assert client.post("/api/v1/admin/sync").status_code == 403
+        assert client.post("/api/v1/imports/text", json={"text": "普通账户不应导入"}).status_code == 403
+        assert client.get("/api/v1/companies").status_code == 200
 
 
 def test_connector_secret_is_preserved_and_agent_scopes_are_enforced(tmp_path, monkeypatch):
@@ -161,6 +166,7 @@ def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
         assert canceled.json()["canceled"] == 1
         assert db.one("SELECT status FROM processing_jobs WHERE id=?", (job["id"],))["status"] == "canceled"
         assert db.one("SELECT stage FROM processing_logs WHERE processing_job_id=?", (job["id"],))["stage"] == "canceled"
+        assert db.one("SELECT recognition_status FROM raw_messages WHERE id=?", (raw_message_id,))["recognition_status"] == "canceled"
         visible = client.get("/api/v1/admin/processing-queue")
         assert visible.status_code == 200
         assert all(item["id"] != job["id"] for item in visible.json()["items"])
@@ -171,6 +177,7 @@ def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
         retried = client.post(f"/api/v1/admin/processing-queue/{job['id']}/retry")
         assert retried.status_code == 200
         assert retried.json() == {"id": job["id"], "status": "pending"}
+        assert db.one("SELECT recognition_status FROM raw_messages WHERE id=?", (raw_message_id,))["recognition_status"] == "pending"
 
 
 def test_manual_sync_requires_selected_groups(tmp_path, monkeypatch):
@@ -339,6 +346,62 @@ def test_tracememo_messages_are_cached_until_force_refetch(tmp_path, monkeypatch
     assert second["cached_messages"] == 1
     assert forced["cache_mode"] == "tracememo"
     assert db.one("SELECT COUNT(*) AS count FROM tracememo_message_cache")["count"] == 1
+
+
+def test_tracememo_auto_sync_fetches_from_group_cursor_and_skips_recognized_messages(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    from app import main as main_module
+
+    initial_cursor = datetime.now(timezone.utc) - timedelta(minutes=10)
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+            ("trace", "tracememo", "http://trace", 1, "{}", db.utc_now()),
+        )
+        connection.execute(
+            "INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            ("group", "trace", "room", "招聘群", 1, 1, db.utc_now(), db.utc_now()),
+        )
+        connection.execute(
+            "INSERT INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)",
+            ("group", initial_cursor.isoformat(timespec="seconds"), None, db.utc_now()),
+        )
+
+    calls: list[tuple[datetime, datetime]] = []
+
+    class FakeTraceMemoClient:
+        def __init__(self, base_url, token):
+            pass
+
+        def messages(self, talker, start, end):
+            calls.append((start, end))
+            return [{
+                "id": "incremental-message",
+                "type": "普通文本",
+                "text": "增量招聘信息",
+                "datetime": (end - timedelta(seconds=1)).isoformat(timespec="seconds"),
+            }]
+
+    monkeypatch.setattr(main_module, "TraceMemoClient", FakeTraceMemoClient)
+    first = main_module._sync_tracememo_once(incremental=True)
+    raw_id = db.one("SELECT id FROM raw_messages WHERE external_message_id='incremental-message'")["id"]
+    with db.connect() as connection:
+        connection.execute("UPDATE processing_jobs SET status='succeeded',stage='completed' WHERE raw_message_id=?", (raw_id,))
+        connection.execute("UPDATE raw_messages SET is_recruitment=0,recognition_status='succeeded',recognized_at=? WHERE id=?", (db.utc_now(), raw_id))
+    second = main_module._sync_tracememo_once(incremental=True)
+
+    assert first["incremental"] is True
+    assert first["created"] == 1
+    assert first["remote_fetches"] == 1
+    assert second["incremental"] is True
+    assert second["created"] == 0
+    assert second["recognized_skipped"] == 1
+    assert second["cached_groups"] == 0
+    assert len(calls) == 2
+    assert calls[1][0] >= calls[0][1] - timedelta(minutes=1, seconds=1)
+    assert db.one("SELECT COUNT(*) AS count FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["count"] == 1
 
 
 def test_admin_can_manage_local_storage_and_edit_company(tmp_path, monkeypatch):

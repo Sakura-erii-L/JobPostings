@@ -25,6 +25,29 @@ def test_init_db_migrates_legacy_processing_jobs_before_index(tmp_path, monkeypa
     assert db.one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_processing_jobs_ready'")
 
 
+def test_init_db_migrates_legacy_raw_message_recognition_columns(tmp_path, monkeypatch):
+    database = tmp_path / "data" / "jobpostings.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """CREATE TABLE raw_messages (
+               id TEXT PRIMARY KEY, connector_id TEXT, source_group_id TEXT, external_message_id TEXT,
+               sender TEXT, sent_at TEXT, message_type TEXT NOT NULL, text_content TEXT,
+               metadata_json TEXT NOT NULL DEFAULT '{}', content_hash TEXT NOT NULL UNIQUE,
+               is_recruitment INTEGER, retention_until TEXT, created_at TEXT NOT NULL)"""
+        )
+        connection.execute(
+            "INSERT INTO raw_messages(id,message_type,text_content,metadata_json,content_hash,is_recruitment,created_at) VALUES(?,?,?,?,?,?,?)",
+            ("legacy-raw", "text", "旧消息", "{}", "legacy-hash", 0, db.utc_now()),
+        )
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", database)
+    db.init_db()
+    columns = {row["name"] for row in db.all_rows("PRAGMA table_info(raw_messages)")}
+    assert {"recognition_status", "recognized_at", "recognition_error"}.issubset(columns)
+    assert db.one("SELECT recognition_status FROM raw_messages WHERE id='legacy-raw'")["recognition_status"] == "succeeded"
+
+
 def test_message_processing_creates_catalog_and_consolidation_job(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
@@ -82,10 +105,36 @@ def test_ingest_message_updates_external_id_and_requeues_changed_content(tmp_pat
         "stage": "queued",
         "cancel_requested": 0,
     }
+    assert db.one("SELECT recognition_status FROM raw_messages WHERE id=?", (raw_id,))["recognition_status"] == "pending"
 
     duplicate_stats: dict[str, int] = {}
     assert ingest_message({**message, "text": "新招聘信息"}, "tracememo", "group-1", duplicate_stats) == raw_id
     assert duplicate_stats == {"duplicates": 1}
+
+
+def test_recognized_message_is_not_requeued_when_fetched_again(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    message = {"id": "already-recognized", "type": "普通文本", "text": "已识别的招聘信息"}
+    raw_id = ingest_message(message, "tracememo", "group-1")
+    assert raw_id
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET status='succeeded',stage='completed',finished_at=?,updated_at=? WHERE raw_message_id=?",
+            (db.utc_now(), db.utc_now(), raw_id),
+        )
+        connection.execute("UPDATE raw_messages SET text_content=? WHERE id=?", ("已识别的招聘信息\nOCR 补充文字", raw_id))
+        connection.execute(
+            "UPDATE raw_messages SET is_recruitment=0,recognition_status='succeeded',recognized_at=? WHERE id=?",
+            (db.utc_now(), raw_id),
+        )
+
+    stats: dict[str, int] = {}
+    assert ingest_message({**message, "datetime": "2026/09/05 10:00:00"}, "tracememo", "group-1", stats) == raw_id
+    assert stats == {"recognized_skipped": 1}
+    assert db.one("SELECT COUNT(*) AS count FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["count"] == 1
+    assert db.one("SELECT recognition_status FROM raw_messages WHERE id=?", (raw_id,))["recognition_status"] == "succeeded"
 
 
 def test_ingest_uses_trace_datetime_and_does_not_fallback_to_creation_time(tmp_path, monkeypatch):
@@ -157,7 +206,9 @@ def test_system_messages_are_filtered_before_queueing(tmp_path, monkeypatch):
     stats: dict[str, int] = {}
     assert ingest_message({"id": "system-1", "type": "公众号链接", "text": '"甲"邀请"乙"加入了群聊', "contentData": {"type": "share", "title": "招聘"}}, "tracememo", "group-1", stats) is None
     assert stats == {"filtered_system": 1}
-    assert db.one("SELECT COUNT(*) AS count FROM raw_messages")["count"] == 0
+    assert db.one("SELECT COUNT(*) AS count FROM raw_messages")["count"] == 1
+    assert db.one("SELECT recognition_status,is_recruitment FROM raw_messages")["recognition_status"] == "filtered"
+    assert db.one("SELECT COUNT(*) AS count FROM processing_jobs")["count"] == 0
     assert db.one("SELECT COUNT(*) AS count FROM processing_jobs")["count"] == 0
 
 
@@ -390,6 +441,8 @@ def test_failed_job_review_keeps_error_original_message_and_logs(tmp_path, monke
     log_processing(job_row["id"], "classifying", "识别开始")
     result = _fail(dict(db.one("SELECT * FROM processing_jobs WHERE id=?", (job_row["id"],))), RuntimeError("模型返回无效 JSON"))
     assert result["status"] == "needs_review"
+    assert db.one("SELECT recognition_status,recognition_error FROM raw_messages WHERE id=?", (raw_id,))["recognition_status"] == "needs_review"
+    assert db.one("SELECT recognition_error FROM raw_messages WHERE id=?", (raw_id,))["recognition_error"] == "模型返回无效 JSON"
     review = db.one("SELECT payload_json FROM review_items WHERE entity_type='processing_job'")
     assert review
     payload = json.loads(review["payload_json"])

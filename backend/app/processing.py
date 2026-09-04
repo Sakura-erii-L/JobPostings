@@ -91,6 +91,10 @@ def _increment_ingest_stat(stats: dict[str, int] | None, key: str) -> None:
 
 
 def _queue_classification(connection: Any, raw_id: str) -> None:
+    connection.execute(
+        "UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL WHERE id=? AND recognition_status NOT IN ('running')",
+        (raw_id,),
+    )
     job = connection.execute(
         "SELECT id,status FROM processing_jobs WHERE raw_message_id=? AND kind='classify' ORDER BY created_at DESC LIMIT 1",
         (raw_id,),
@@ -112,12 +116,23 @@ def _queue_classification(connection: Any, raw_id: str) -> None:
         )
 
 
+def _set_recognition_status(raw_message_id: str | None, status: str, error: str | None = None) -> None:
+    if not raw_message_id:
+        return
+    recognized_at = utc_now() if status in {"succeeded", "filtered"} else None
+    with connect() as connection:
+        connection.execute(
+            """UPDATE raw_messages
+               SET recognition_status=?,recognized_at=?,recognition_error=?
+               WHERE id=?""",
+            (status, recognized_at, error, raw_message_id),
+        )
+
+
 def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: str | None, stats: dict[str, int] | None = None) -> str | None:
     message_type = str(message.get("type") or message.get("msgType") or "text").strip().lower()
     original_text = str(message.get("text") or message.get("content") or "")
-    if is_system_message(message_type, original_text, message):
-        _increment_ingest_stat(stats, "filtered_system")
-        return None
+    system_message = is_system_message(message_type, original_text, message)
     text, metadata = parse_message_payload(message)
     digest = message_hash(connector_id, group_id, message)
     metadata["_original_text_content"] = original_text
@@ -131,16 +146,25 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
         retention_days = 30
     retention = (datetime.now(timezone.utc) + timedelta(days=retention_days)).isoformat(timespec="seconds")
     with connect() as connection:
-        existing = connection.execute("SELECT id,sent_at FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
+        existing = connection.execute("SELECT id,sent_at,recognition_status FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
         if existing:
             if sent_at and existing["sent_at"] != sent_at:
                 connection.execute("UPDATE raw_messages SET sent_at=? WHERE id=?", (sent_at, existing["id"]))
-            _increment_ingest_stat(stats, "duplicates")
-            return existing["id"]
+            if system_message:
+                connection.execute(
+                    "UPDATE raw_messages SET is_recruitment=0,recognition_status='filtered',recognized_at=COALESCE(recognized_at,?),recognition_error=NULL WHERE id=?",
+                    (utc_now(), existing["id"]),
+                )
+                _increment_ingest_stat(stats, "filtered_system")
+            elif existing["recognition_status"] in {"succeeded", "filtered"}:
+                _increment_ingest_stat(stats, "recognized_skipped")
+            else:
+                _increment_ingest_stat(stats, "duplicates")
+            return None if system_message else existing["id"]
         existing_external = None
         if connector_id and group_id and external_id:
             existing_external = connection.execute(
-                "SELECT id,text_content,metadata_json FROM raw_messages WHERE connector_id=? AND source_group_id=? AND external_message_id=?",
+                "SELECT id,text_content,message_type,metadata_json,recognition_status,is_recruitment FROM raw_messages WHERE connector_id=? AND source_group_id=? AND external_message_id=?",
                 (connector_id, group_id, external_id),
             ).fetchone()
         if existing_external:
@@ -152,10 +176,41 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
             except (TypeError, json.JSONDecodeError):
                 pass
             merged_metadata = {**old_metadata, **metadata}
+            previous_source_text = old_metadata.get("_parsed_text_content", existing_external["text_content"] or "")
+            same_content = (text or "") == str(previous_source_text or "") and message_type == existing_external["message_type"] and (
+                str(metadata.get("source_url") or metadata.get("url") or "")
+                == str(old_metadata.get("source_url") or old_metadata.get("url") or "")
+            )
+            if same_content:
+                connection.execute(
+                    """UPDATE raw_messages
+                       SET sender=?,sent_at=?,message_type=?,metadata_json=?,content_hash=?,retention_until=?
+                       WHERE id=?""",
+                    (
+                        str(message.get("sender") or message.get("talker") or ""),
+                        sent_at,
+                        message_type,
+                        json.dumps(merged_metadata, ensure_ascii=False),
+                        digest,
+                        retention,
+                        existing_external["id"],
+                    ),
+                )
+                if system_message:
+                    connection.execute(
+                        "UPDATE raw_messages SET is_recruitment=0,recognition_status='filtered',recognized_at=COALESCE(recognized_at,?),recognition_error=NULL WHERE id=?",
+                        (utc_now(), existing_external["id"]),
+                    )
+                    _increment_ingest_stat(stats, "filtered_system")
+                elif existing_external["recognition_status"] in {"succeeded", "filtered"}:
+                    _increment_ingest_stat(stats, "recognized_skipped")
+                else:
+                    _increment_ingest_stat(stats, "duplicates")
+                return None if system_message else existing_external["id"]
             connection.execute(
                 """UPDATE raw_messages
                    SET sender=?,sent_at=?,message_type=?,text_content=?,metadata_json=?,content_hash=?,
-                       is_recruitment=NULL,retention_until=?
+                       is_recruitment=?,recognition_status=?,recognized_at=?,recognition_error=NULL,retention_until=?
                    WHERE id=?""",
                 (
                     str(message.get("sender") or message.get("talker") or ""),
@@ -164,27 +219,60 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
                     text or existing_external["text_content"] or "",
                     json.dumps(merged_metadata, ensure_ascii=False),
                     digest,
+                    0 if system_message else None,
+                    "filtered" if system_message else "pending",
+                    utc_now() if system_message else None,
                     retention,
                     existing_external["id"],
                 ),
             )
-            _queue_classification(connection, existing_external["id"])
-            _increment_ingest_stat(stats, "updated")
-            return existing_external["id"]
+            if system_message:
+                _increment_ingest_stat(stats, "filtered_system")
+            else:
+                _queue_classification(connection, existing_external["id"])
+                _increment_ingest_stat(stats, "updated")
+            return None if system_message else existing_external["id"]
         try:
             connection.execute(
-                "INSERT INTO raw_messages(id,connector_id,source_group_id,external_message_id,sender,sent_at,message_type,text_content,metadata_json,content_hash,retention_until,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (raw_id, connector_id, group_id, external_id, str(message.get("sender") or message.get("talker") or ""), sent_at, message_type, text, json.dumps(metadata, ensure_ascii=False), digest, retention, utc_now()),
+                """INSERT INTO raw_messages(
+                   id,connector_id,source_group_id,external_message_id,sender,sent_at,message_type,text_content,
+                   metadata_json,content_hash,is_recruitment,recognition_status,recognized_at,recognition_error,
+                   retention_until,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    raw_id,
+                    connector_id,
+                    group_id,
+                    external_id,
+                    str(message.get("sender") or message.get("talker") or ""),
+                    sent_at,
+                    message_type,
+                    text,
+                    json.dumps(metadata, ensure_ascii=False),
+                    digest,
+                    0 if system_message else None,
+                    "filtered" if system_message else "pending",
+                    utc_now() if system_message else None,
+                    None,
+                    retention,
+                    utc_now(),
+                ),
             )
-            _queue_classification(connection, raw_id)
-            _increment_ingest_stat(stats, "created")
+            if system_message:
+                _increment_ingest_stat(stats, "filtered_system")
+            else:
+                _queue_classification(connection, raw_id)
+                _increment_ingest_stat(stats, "created")
         except sqlite3.IntegrityError:
             existing = connection.execute("SELECT id FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
             if existing:
+                if system_message:
+                    _increment_ingest_stat(stats, "filtered_system")
+                    return None
                 _increment_ingest_stat(stats, "duplicates")
                 return existing["id"]
             raise
-    return raw_id
+    return None if system_message else raw_id
 
 
 def log_processing(job_id: str, stage: str, message: str, level: str = "info", details: dict[str, Any] | None = None) -> None:
@@ -220,6 +308,11 @@ def _claim_one() -> dict[str, Any] | None:
         ).rowcount
         if not changed:
             return None
+        if row["kind"] == "classify" and row["raw_message_id"]:
+            connection.execute(
+                "UPDATE raw_messages SET recognition_status='running',recognized_at=NULL,recognition_error=NULL WHERE id=?",
+                (row["raw_message_id"],),
+            )
         return dict(connection.execute("SELECT * FROM processing_jobs WHERE id=?", (row["id"],)).fetchone())
 
 
@@ -370,6 +463,9 @@ def _raw_snapshot(raw_message_id: str | None) -> dict[str, Any] | None:
         "sender": value.get("sender"),
         "sent_at": value.get("sent_at"),
         "message_type": value.get("message_type"),
+        "recognition_status": value.get("recognition_status"),
+        "recognized_at": value.get("recognized_at"),
+        "recognition_error": value.get("recognition_error"),
         "original_text_content": original_text if original_text is not None else value.get("text_content") or "",
         "current_text_content": value.get("text_content") or "",
         "metadata": metadata,
@@ -619,10 +715,17 @@ def _finish(job_id: str, result: dict[str, Any]) -> None:
         log_processing(job_id, "canceled", "任务已取消，忽略迟到结果", "warning")
         return
     with connect() as connection:
+        job = connection.execute("SELECT kind,raw_message_id FROM processing_jobs WHERE id=?", (job_id,)).fetchone()
+        finished_at = utc_now()
         connection.execute(
             "UPDATE processing_jobs SET status='succeeded',stage='completed',lease_until=NULL,error=NULL,result_json=?,finished_at=?,updated_at=? WHERE id=?",
-            (json.dumps(result, ensure_ascii=False), utc_now(), utc_now(), job_id),
+            (json.dumps(result, ensure_ascii=False), finished_at, finished_at, job_id),
         )
+        if job and job["kind"] == "classify" and job["raw_message_id"]:
+            connection.execute(
+                "UPDATE raw_messages SET recognition_status='succeeded',recognized_at=?,recognition_error=NULL WHERE id=?",
+                (finished_at, job["raw_message_id"]),
+            )
     log_processing(job_id, "completed", "任务处理完成", details=result)
 
 
@@ -630,6 +733,7 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
     error = str(exc)
     current = one("SELECT status,cancel_requested,attempts FROM processing_jobs WHERE id=?", (job["id"],))
     if not current or current["status"] == "canceled" or current["cancel_requested"]:
+        _set_recognition_status(job.get("raw_message_id"), "canceled")
         return {"status": "canceled", "id": job["id"]}
     attempts = int(current["attempts"])
     delays = [10, 30, 90]
@@ -655,8 +759,10 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
                 (str(uuid4()), "processing_failed", "processing_job", entity_id, json.dumps(review_payload, ensure_ascii=False), utc_now()),
             )
     if retry_at:
+        _set_recognition_status(job.get("raw_message_id"), "pending", error)
         log_processing(job["id"], "retry_wait", f"处理失败，将自动进行第 {attempts + 1} 次尝试", "warning", {"error": error, "retry_at": retry_at})
         return {"status": "retry_wait", "id": job["id"], "error": error}
+    _set_recognition_status(job.get("raw_message_id"), "needs_review", error)
     log_processing(job["id"], "failed", "自动重试已用尽，转入人工处理", "error", {"error": error})
     return {"status": status, "id": job["id"], "error": error}
 
@@ -758,6 +864,7 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
     if not raw_row:
         raise RuntimeError("Raw message not found")
     raw = dict(raw_row)
+    _set_recognition_status(raw["id"], "running")
     try:
         raw_metadata = json.loads(raw.get("metadata_json") or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -766,9 +873,13 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
         with connect() as connection:
             connection.execute("UPDATE raw_messages SET is_recruitment=0 WHERE id=?", (raw["id"],))
         _finish(job["id"], {"is_recruitment": False, "reason": "system_message_filtered"})
+        job_status = one("SELECT status FROM processing_jobs WHERE id=?", (job["id"],))
+        if job_status and job_status["status"] == "succeeded":
+            _set_recognition_status(raw["id"], "filtered")
         return {"status": "succeeded", "is_recruitment": False, "filtered": "system_message", "id": job["id"]}
     text, metadata = _extract_source_text(job, raw)
     if not _still_active(job["id"]):
+        _set_recognition_status(raw["id"], "canceled")
         return {"status": "canceled", "id": job["id"]}
     engine = str(get_setting("processing_engine", "codex") or "codex")
     processor = "local_codex:gpt-5.6-luna" if engine == "codex" else "generic_llm"
@@ -777,6 +888,7 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
     item = _classify_source(job, message)
     item["message_id"] = raw["id"]
     if not _still_active(job["id"]):
+        _set_recognition_status(raw["id"], "canceled")
         return {"status": "canceled", "id": job["id"]}
     with connect() as connection:
         connection.execute("UPDATE raw_messages SET is_recruitment=? WHERE id=?", (1 if item.get("is_recruitment") else 0, raw["id"]))

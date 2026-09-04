@@ -138,6 +138,9 @@ CREATE TABLE IF NOT EXISTS raw_messages (
   metadata_json TEXT NOT NULL DEFAULT '{}',
   content_hash TEXT NOT NULL UNIQUE,
   is_recruitment INTEGER,
+  recognition_status TEXT NOT NULL DEFAULT 'pending',
+  recognized_at TEXT,
+  recognition_error TEXT,
   retention_until TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(connector_id, source_group_id, external_message_id)
@@ -503,6 +506,11 @@ def init_db() -> None:
                 "started_at": "TEXT",
                 "finished_at": "TEXT",
             },
+            "raw_messages": {
+                "recognition_status": "TEXT NOT NULL DEFAULT 'pending'",
+                "recognized_at": "TEXT",
+                "recognition_error": "TEXT",
+            },
             "companies": {
                 "company_nature": "TEXT",
                 "founded_at": "TEXT",
@@ -527,11 +535,33 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_processing_jobs_ready ON processing_jobs(status, next_attempt_at, created_at)"
         )
         connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_raw_messages_recognition_status ON raw_messages(recognition_status, created_at)"
+        )
+        connection.execute(
+            """UPDATE raw_messages
+               SET recognition_status='succeeded',recognized_at=COALESCE(recognized_at,created_at),recognition_error=NULL
+               WHERE recognition_status='pending' AND is_recruitment IS NOT NULL"""
+        )
+        connection.execute(
+            """UPDATE raw_messages
+               SET recognition_status=CASE
+                   WHEN p.status IN ('needs_review','paused_quota','failed') THEN 'needs_review'
+                   WHEN p.status='canceled' THEN 'canceled'
+                   WHEN p.status='running' THEN 'running'
+                   ELSE 'pending'
+               END,
+                   recognition_error=CASE WHEN p.status IN ('needs_review','paused_quota','failed') THEN p.error ELSE NULL END
+               FROM processing_jobs p
+               WHERE p.raw_message_id=raw_messages.id
+                 AND raw_messages.recognition_status='pending'
+                 AND raw_messages.is_recruitment IS NULL"""
+        )
+        connection.execute(
             "INSERT OR IGNORE INTO queue_control(id,state,updated_at) VALUES(1,'paused',?)",
             (utc_now(),),
         )
         connection.execute(
-            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '2')"
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '3')"
         )
         connection.execute(
             """INSERT OR IGNORE INTO system_settings(key, value_json, updated_at)

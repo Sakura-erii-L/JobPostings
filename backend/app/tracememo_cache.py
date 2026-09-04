@@ -67,10 +67,17 @@ def store_messages(
             content_hash = _message_hash(connector_id, source_group_id, message)
             external_id = str(message.get("id") or message.get("messageId") or "") or None
             source_time = parse_message_time(message)
-            existing = connection.execute(
-                "SELECT id FROM tracememo_message_cache WHERE connector_id=? AND source_group_id=? AND content_hash=?",
-                (connector_id, source_group_id, content_hash),
-            ).fetchone()
+            existing = None
+            if external_id:
+                existing = connection.execute(
+                    "SELECT id FROM tracememo_message_cache WHERE connector_id=? AND source_group_id=? AND external_message_id=?",
+                    (connector_id, source_group_id, external_id),
+                ).fetchone()
+            if not existing:
+                existing = connection.execute(
+                    "SELECT id FROM tracememo_message_cache WHERE connector_id=? AND source_group_id=? AND content_hash=?",
+                    (connector_id, source_group_id, content_hash),
+                ).fetchone()
             if existing:
                 connection.execute(
                     """UPDATE tracememo_message_cache

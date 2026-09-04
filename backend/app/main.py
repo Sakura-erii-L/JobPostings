@@ -277,12 +277,24 @@ def _import_days() -> int:
         return 30
 
 
-def sync_tracememo_once(force: bool = False) -> dict[str, Any]:
+def _sync_cursor_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict[str, Any]:
     with _sync_lock:
-        return _sync_tracememo_once(force)
+        return _sync_tracememo_once(force, incremental)
 
 
-def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
+def _sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict[str, Any]:
     row = one("SELECT * FROM connectors WHERE kind='tracememo' AND enabled=1")
     if not row:
         return {"status": "disabled", "fetched": 0, "groups": 0}
@@ -302,11 +314,17 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
     cached_groups = 0
     cached_messages = 0
     import_days = _import_days()
-    ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "ignored": 0, "filtered_system": 0, "media_attached": 0, "media_failed": 0, "outside_window": 0, "missing_source_time": 0}
+    ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "recognized_skipped": 0, "ignored": 0, "filtered_system": 0, "media_attached": 0, "media_failed": 0, "outside_window": 0, "missing_source_time": 0}
     for group in groups:
         end = datetime.now(timezone.utc)
-        start = end - timedelta(days=import_days)
-        if has_cached_group(row["id"], group["id"]):
+        cursor = one("SELECT cursor_time FROM sync_cursors WHERE source_group_id=?", (group["id"],))
+        cursor_time = _sync_cursor_datetime(cursor["cursor_time"] if cursor else None)
+        if incremental and not force and cursor_time and cursor_time <= end:
+            start = cursor_time - timedelta(minutes=1)
+        else:
+            start = end - timedelta(days=import_days)
+        use_cache = not force and not incremental and has_cached_group(row["id"], group["id"])
+        if use_cache:
             messages = load_cached_messages(row["id"], group["id"])
             cached_groups += 1
             cached_messages += len(messages)
@@ -348,8 +366,9 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
                         processing_job = one("SELECT id FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))
                         if processing_job:
                             log_processing(processing_job["id"], "extracting", "TraceMemo 媒体下载失败，后续将保留原消息并尝试其他提取方式", "warning", {"media_id": media_id, "error": str(exc)})
-        with connect() as connection:
-            connection.execute("INSERT OR REPLACE INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)", (group["id"], end.isoformat(), None, utc_now()))
+        if not use_cache:
+            with connect() as connection:
+                connection.execute("INSERT OR REPLACE INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)", (group["id"], end.isoformat(), None, utc_now()))
     return {
         "status": "completed",
         "fetched": fetched,
@@ -357,6 +376,7 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
         "created": ingest_stats["created"],
         "updated": ingest_stats["updated"],
         "duplicates": ingest_stats["duplicates"],
+        "recognized_skipped": ingest_stats["recognized_skipped"],
         "ignored": ingest_stats["ignored"],
         "filtered_system": ingest_stats["filtered_system"],
         "media_attached": ingest_stats["media_attached"],
@@ -365,6 +385,7 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
         "missing_source_time": ingest_stats["missing_source_time"],
         "import_days": import_days,
         "force": force,
+        "incremental": incremental,
         "cache_mode": "mixed" if remote_fetches and cached_groups else ("tracememo" if remote_fetches else "cache"),
         "remote_fetches": remote_fetches,
         "cached_groups": cached_groups,
@@ -380,7 +401,7 @@ async def auto_sync_loop() -> None:
         await asyncio.sleep(interval * 60)
         try:
             await events.publish("sync.started", {"interval_minutes": interval})
-            result = await asyncio.to_thread(sync_tracememo_once)
+            result = await asyncio.to_thread(sync_tracememo_once, False, True)
             if result.get("status") == "completed":
                 await events.publish("sync.completed", result)
         except Exception as exc:
@@ -399,6 +420,10 @@ async def lifespan(app: FastAPI):
         connection.execute(
             "UPDATE processing_jobs SET status='pending',stage='queued',lease_until=NULL,updated_at=? WHERE status='running' AND cancel_requested=0",
             (utc_now(),),
+        )
+        connection.execute(
+            """UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL
+               WHERE id IN (SELECT raw_message_id FROM processing_jobs WHERE status='pending' AND kind='classify' AND raw_message_id IS NOT NULL)"""
         )
     task1 = asyncio.create_task(worker_loop())
     task2 = asyncio.create_task(retention_loop())
@@ -768,7 +793,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         f"""
         SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
                p.cancel_requested,p.processor,p.error,p.created_at,p.updated_at,p.started_at,p.finished_at,
-               r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,
+               r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,r.recognition_status,r.recognized_at,r.recognition_error,
                substr(COALESCE(r.text_content,''),1,240) AS text_preview,
                sg.name AS source_group_name
         FROM processing_jobs p
@@ -804,6 +829,15 @@ def control_processing_queue(body: QueueControlRequest, _: dict[str, Any] = Depe
                 "UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE status IN ('pending','running','needs_review','paused_quota','failed')",
                 (utc_now(), utc_now()),
             )
+            if canceled_ids:
+                connection.execute(
+                    """UPDATE raw_messages SET recognition_status='canceled',recognized_at=NULL,recognition_error=NULL
+                       WHERE id IN (
+                           SELECT raw_message_id FROM processing_jobs
+                           WHERE id IN ({}) AND kind='classify' AND raw_message_id IS NOT NULL
+                       )""".format(",".join("?" for _ in canceled_ids)),
+                    tuple(canceled_ids),
+                )
     if body.action == "cancel_all":
         from .codex_agent import cancel_codex_job
 
@@ -831,6 +865,14 @@ def cancel_processing_jobs(body: QueueBulkRequest, _: dict[str, Any] = Depends(r
                 f"UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE id IN ({cancellable_placeholders})",
                 (utc_now(), utc_now(), *cancellable),
             )
+            connection.execute(
+                f"""UPDATE raw_messages SET recognition_status='canceled',recognized_at=NULL,recognition_error=NULL
+                   WHERE id IN (
+                       SELECT raw_message_id FROM processing_jobs
+                       WHERE id IN ({cancellable_placeholders}) AND kind='classify' AND raw_message_id IS NOT NULL
+                   )""",
+                tuple(cancellable),
+            )
     from .codex_agent import cancel_codex_job
 
     for job_id in cancellable:
@@ -851,6 +893,11 @@ def cancel_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin
         connection.execute(
             "UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE id=?",
             (utc_now(), utc_now(), job_id),
+        )
+        connection.execute(
+            """UPDATE raw_messages SET recognition_status='canceled',recognized_at=NULL,recognition_error=NULL
+               WHERE id=(SELECT raw_message_id FROM processing_jobs WHERE id=? AND kind='classify')""",
+            (job_id,),
         )
     from .codex_agent import cancel_codex_job
 
@@ -878,6 +925,10 @@ def update_processing_text(job_id: str, body: QueueTextRequest, _: dict[str, Any
         raise HTTPException(404, "Processing source was not found")
     with connect() as connection:
         connection.execute("UPDATE raw_messages SET text_content=? WHERE id=?", (body.text, job["raw_message_id"]))
+        connection.execute(
+            "UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL WHERE id=?",
+            (job["raw_message_id"],),
+        )
         connection.execute("UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,error=NULL,next_attempt_at=NULL,finished_at=NULL,updated_at=? WHERE id=?", (utc_now(), job_id))
     return {"id": job_id, "status": "pending"}
 
@@ -893,6 +944,11 @@ def retry_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin)
         connection.execute(
             "UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,lease_until=NULL,next_attempt_at=NULL,error=NULL,finished_at=NULL,updated_at=? WHERE id=?",
             (utc_now(), job_id),
+        )
+        connection.execute(
+            """UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL
+               WHERE id=(SELECT raw_message_id FROM processing_jobs WHERE id=? AND kind='classify')""",
+            (job_id,),
         )
     log_processing(job_id, "queued", "管理员将任务重新加入队列")
     return {"id": job_id, "status": "pending"}
