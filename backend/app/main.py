@@ -18,16 +18,18 @@ from pydantic import BaseModel, EmailStr, Field
 
 from .auth import authenticate_password, create_session, initial_admin_password_required, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_initial_admin_password, set_user_password, verify_code
 from .backups import WebDAVClient, _backup_credentials, create_backup, list_backups, validate_remote_backup
-from .catalog import refresh_expiration
+from .catalog import COMPANY_OVERRIDE_COLUMNS, INDUSTRIES, apply_company_overrides, company_overrides, refresh_expiration
 from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
 from .maintenance import repair_source_urls, reset_recruitment_data
+from .local_storage import clear_cache, clear_chat_records, delete_local_database_backup, storage_snapshot
 from .parsers import is_file_message, is_image_message, parse_message_time
 from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
 from .security import SecretVault, hash_password, hash_value, token
 from .tracememo import TraceMemoClient, normalize_group
+from .tracememo_cache import has_cached_group, load_cached_messages, store_messages
 
 
 class BootstrapRequest(BaseModel):
@@ -85,6 +87,23 @@ class GroupSelection(BaseModel):
 
 class SettingsUpdate(BaseModel):
     values: dict[str, Any]
+
+
+class CompanyUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=300)
+    legal_name: str | None = Field(default=None, max_length=300)
+    aliases: list[str] | None = Field(default=None, max_length=100)
+    summary: str | None = Field(default=None, max_length=100_000)
+    primary_industry: str | None = Field(default=None, max_length=80)
+    secondary_industries: list[str] | None = Field(default=None, max_length=100)
+    website: str | None = Field(default=None, max_length=2_000)
+    company_nature: str | None = Field(default=None, max_length=300)
+    founded_at: str | None = Field(default=None, max_length=100)
+    company_size: str | None = Field(default=None, max_length=300)
+    headquarters: str | None = Field(default=None, max_length=500)
+    businesses: list[str] | None = Field(default=None, max_length=100)
+    highlights: list[str] | None = Field(default=None, max_length=100)
+    official_channels: list[str] | None = Field(default=None, max_length=100)
 
 
 class JobStateRequest(BaseModel):
@@ -274,12 +293,23 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
         }
     reset_result = reset_recruitment_data() if force else None
     fetched = 0
+    remote_fetches = 0
+    cached_groups = 0
+    cached_messages = 0
     import_days = _import_days()
     ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "ignored": 0, "filtered_system": 0, "media_attached": 0, "media_failed": 0, "outside_window": 0, "missing_source_time": 0}
     for group in groups:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=import_days)
-        for message in client.messages(group["external_id"], start, end):
+        if has_cached_group(row["id"], group["id"]):
+            messages = load_cached_messages(row["id"], group["id"])
+            cached_groups += 1
+            cached_messages += len(messages)
+        else:
+            messages = client.messages(group["external_id"], start, end)
+            remote_fetches += 1
+            store_messages(row["id"], group["id"], messages, start, end)
+        for message in messages:
             if not isinstance(message, dict):
                 ingest_stats["ignored"] += 1
                 continue
@@ -330,6 +360,10 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
         "missing_source_time": ingest_stats["missing_source_time"],
         "import_days": import_days,
         "force": force,
+        "cache_mode": "mixed" if remote_fetches and cached_groups else ("tracememo" if remote_fetches else "cache"),
+        "remote_fetches": remote_fetches,
+        "cached_groups": cached_groups,
+        "cached_messages": cached_messages,
         "reset": reset_result,
         "groups": len(groups),
     }
@@ -890,6 +924,7 @@ def companies(q: str | None = None, industry: str | None = None, _: dict[str, An
     for row in all_rows(sql, tuple(params)):
         value = dict(row)
         value["job_count"] = row["job_count"]
+        value.pop("manual_overrides_json", None)
         value["aliases"] = json.loads(value.pop("aliases_json"))
         value["secondary_industries"] = json.loads(value.pop("secondary_industries_json"))
         result.append(value)
@@ -911,6 +946,7 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
                     pass
     evidences = [dict(row) for row in all_rows("SELECT * FROM evidences WHERE company_id=? OR job_id IN (SELECT id FROM jobs WHERE company_id=?) ORDER BY observed_at DESC", (company_id, company_id))]
     result = dict(company)
+    result.pop("manual_overrides_json", None)
     result["aliases"] = json.loads(result.pop("aliases_json"))
     result["secondary_industries"] = json.loads(result.pop("secondary_industries_json"))
     for key in ("businesses_json", "highlights_json", "official_channels_json"):
@@ -919,6 +955,64 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
     result["evidences"] = evidences
     result["events"] = recruitment_events(company_id=company_id, _=_)
     return result
+
+
+@app.put("/api/v1/companies/{company_id}")
+async def update_company(company_id: str, body: CompanyUpdate, user: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    values = body.model_dump(exclude_unset=True)
+    if not values:
+        raise HTTPException(400, "No company fields were provided")
+    list_fields = {"aliases", "secondary_industries", "businesses", "highlights", "official_channels"}
+    normalized: dict[str, Any] = {}
+    for field, value in values.items():
+        if field not in COMPANY_OVERRIDE_COLUMNS:
+            continue
+        if field in list_fields:
+            if value is None:
+                normalized[field] = []
+            else:
+                normalized[field] = list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+        elif field == "primary_industry":
+            normalized[field] = value or "other"
+            if normalized[field] not in INDUSTRIES:
+                raise HTTPException(400, "Unknown primary industry")
+        elif field == "display_name":
+            normalized[field] = str(value).strip()
+            if not normalized[field]:
+                raise HTTPException(400, "Company display name cannot be empty")
+        elif value is None:
+            normalized[field] = None
+        else:
+            normalized[field] = str(value).strip()
+    if not normalized:
+        raise HTTPException(400, "No editable company fields were provided")
+    now = utc_now()
+    with connect() as connection:
+        company = connection.execute("SELECT * FROM companies WHERE id=?", (company_id,)).fetchone()
+        if not company:
+            raise HTTPException(404, "Company not found")
+        overrides = {**company_overrides(company["manual_overrides_json"]), **normalized}
+        apply_company_overrides(connection, company_id, normalized, now)
+        connection.execute(
+            "UPDATE companies SET manual_overrides_json=?,summary_locked=CASE WHEN ? THEN 1 ELSE summary_locked END,updated_at=? WHERE id=?",
+            (json.dumps(overrides, ensure_ascii=False), int("summary" in normalized), now, company_id),
+        )
+        updated = connection.execute("SELECT display_name,summary FROM companies WHERE id=?", (company_id,)).fetchone()
+        indexed = connection.execute(
+            "UPDATE search_index SET title=?,body=? WHERE entity_type='company' AND entity_id=?",
+            (updated["display_name"], f"{updated['display_name']} {updated['summary'] or ''}".strip(), company_id),
+        ).rowcount
+        if not indexed:
+            connection.execute(
+                "INSERT INTO search_index(entity_type,entity_id,title,body) VALUES('company',?,?,?)",
+                (company_id, updated["display_name"], f"{updated['display_name']} {updated['summary'] or ''}".strip()),
+            )
+        connection.execute(
+            "INSERT INTO company_versions(id,company_id,profile_json,decision,reason,processor,created_at) VALUES(?,?,?,?,?,?,?)",
+            (str(uuid4()), company_id, json.dumps(normalized, ensure_ascii=False), "manual_edit", "管理员手动编辑企业资料", f"admin:{user['id']}", now),
+        )
+    await events.publish("company.updated", {"company_id": company_id})
+    return company_detail(company_id, user)
 
 
 @app.get("/api/v1/evidences/{evidence_id}")
@@ -1113,6 +1207,33 @@ def test_backup(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
         return {"ok": True, "remote_directory": directory}
     except Exception as exc:
         raise HTTPException(502, f"WebDAV test failed: {exc}") from exc
+
+
+@app.get("/api/v1/admin/local-storage")
+def local_storage(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    return storage_snapshot()
+
+
+@app.delete("/api/v1/admin/local-storage/cache")
+def clear_local_cache(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    return {"deleted": clear_cache(), "storage": storage_snapshot()}
+
+
+@app.delete("/api/v1/admin/local-storage/chat-records")
+async def clear_local_chat_records(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    deleted = await asyncio.to_thread(clear_chat_records)
+    return {"deleted": deleted, "storage": storage_snapshot()}
+
+
+@app.delete("/api/v1/admin/local-storage/backups/{filename}")
+def delete_local_backup(filename: str, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        deleted = delete_local_database_backup(filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"deleted": deleted, "storage": storage_snapshot()}
 
 
 @app.post("/api/v1/admin/backups/run")

@@ -37,6 +37,8 @@ _RECRUITMENT_TABLES = (
     "processing_jobs",
     "raw_messages",
     "sync_cursors",
+    "tracememo_message_cache",
+    "tracememo_cache_state",
     "ingest_runs",
     "llm_calls",
     "notifications",

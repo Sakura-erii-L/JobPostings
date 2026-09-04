@@ -90,6 +90,30 @@ CREATE TABLE IF NOT EXISTS sync_cursors (
   cursor_message_id TEXT,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tracememo_message_cache (
+  id TEXT PRIMARY KEY,
+  connector_id TEXT NOT NULL REFERENCES connectors(id) ON DELETE CASCADE,
+  source_group_id TEXT NOT NULL REFERENCES source_groups(id) ON DELETE CASCADE,
+  external_message_id TEXT,
+  content_hash TEXT NOT NULL,
+  source_time TEXT,
+  message_json TEXT NOT NULL,
+  first_fetched_at TEXT NOT NULL,
+  last_fetched_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(connector_id, source_group_id, content_hash)
+);
+CREATE TABLE IF NOT EXISTS tracememo_cache_state (
+  connector_id TEXT NOT NULL REFERENCES connectors(id) ON DELETE CASCADE,
+  source_group_id TEXT NOT NULL REFERENCES source_groups(id) ON DELETE CASCADE,
+  first_fetched_at TEXT NOT NULL,
+  last_fetched_at TEXT NOT NULL,
+  last_start_at TEXT,
+  last_end_at TEXT,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY(connector_id, source_group_id)
+);
 CREATE TABLE IF NOT EXISTS ingest_runs (
   id TEXT PRIMARY KEY,
   source_group_id TEXT,
@@ -181,6 +205,7 @@ CREATE TABLE IF NOT EXISTS companies (
   highlights_json TEXT NOT NULL DEFAULT '[]',
   official_channels_json TEXT NOT NULL DEFAULT '[]',
   summary_locked INTEGER NOT NULL DEFAULT 0,
+  manual_overrides_json TEXT NOT NULL DEFAULT '{}',
   last_consolidated_at TEXT,
   verification_status TEXT NOT NULL DEFAULT 'unverified',
   created_at TEXT NOT NULL,
@@ -416,6 +441,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   tokenize='unicode61'
 );
 CREATE INDEX IF NOT EXISTS idx_raw_messages_group_time ON raw_messages(source_group_id, sent_at);
+CREATE INDEX IF NOT EXISTS idx_tracememo_cache_group_time ON tracememo_message_cache(connector_id, source_group_id, source_time);
+CREATE INDEX IF NOT EXISTS idx_tracememo_cache_external_id ON tracememo_message_cache(connector_id, source_group_id, external_message_id);
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_processing_logs_job ON processing_logs(processing_job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id);
@@ -467,6 +494,7 @@ def init_db() -> None:
                 "highlights_json": "TEXT NOT NULL DEFAULT '[]'",
                 "official_channels_json": "TEXT NOT NULL DEFAULT '[]'",
                 "summary_locked": "INTEGER NOT NULL DEFAULT 0",
+                "manual_overrides_json": "TEXT NOT NULL DEFAULT '{}'",
                 "last_consolidated_at": "TEXT",
             },
         }

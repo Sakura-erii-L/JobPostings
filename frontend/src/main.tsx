@@ -4,7 +4,7 @@ import './styles.css'
 import './queue.css'
 
 type User = { id: string; email: string; role: string; password_configured?: boolean }
-type Company = { id: string; display_name: string; legal_name?: string; website?: string; summary?: string; primary_industry: string; job_count: number; updated_at: string; company_nature?: string; founded_at?: string; company_size?: string; headquarters?: string; businesses?: string[]; highlights?: string[]; official_channels?: string[] }
+type Company = { id: string; display_name: string; legal_name?: string; website?: string; summary?: string; primary_industry: string; secondary_industries?: string[]; job_count: number; updated_at: string; company_nature?: string; founded_at?: string; company_size?: string; headquarters?: string; businesses?: string[]; highlights?: string[]; official_channels?: string[] }
 type Job = { id: string; canonical_title: string; recruitment_type: string; employment_type: string; status: string; locations_json?: string; locations?: string[]; company_name?: string; updated_at?: string; department?: string; headcount?: string; education?: string[]; majors?: string[]; experience_requirement?: string; salary?: Record<string, any>; responsibilities?: string; requirements?: string; benefits?: string[]; application_methods?: string[]; contacts?: string[]; explicit_deadline?: string }
 type Application = Job & { state: string; favorite: number; updated_at: string }
 type Evidence = { id: string; source_url?: string; source_type: string; excerpt?: string; artifact_id?: string; artifact_ids?: string[]; qr_values?: string[]; observed_at?: string; raw_text?: string; ocr_text?: string; sender?: string; sent_at?: string; source_group_name?: string; filename?: string; mime_type?: string; metadata?: Record<string, any> }
@@ -17,6 +17,10 @@ type TraceMemoGroup = { id: string; external_id: string; name: string; avatar?: 
 type ProcessingLog = { id: string; stage: string; level: string; message: string; details: Record<string, any>; created_at: string }
 type ProcessingQueueItem = { id: string; kind: string; raw_message_id?: string | null; company_id?: string | null; status: string; stage: string; attempts: number; lease_until?: string | null; next_attempt_at?: string | null; processor?: string | null; error?: string | null; created_at: string; updated_at: string; connector_id?: string | null; source_group_id?: string | null; source_group_name?: string | null; message_type?: string | null; sender?: string | null; sent_at?: string | null; text_preview?: string | null }
 type ProcessingQueue = { state: 'running' | 'paused'; stats: Record<string, number>; items: ProcessingQueueItem[]; total: number }
+type LocalBackup = { name: string; size: number; created_at: string }
+type LocalStorageSnapshot = { database: { path: string; size: number }; backups: LocalBackup[]; tracememo_cache: { groups: number; messages: number; bytes: number }; chat_records: { messages: number; artifacts: number; artifact_bytes: number } }
+
+const INDUSTRY_OPTIONS = ['internet_software', 'ai_data', 'electronics_semiconductor', 'telecommunications', 'manufacturing_automation', 'automotive_transport_equipment', 'energy_chemical_materials', 'construction_real_estate', 'finance', 'consumer_retail_ecommerce', 'healthcare_biopharma', 'education_research', 'media_culture_entertainment', 'logistics_transportation', 'professional_services', 'government_public_nonprofit', 'agriculture', 'other']
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isForm = options.body instanceof FormData
@@ -83,10 +87,28 @@ function App() {
     source.addEventListener('job.created', refresh)
     source.addEventListener('job.updated', refresh)
     source.addEventListener('company.created', refresh)
+    source.addEventListener('company.updated', refresh)
     source.addEventListener('sync.completed', refresh)
     source.addEventListener('processing.updated', refresh)
     return () => source.close()
   }, [user, query])
+
+  useEffect(() => {
+    if (!window.history.state?.jobPostingsRoot) {
+      window.history.replaceState({ ...(window.history.state || {}), jobPostingsRoot: true }, '', window.location.href)
+    }
+    const handlePopState = () => {
+      const companyId = window.history.state?.jobPostingsCompanyId
+      if (!companyId) {
+        setSelected(null)
+        setPage('companies')
+        return
+      }
+      api<CompanyDetail>(`/companies/${companyId}`).then(setSelected).catch(reason => setError((reason as Error).message))
+    }
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [])
 
   const flash = (message: string) => {
     setNotice(message)
@@ -100,19 +122,33 @@ function App() {
     if (syncing) return
     setSyncing(true)
     try {
-      const result = await api<{ fetched: number; added: number; created: number; updated: number; duplicates: number; filtered_system?: number; media_attached?: number; media_failed?: number; reset?: { backup_path?: string; deleted?: Record<string, number> } }>('/admin/sync', { method: 'POST', ...(force ? { body: JSON.stringify({ force: true }) } : {}) })
+      const result = await api<{ fetched: number; added: number; created: number; updated: number; duplicates: number; filtered_system?: number; media_attached?: number; media_failed?: number; cache_mode?: string; remote_fetches?: number; cached_messages?: number; reset?: { backup_path?: string; deleted?: Record<string, number> } }>('/admin/sync', { method: 'POST', ...(force ? { body: JSON.stringify({ force: true }) } : {}) })
       const cleared = Object.values(result.reset?.deleted || {}).reduce((total, value) => total + value, 0)
       const resetText = force ? `；已备份并清理 ${cleared} 条旧记录` : ''
       const mediaText = result.media_attached || result.media_failed ? `；图片处理成功 ${result.media_attached || 0}，失败 ${result.media_failed || 0}` : ''
-      flash(`同步完成：读取 ${result.fetched} 条，新增 ${result.created} 条，更新 ${result.updated} 条，重复 ${result.duplicates} 条，过滤系统消息 ${result.filtered_system || 0} 条${mediaText}${resetText}`)
+      const cacheText = result.cache_mode === 'cache' ? `；使用本地缓存 ${result.cached_messages || 0} 条` : result.cache_mode === 'mixed' ? `；远程获取 ${result.remote_fetches || 0} 个群，本地缓存 ${result.cached_messages || 0} 条` : result.cache_mode === 'tracememo' ? `；远程获取 ${result.remote_fetches || 0} 个群` : ''
+      flash(`同步完成：读取 ${result.fetched} 条，新增 ${result.created} 条，更新 ${result.updated} 条，重复 ${result.duplicates} 条，过滤系统消息 ${result.filtered_system || 0} 条${cacheText}${mediaText}${resetText}`)
       await loadData()
     }
     catch (e) { setError((e as Error).message) }
     finally { setSyncing(false) }
   }
   const openCompany = async (id: string) => {
-    try { setSelected(await api<CompanyDetail>(`/companies/${id}`)) }
+    try {
+      setSelected(await api<CompanyDetail>(`/companies/${id}`))
+      setPage('companies')
+      window.history.pushState({ ...(window.history.state || {}), jobPostingsCompanyId: id }, '', window.location.href)
+    }
     catch (e) { setError((e as Error).message) }
+  }
+  const backFromCompany = () => {
+    if (window.history.state?.jobPostingsCompanyId) window.history.back()
+    else { setSelected(null); setPage('companies') }
+  }
+  const updateCompany = async (company: CompanyDetail) => {
+    setSelected(company)
+    await loadData()
+    flash('企业资料已保存')
   }
   const updateState = async (jobId: string, state: string, favorite?: boolean) => {
     try { await api(`/me/jobs/${jobId}/state`, { method: 'PUT', body: JSON.stringify({ state, ...(favorite === undefined ? {} : { favorite }) }) }); flash('求职进度已更新'); await loadData() }
@@ -152,7 +188,7 @@ function App() {
       {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
       {notice && <div className="notice">{notice}</div>}
       {!selected && notifications.filter(item => !item.read_at).slice(0, 3).map(item => <div className="notification-strip" key={item.id}><div><strong>{item.title}</strong><span>{item.body}</span></div><button onClick={() => markNotificationRead(item.id)}>知道了</button></div>)}
-      {selected ? <CompanyView company={selected} onBack={() => setSelected(null)} onState={updateState} onFollow={followCompany} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={user.role === 'admin' ? sync : undefined} syncing={syncing} onOpen={openCompany} onExport={exportJobs} onImport={() => setPage('import')} /> : page === 'timeline' ? <TimelinePage events={timeline} onOpenCompany={openCompany} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData(); setPage('queue') }} /> : page === 'admin' ? <AdminPage onNavigate={target => { setPage(target); setSelected(null) }} /> : page === 'queue' ? <QueuePage onSync={sync} syncing={syncing} /> : page === 'security' ? <AccountSecurityPage /> : page === 'review' ? <ReviewPage onResolved={async () => { await loadData() }} /> : <SettingsPage onSaved={flash} onSync={sync} syncing={syncing} />}
+      {selected ? <CompanyDetailShell company={selected} onBack={backFromCompany} onState={updateState} onFollow={followCompany} editable={user.role === 'admin'} onUpdated={updateCompany} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={user.role === 'admin' ? sync : undefined} syncing={syncing} onOpen={openCompany} onExport={exportJobs} onImport={() => setPage('import')} /> : page === 'timeline' ? <TimelinePage events={timeline} onOpenCompany={openCompany} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData(); setPage('queue') }} /> : page === 'admin' ? <AdminPage onNavigate={target => { setPage(target); setSelected(null) }} /> : page === 'queue' ? <QueuePage onSync={sync} syncing={syncing} /> : page === 'security' ? <AccountSecurityPage /> : page === 'review' ? <ReviewPage onResolved={async () => { await loadData() }} /> : <SettingsPage onSaved={flash} onSync={sync} syncing={syncing} />}
     </main>
   </div>
 }
@@ -217,6 +253,84 @@ function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onSync, syn
 function Metric({ label, value, tone }: { label: string; value: string | number; tone: string }) { return <div className="metric"><div className={`metric-icon ${tone}`}>{tone === 'blue' ? '◈' : tone === 'violet' ? '▣' : tone === 'green' ? '✓' : '◷'}</div><div><small>{label}</small><strong>{value}</strong></div></div> }
 function CompanyCard({ company, onClick }: { company: Company; onClick: () => void }) { return <button className="company-card" onClick={onClick}><div className="company-top"><div className="company-avatar">{company.display_name.slice(0, 1)}</div><span className="more">···</span></div><h3>{company.display_name}</h3><div className="chips"><span>{company.primary_industry}</span><span>{company.job_count} 个岗位</span></div><p>{company.summary || '企业介绍将在联网检索或审核后补充。'}</p><div className="card-footer"><span>最近更新</span><time>{company.updated_at?.replace('T', ' ').slice(0, 16) || '—'}</time><span className="arrow">→</span></div></button> }
 function EmptyState() { return <div className="empty-state"><div className="empty-icon">✦</div><h3>知识库还在等待第一条招聘信息</h3><p>从“导入信息”粘贴群消息或公开链接，系统会自动识别企业和岗位。</p></div> }
+
+type CompanyEditForm = {
+  display_name: string
+  legal_name: string
+  aliases: string
+  summary: string
+  primary_industry: string
+  secondary_industries: string
+  website: string
+  company_nature: string
+  founded_at: string
+  company_size: string
+  headquarters: string
+  businesses: string
+  highlights: string
+  official_channels: string
+}
+
+function splitList(value: string) { return Array.from(new Set(value.split(/\r?\n/).map(item => item.trim()).filter(Boolean))) }
+
+function CompanyDetailShell({ company, onBack, onState, onFollow, editable, onUpdated }: { company: CompanyDetail; onBack: () => void; onState: (id: string, state: string, favorite?: boolean) => void; onFollow: (id: string, followed?: boolean) => void; editable: boolean; onUpdated: (company: CompanyDetail) => Promise<void> }) {
+  const [editing, setEditing] = useState(false)
+  if (editing) return <><button className="back" onClick={onBack}>← 返回企业列表</button><PageHeader eyebrow="企业详情" title={company.display_name} description="管理员正在编辑企业资料"><button className="secondary" onClick={() => setEditing(false)}>取消编辑</button></PageHeader><CompanyEditor company={company} onCancel={() => setEditing(false)} onSaved={updated => { setEditing(false); void onUpdated(updated) }} /></>
+  return <><div className="company-edit-bar">{editable ? <><span>管理员可以手动修正企业全称、别名、简介和企业资料。</span><button className="secondary" onClick={() => setEditing(true)}>编辑企业资料</button></> : <span>企业资料由来源证据和模型整理。</span>}</div><CompanyView company={company} onBack={onBack} onState={onState} onFollow={onFollow} /></>
+}
+
+function CompanyEditor({ company, onCancel, onSaved }: { company: CompanyDetail; onCancel: () => void; onSaved: (company: CompanyDetail) => void }) {
+  const [form, setForm] = useState<CompanyEditForm>({
+    display_name: company.display_name || '',
+    legal_name: company.legal_name || '',
+    aliases: company.aliases?.join('\n') || '',
+    summary: company.summary || '',
+    primary_industry: company.primary_industry || 'other',
+    secondary_industries: company.secondary_industries?.join('\n') || '',
+    website: company.website || '',
+    company_nature: company.company_nature || '',
+    founded_at: company.founded_at || '',
+    company_size: company.company_size || '',
+    headquarters: company.headquarters || '',
+    businesses: company.businesses?.join('\n') || '',
+    highlights: company.highlights?.join('\n') || '',
+    official_channels: company.official_channels?.join('\n') || '',
+  })
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const update = (field: keyof CompanyEditForm, value: string) => setForm(current => ({ ...current, [field]: value }))
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!form.display_name.trim()) { setError('企业显示名称不能为空'); return }
+    setBusy(true)
+    setError('')
+    try {
+      const updated = await api<CompanyDetail>(`/companies/${company.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          display_name: form.display_name.trim(),
+          legal_name: form.legal_name.trim() || null,
+          aliases: splitList(form.aliases),
+          summary: form.summary.trim() || null,
+          primary_industry: form.primary_industry || 'other',
+          secondary_industries: splitList(form.secondary_industries),
+          website: form.website.trim() || null,
+          company_nature: form.company_nature.trim() || null,
+          founded_at: form.founded_at.trim() || null,
+          company_size: form.company_size.trim() || null,
+          headquarters: form.headquarters.trim() || null,
+          businesses: splitList(form.businesses),
+          highlights: splitList(form.highlights),
+          official_channels: splitList(form.official_channels),
+        }),
+      })
+      onSaved(updated)
+    } catch (reason) { setError((reason as Error).message) }
+    finally { setBusy(false) }
+  }
+  const industries = form.primary_industry && !INDUSTRY_OPTIONS.includes(form.primary_industry) ? [form.primary_industry, ...INDUSTRY_OPTIONS] : INDUSTRY_OPTIONS
+  return <form className="detail-card company-editor" onSubmit={submit}><div className="editor-grid"><label>显示名称<input required value={form.display_name} onChange={event => update('display_name', event.target.value)} /></label><label>企业全称<input value={form.legal_name} onChange={event => update('legal_name', event.target.value)} /></label><label>企业性质<input value={form.company_nature} onChange={event => update('company_nature', event.target.value)} /></label><label>成立时间<input value={form.founded_at} onChange={event => update('founded_at', event.target.value)} placeholder="如：2005 年" /></label><label>企业规模<input value={form.company_size} onChange={event => update('company_size', event.target.value)} /></label><label>总部及办公地点<input value={form.headquarters} onChange={event => update('headquarters', event.target.value)} /></label><label>主营行业<select value={form.primary_industry} onChange={event => update('primary_industry', event.target.value)}>{industries.map(industry => <option value={industry} key={industry}>{industry}</option>)}</select></label><label>官方网站<input type="url" value={form.website} onChange={event => update('website', event.target.value)} placeholder="https://" /></label></div><label className="editor-wide">企业简介<textarea rows={6} value={form.summary} onChange={event => update('summary', event.target.value)} /></label><div className="editor-grid editor-lists"><label>企业别名<textarea rows={3} value={form.aliases} onChange={event => update('aliases', event.target.value)} placeholder="一行一个别名" /></label><label>其他行业<textarea rows={3} value={form.secondary_industries} onChange={event => update('secondary_industries', event.target.value)} placeholder="一行一个行业" /></label><label>主要业务<textarea rows={3} value={form.businesses} onChange={event => update('businesses', event.target.value)} placeholder="一行一项" /></label><label>企业亮点<textarea rows={3} value={form.highlights} onChange={event => update('highlights', event.target.value)} placeholder="一行一项" /></label><label>官方招聘渠道<textarea rows={3} value={form.official_channels} onChange={event => update('official_channels', event.target.value)} placeholder="一行一个渠道或链接" /></label></div><div className="button-row"><button className="secondary" type="button" onClick={onCancel}>取消</button><button className="primary" type="submit" disabled={busy}>{busy ? '保存中…' : '保存企业资料'}</button></div>{error && <div className="form-error">{error}</div>}</form>
+}
 
 function CompanyView({ company, onBack, onState, onFollow }: { company: CompanyDetail; onBack: () => void; onState: (id: string, state: string, favorite?: boolean) => void; onFollow: (id: string, followed?: boolean) => void }) {
   const facts = [
@@ -331,6 +445,13 @@ function formatDate(value?: string | null) {
   return date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
+function formatBytes(value: number) {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
 function ReviewPage({ onResolved }: { onResolved: () => Promise<void> }) {
   const [items, setItems] = useState<ReviewItem[]>([])
   const [message, setMessage] = useState('')
@@ -439,6 +560,41 @@ function AccountSecurityPage() {
   return <><PageHeader eyebrow="账户安全" title="修改登录密码" description="为当前账户设置或更新账号密码；邮箱验证码登录仍保留，但当前默认关闭。" /><section className="detail-card setting-section security-card"><h2>账号密码</h2><form onSubmit={savePassword}><label>新密码<input type="password" required minLength={8} maxLength={128} value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder="至少 8 位" /></label><label>确认新密码<input type="password" required minLength={8} maxLength={128} value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} placeholder="再次输入新密码" /></label><button className="primary" type="submit">保存密码</button>{message && <p className="setting-help">{message}</p>}</form></section></>
 }
 
+function LocalStoragePanel() {
+  const [storage, setStorage] = useState<LocalStorageSnapshot | null>(null)
+  const [message, setMessage] = useState('')
+  const [busy, setBusy] = useState('')
+  const load = async () => {
+    setBusy('load')
+    try { setStorage(await api<LocalStorageSnapshot>('/admin/local-storage')); setMessage('') }
+    catch (reason) { setMessage((reason as Error).message) }
+    finally { setBusy('') }
+  }
+  useEffect(() => { void load() }, [])
+  const clear = async (kind: 'cache' | 'chat-records') => {
+    const title = kind === 'cache' ? 'TraceMemo 聊天缓存' : '本地聊天记录、附件和对应处理任务'
+    if (!window.confirm(`确认清除${title}吗？此操作不可自动恢复。`)) return
+    setBusy(kind)
+    try {
+      const result = await api<{ storage: LocalStorageSnapshot }>(`/admin/local-storage/${kind}`, { method: 'DELETE' })
+      setStorage(result.storage)
+      setMessage(kind === 'cache' ? 'TraceMemo 缓存已清除，下次普通同步会重新访问 TraceMemo。' : '聊天记录及其附件、处理任务已清除；企业和岗位目录已保留。')
+    } catch (reason) { setMessage((reason as Error).message) }
+    finally { setBusy('') }
+  }
+  const removeBackup = async (name: string) => {
+    if (!window.confirm(`确认删除本地备份“${name}”吗？`)) return
+    setBusy(`backup:${name}`)
+    try {
+      const result = await api<{ storage: LocalStorageSnapshot }>(`/admin/local-storage/backups/${encodeURIComponent(name)}`, { method: 'DELETE' })
+      setStorage(result.storage)
+      setMessage(`本地备份“${name}”已删除。`)
+    } catch (reason) { setMessage((reason as Error).message) }
+    finally { setBusy('') }
+  }
+  return <section className="detail-card setting-section local-storage-section"><div className="section-title"><h2>本地数据管理</h2><button className="secondary" onClick={load} disabled={Boolean(busy)}>{busy === 'load' ? '刷新中…' : '刷新'}</button></div>{storage ? <><div className="storage-summary"><div className="storage-stat"><small>当前数据库</small><strong>{formatBytes(storage.database.size)}</strong><code>{storage.database.path}</code></div><div className="storage-stat"><small>聊天记录</small><strong>{storage.chat_records.messages} 条</strong><span>附件 {storage.chat_records.artifacts} 个 · {formatBytes(storage.chat_records.artifact_bytes)}</span></div><div className="storage-stat"><small>TraceMemo 缓存</small><strong>{storage.tracememo_cache.messages} 条</strong><span>{storage.tracememo_cache.groups} 个群 · {formatBytes(storage.tracememo_cache.bytes)}</span></div><div className="storage-stat"><small>本地 DB 备份</small><strong>{storage.backups.length} 个</strong><span>强制重取前会自动创建</span></div></div><div className="storage-actions"><button className="secondary danger" onClick={() => clear('cache')} disabled={Boolean(busy)}>清除 TraceMemo 缓存</button><button className="secondary danger" onClick={() => clear('chat-records')} disabled={Boolean(busy)}>清除本地聊天记录</button></div><p className="setting-help">清除缓存只影响后续同步是否访问 TraceMemo；清除聊天记录会删除原始消息、附件、相关处理队列和阶段日志，但保留已整理的企业与岗位目录。清除前请确认已有备份。</p><div className="storage-backups"><div className="section-title"><strong>本地数据库备份</strong><span>{storage.backups.length} 个</span></div>{storage.backups.length ? storage.backups.map(backup => <div className="storage-backup-row" key={backup.name}><div><strong>{backup.name}</strong><span>{formatBytes(backup.size)} · {formatDate(backup.created_at)}</span></div><button className="secondary danger" onClick={() => removeBackup(backup.name)} disabled={Boolean(busy)}>删除</button></div>) : <div className="empty-inline">暂无本地数据库备份；勾选强制重新获取时会自动创建。</div>}</div></> : <div className="loading-inline">加载本地存储信息…</div>}{message && <p className="setting-help">{message}</p>}</section>
+}
+
 function SettingsPage({ onSaved, onSync, syncing }: { onSaved: (message: string) => void; onSync: () => Promise<void>; syncing: boolean }) {
   const [settings, setSettings] = useState<Record<string, any>>({})
   const [trace, setTrace] = useState({ base_url: 'http://127.0.0.1:6131/api/v1', enabled: false })
@@ -463,7 +619,7 @@ function SettingsPage({ onSaved, onSync, syncing }: { onSaved: (message: string)
   const provider = settings.llm_provider || {}
   const backup = settings.backup || {}
   const smtp = settings.smtp || {}
-  return <><PageHeader eyebrow="管理员" title="系统设置" description="连接 TraceMemo、选择招聘处理器并配置备份与通知。"><button className="primary" onClick={save}>保存设置</button></PageHeader><div className="settings-grid"><section className="detail-card setting-section"><h2>同步与隐私</h2><label>同步间隔（分钟）<input type="number" min="1" value={settings.sync_interval_minutes || 10} onChange={e => set('sync_interval_minutes', Number(e.target.value))} /></label><label>导入天数（距今）<input type="number" min="1" value={settings.import_days ?? settings.initial_import_days ?? 30} onChange={e => set('import_days', Math.max(1, Number(e.target.value) || 1))} /></label><p className="setting-help">每次同步导入距今设定天数内的聊天记录。</p><label className="check"><input type="checkbox" checked={Boolean(settings.redaction_enabled)} onChange={e => set('redaction_enabled', e.target.checked)} />发送云模型前启用脱敏（默认关闭）</label></section><section className="detail-card setting-section"><h2>处理器与并发</h2><label>招聘识别与整理处理器<select value={settings.processing_engine || 'codex'} onChange={e => set('processing_engine', e.target.value)}><option value="codex">本地 Codex（默认）</option><option value="generic">通用模型 API</option></select></label><p className="setting-help">本地 Codex 固定使用 gpt-5.6-luna。切换只影响新任务和重新处理的任务。</p><label>模型并发（1–8）<input type="number" min="1" max="8" value={settings.model_concurrency || 2} onChange={e => set('model_concurrency', Math.max(1, Math.min(8, Number(e.target.value))))} /></label><label>Codex 并发（1–4）<input type="number" min="1" max="4" value={settings.codex_concurrency || 1} onChange={e => set('codex_concurrency', Math.max(1, Math.min(4, Number(e.target.value))))} /></label><label>本地提取并发<input type="number" min="1" max="16" value={settings.extract_concurrency || 4} onChange={e => set('extract_concurrency', Math.max(1, Math.min(16, Number(e.target.value))))} /></label><label>阶段日志保留天数<input type="number" min="1" value={settings.processing_log_retention_days || 30} onChange={e => set('processing_log_retention_days', Math.max(1, Number(e.target.value)))} /></label><button className="secondary" onClick={async () => { try { await api('/admin/models/test', { method: 'POST' }); onSaved('当前处理器连接成功') } catch (e) { alert((e as Error).message) } }}>测试当前处理器</button></section><section className="detail-card setting-section"><h2>TraceMemo</h2><label className="check"><input type="checkbox" checked={Boolean(trace.enabled)} onChange={e => setTrace({ ...trace, enabled: e.target.checked })} />启用自动同步</label><label>API 地址<input value={trace.base_url} onChange={e => setTrace({ ...trace, base_url: e.target.value })} /></label><label>Bearer Token<input type="password" value={traceToken} placeholder="已配置时留空保持不变" onChange={e => setTraceToken(e.target.value)} /></label><p className="setting-help">保存后可在后端接口读取群聊列表并手工选择招聘群；选择保存后，可点击下方按钮立即获取，自动同步仍按设定间隔运行。</p><TraceMemoGroups onSync={onSync} syncing={syncing} /></section><section className="detail-card setting-section"><h2>通用模型 API</h2><label className="check"><input type="checkbox" checked={Boolean(provider.enabled)} onChange={e => set('llm_provider', { ...provider, enabled: e.target.checked })} />启用云模型处理</label><label>API 风格<select value={provider.api_style || 'chat_completions'} onChange={e => set('llm_provider', { ...provider, api_style: e.target.value })}><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label><label>Base URL<input value={provider.base_url || ''} onChange={e => set('llm_provider', { ...provider, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label><label>模型名称<input value={provider.model || provider.text_model || ''} onChange={e => set('llm_provider', { ...provider, model: e.target.value, text_model: e.target.value })} /></label><label>API Key<input type="password" placeholder={provider.api_key_configured ? '已配置，留空保持不变' : '输入 API Key'} onChange={e => set('llm_provider', { ...provider, api_key: e.target.value })} /></label></section><section className="detail-card setting-section"><h2>AList WebDAV 备份</h2><label className="check"><input type="checkbox" checked={Boolean(backup.enabled)} onChange={e => set('backup', { ...backup, enabled: e.target.checked })} />启用每日备份</label><label>WebDAV URL<input value={backup.webdav_url || ''} onChange={e => set('backup', { ...backup, webdav_url: e.target.value })} placeholder="https://alist.example.com/dav/" /></label><label>用户名<input value={backup.username || ''} onChange={e => set('backup', { ...backup, username: e.target.value })} /></label><label>远端目录<input value={backup.remote_directory || '/JobPostings'} onChange={e => set('backup', { ...backup, remote_directory: e.target.value })} /></label><label>WebDAV 密码<input type="password" placeholder={backup.webdav_password_configured ? '已配置，留空保持不变' : '输入 WebDAV 密码'} onChange={e => set('backup', { ...backup, webdav_password: e.target.value })} /></label><label>备份密码<input type="password" placeholder={backup.backup_password_configured ? '已配置，留空保持不变' : '输入独立备份密码'} onChange={e => set('backup', { ...backup, backup_password: e.target.value })} /></label><div className="button-row"><button className="secondary" onClick={async () => { try { await api('/admin/backups/test', { method: 'POST' }); onSaved('WebDAV 连接成功') } catch (e) { alert((e as Error).message) } }}>测试 WebDAV</button><button className="secondary" onClick={async () => { try { await api('/admin/backups/run', { method: 'POST' }); onSaved('备份已完成') } catch (e) { alert((e as Error).message) } }}>立即备份</button></div></section><section className="detail-card setting-section"><h2>SMTP 邮件</h2><label className="check"><input type="checkbox" checked={Boolean(smtp.enabled)} onChange={e => set('smtp', { ...smtp, enabled: e.target.checked })} />启用邀请邮件（验证码登录当前关闭）</label><label>SMTP 主机<input value={smtp.host || ''} onChange={e => set('smtp', { ...smtp, host: e.target.value })} placeholder="smtp.example.com" /></label><label>端口<input type="number" value={smtp.port || 587} onChange={e => set('smtp', { ...smtp, port: Number(e.target.value) })} /></label><label>发件人邮箱<input type="email" value={smtp.from_email || ''} onChange={e => set('smtp', { ...smtp, from_email: e.target.value })} /></label><label>用户名<input value={smtp.username || ''} onChange={e => set('smtp', { ...smtp, username: e.target.value })} /></label><label>SMTP 密码<input type="password" placeholder={smtp.password_configured ? '已配置，留空保持不变' : '输入 SMTP 密码'} onChange={e => set('smtp', { ...smtp, password: e.target.value })} /></label><label className="check"><input type="checkbox" checked={smtp.starttls !== false} onChange={e => set('smtp', { ...smtp, starttls: e.target.checked })} />使用 STARTTLS</label></section><section className="detail-card setting-section"><h2>Agent API</h2><label className="check"><input type="checkbox" checked={Boolean(settings.agent_api_enabled)} onChange={e => set('agent_api_enabled', e.target.checked)} />允许创建受限 Agent Token</label><p className="setting-help">Token 默认只允许读取招聘目录和操作自己的求职进度，不能读取原始群消息或系统密钥。</p></section></div></>
+  return <><PageHeader eyebrow="管理员" title="系统设置" description="连接 TraceMemo、选择招聘处理器并配置备份与通知。"><button className="primary" onClick={save}>保存设置</button></PageHeader><div className="settings-grid"><section className="detail-card setting-section"><h2>同步与隐私</h2><label>同步间隔（分钟）<input type="number" min="1" value={settings.sync_interval_minutes || 10} onChange={e => set('sync_interval_minutes', Number(e.target.value))} /></label><label>导入天数（距今）<input type="number" min="1" value={settings.import_days ?? settings.initial_import_days ?? 30} onChange={e => set('import_days', Math.max(1, Number(e.target.value) || 1))} /></label><p className="setting-help">每次同步导入距今设定天数内的聊天记录。</p><label className="check"><input type="checkbox" checked={Boolean(settings.redaction_enabled)} onChange={e => set('redaction_enabled', e.target.checked)} />发送云模型前启用脱敏（默认关闭）</label></section><section className="detail-card setting-section"><h2>处理器与并发</h2><label>招聘识别与整理处理器<select value={settings.processing_engine || 'codex'} onChange={e => set('processing_engine', e.target.value)}><option value="codex">本地 Codex（默认）</option><option value="generic">通用模型 API</option></select></label><p className="setting-help">本地 Codex 固定使用 gpt-5.6-luna。切换只影响新任务和重新处理的任务。</p><label>模型并发（1–8）<input type="number" min="1" max="8" value={settings.model_concurrency || 2} onChange={e => set('model_concurrency', Math.max(1, Math.min(8, Number(e.target.value))))} /></label><label>Codex 并发（1–4）<input type="number" min="1" max="4" value={settings.codex_concurrency || 1} onChange={e => set('codex_concurrency', Math.max(1, Math.min(4, Number(e.target.value))))} /></label><label>本地提取并发<input type="number" min="1" max="16" value={settings.extract_concurrency || 4} onChange={e => set('extract_concurrency', Math.max(1, Math.min(16, Number(e.target.value))))} /></label><label>阶段日志保留天数<input type="number" min="1" value={settings.processing_log_retention_days || 30} onChange={e => set('processing_log_retention_days', Math.max(1, Number(e.target.value)))} /></label><button className="secondary" onClick={async () => { try { await api('/admin/models/test', { method: 'POST' }); onSaved('当前处理器连接成功') } catch (e) { alert((e as Error).message) } }}>测试当前处理器</button></section><section className="detail-card setting-section"><h2>TraceMemo</h2><label className="check"><input type="checkbox" checked={Boolean(trace.enabled)} onChange={e => setTrace({ ...trace, enabled: e.target.checked })} />启用自动同步</label><label>API 地址<input value={trace.base_url} onChange={e => setTrace({ ...trace, base_url: e.target.value })} /></label><label>Bearer Token<input type="password" value={traceToken} placeholder="已配置时留空保持不变" onChange={e => setTraceToken(e.target.value)} /></label><p className="setting-help">保存后可在后端接口读取群聊列表并手工选择招聘群；普通同步优先使用已保存的聊天记录，只有强制重新获取才会清理缓存并重新访问 TraceMemo。</p><TraceMemoGroups onSync={onSync} syncing={syncing} /></section><section className="detail-card setting-section"><h2>通用模型 API</h2><label className="check"><input type="checkbox" checked={Boolean(provider.enabled)} onChange={e => set('llm_provider', { ...provider, enabled: e.target.checked })} />启用云模型处理</label><label>API 风格<select value={provider.api_style || 'chat_completions'} onChange={e => set('llm_provider', { ...provider, api_style: e.target.value })}><option value="chat_completions">Chat Completions</option><option value="responses">Responses</option></select></label><label>Base URL<input value={provider.base_url || ''} onChange={e => set('llm_provider', { ...provider, base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label><label>模型名称<input value={provider.model || provider.text_model || ''} onChange={e => set('llm_provider', { ...provider, model: e.target.value, text_model: e.target.value })} /></label><label>API Key<input type="password" placeholder={provider.api_key_configured ? '已配置，留空保持不变' : '输入 API Key'} onChange={e => set('llm_provider', { ...provider, api_key: e.target.value })} /></label></section><section className="detail-card setting-section"><h2>AList WebDAV 备份</h2><label className="check"><input type="checkbox" checked={Boolean(backup.enabled)} onChange={e => set('backup', { ...backup, enabled: e.target.checked })} />启用每日备份</label><label>WebDAV URL<input value={backup.webdav_url || ''} onChange={e => set('backup', { ...backup, webdav_url: e.target.value })} placeholder="https://alist.example.com/dav/" /></label><label>用户名<input value={backup.username || ''} onChange={e => set('backup', { ...backup, username: e.target.value })} /></label><label>远端目录<input value={backup.remote_directory || '/JobPostings'} onChange={e => set('backup', { ...backup, remote_directory: e.target.value })} /></label><label>WebDAV 密码<input type="password" placeholder={backup.webdav_password_configured ? '已配置，留空保持不变' : '输入 WebDAV 密码'} onChange={e => set('backup', { ...backup, webdav_password: e.target.value })} /></label><label>备份密码<input type="password" placeholder={backup.backup_password_configured ? '已配置，留空保持不变' : '输入独立备份密码'} onChange={e => set('backup', { ...backup, backup_password: e.target.value })} /></label><div className="button-row"><button className="secondary" onClick={async () => { try { await api('/admin/backups/test', { method: 'POST' }); onSaved('WebDAV 连接成功') } catch (e) { alert((e as Error).message) } }}>测试 WebDAV</button><button className="secondary" onClick={async () => { try { await api('/admin/backups/run', { method: 'POST' }); onSaved('备份已完成') } catch (e) { alert((e as Error).message) } }}>立即备份</button></div></section><section className="detail-card setting-section"><h2>SMTP 邮件</h2><label className="check"><input type="checkbox" checked={Boolean(smtp.enabled)} onChange={e => set('smtp', { ...smtp, enabled: e.target.checked })} />启用邀请邮件（验证码登录当前关闭）</label><label>SMTP 主机<input value={smtp.host || ''} onChange={e => set('smtp', { ...smtp, host: e.target.value })} placeholder="smtp.example.com" /></label><label>端口<input type="number" value={smtp.port || 587} onChange={e => set('smtp', { ...smtp, port: Number(e.target.value) })} /></label><label>发件人邮箱<input type="email" value={smtp.from_email || ''} onChange={e => set('smtp', { ...smtp, from_email: e.target.value })} /></label><label>用户名<input value={smtp.username || ''} onChange={e => set('smtp', { ...smtp, username: e.target.value })} /></label><label>SMTP 密码<input type="password" placeholder={smtp.password_configured ? '已配置，留空保持不变' : '输入 SMTP 密码'} onChange={e => set('smtp', { ...smtp, password: e.target.value })} /></label><label className="check"><input type="checkbox" checked={smtp.starttls !== false} onChange={e => set('smtp', { ...smtp, starttls: e.target.checked })} />使用 STARTTLS</label></section><section className="detail-card setting-section"><h2>Agent API</h2><label className="check"><input type="checkbox" checked={Boolean(settings.agent_api_enabled)} onChange={e => set('agent_api_enabled', e.target.checked)} />允许创建受限 Agent Token</label><p className="setting-help">Token 默认只允许读取招聘目录和操作自己的求职进度，不能读取原始群消息或系统密钥。</p></section><LocalStoragePanel /></div></>
 }
 
 function TraceMemoGroups({ onSync, syncing }: { onSync: (force?: boolean) => Promise<void>; syncing: boolean }) {
@@ -508,7 +664,7 @@ function TraceMemoGroups({ onSync, syncing }: { onSync: (force?: boolean) => Pro
     if (!await save()) return
     await onSync(forceRefetch)
   }
-  return <div className="group-picker"><div className="group-picker-head"><strong>招聘群选择</strong><span>{selectedCount}/20</span></div><div className="group-picker-actions"><button className="secondary" onClick={refresh}>读取群列表</button><button className="secondary" onClick={save} disabled={!groups.length}>保存选择</button><button className="primary" onClick={startSync} disabled={syncing || selectedCount === 0}>{syncing ? '获取中…' : '立即从已选微信群获取'}</button></div><label className="check force-refetch"><input type="checkbox" checked={forceRefetch} onChange={event => setForceRefetch(event.target.checked)} />强制重新获取（删除旧招聘数据后重新拉取）</label>{forceRefetch && <p className="setting-warning">执行前会自动创建本地备份；旧目录、队列、审核、证据和与旧岗位绑定的用户操作记录会被清理。</p>}{groups.length > 0 && <div className="group-picker-toolbar"><input className="group-search" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索群名称或群标识" /><span>{visibleGroups.length} 个群聊</span></div>}<div className="group-options">{!groups.length ? <div className="group-empty">正在读取群聊；如果还没有群，请点击“读取群列表”</div> : !visibleGroups.length ? <div className="group-empty">没有匹配的群聊</div> : visibleGroups.map(group => { const source = avatarSource(group.avatar); return <label className={`group-option${group.selected ? ' selected' : ''}`} key={group.id}><input type="checkbox" checked={group.selected} onChange={event => toggle(group.id, event.target.checked)} /><span className="group-avatar-wrap">{source ? <img className="group-avatar-image" src={source} alt={`${group.name}头像`} loading="lazy" /> : <span className="group-avatar" aria-hidden="true">{initial(group.name)}</span>}</span><span className="group-option-copy"><strong>{group.name}</strong><small>{group.external_id}</small></span></label> })}</div><p className="setting-help">TraceMemo 当前群聊接口未提供头像时显示群名首字母；如接口返回头像资源则自动使用。{message && ` ${message}`}</p></div>
+  return <div className="group-picker"><div className="group-picker-head"><strong>招聘群选择</strong><span>{selectedCount}/20</span></div><div className="group-picker-actions"><button className="secondary" onClick={refresh}>读取群列表</button><button className="secondary" onClick={save} disabled={!groups.length}>保存选择</button><button className="primary" onClick={startSync} disabled={syncing || selectedCount === 0}>{syncing ? '获取中…' : '立即从已选微信群获取'}</button></div><label className="check force-refetch"><input type="checkbox" checked={forceRefetch} onChange={event => setForceRefetch(event.target.checked)} />强制重新获取（清理旧数据和缓存后重新拉取）</label>{forceRefetch && <p className="setting-warning">执行前会自动创建本地备份；旧目录、队列、审核、证据、聊天记录和 TraceMemo 缓存会被清理，账号、设置和微信群选择会保留。</p>}{groups.length > 0 && <div className="group-picker-toolbar"><input className="group-search" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索群名称或群标识" /><span>{visibleGroups.length} 个群聊</span></div>}<div className="group-options">{!groups.length ? <div className="group-empty">正在读取群聊；如果还没有群，请点击“读取群列表”</div> : !visibleGroups.length ? <div className="group-empty">没有匹配的群聊</div> : visibleGroups.map(group => { const source = avatarSource(group.avatar); return <label className={`group-option${group.selected ? ' selected' : ''}`} key={group.id}><input type="checkbox" checked={group.selected} onChange={event => toggle(group.id, event.target.checked)} /><span className="group-avatar-wrap">{source ? <img className="group-avatar-image" src={source} alt={`${group.name}头像`} loading="lazy" /> : <span className="group-avatar" aria-hidden="true">{initial(group.name)}</span>}</span><span className="group-option-copy"><strong>{group.name}</strong><small>{group.external_id}</small></span></label> })}</div><p className="setting-help">TraceMemo 当前群聊接口未提供头像时显示群名首字母；普通同步会直接读取已保存聊天记录，只有勾选强制重新获取才会重新访问 TraceMemo。{message && ` ${message}`}</p></div>
 }
 
 function PageHeader({ eyebrow, title, description, children }: { eyebrow: string; title: string; description: string; children?: React.ReactNode }) { return <header className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div><div className="header-actions">{children}</div></header> }

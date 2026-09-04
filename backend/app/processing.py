@@ -11,7 +11,7 @@ from uuid import uuid4
 from urllib.parse import urlparse
 
 from .browser import fetch_public_browser
-from .catalog import apply_model_item
+from .catalog import apply_company_overrides, apply_model_item, company_overrides
 from .db import connect, one, utc_now
 from .model_provider import classify_messages, consolidate_company_profile, get_setting
 from .parsers import (
@@ -840,6 +840,7 @@ def _process_company_consolidation(job: dict[str, Any]) -> dict[str, Any]:
                  json.dumps(profile.get("businesses") or [], ensure_ascii=False), json.dumps(profile.get("highlights") or [], ensure_ascii=False),
                  json.dumps(profile.get("official_channels") or [], ensure_ascii=False), utc_now(), utc_now(), job["company_id"]),
             )
+            apply_company_overrides(connection, job["company_id"], company_overrides(company_row["manual_overrides_json"]))
     if abnormal:
         log_processing(job["id"], "review", "模型判定企业整理结果异常，转入审核", "warning", payload)
         return {"status": "needs_review", "id": job["id"]}

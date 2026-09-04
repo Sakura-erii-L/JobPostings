@@ -301,6 +301,114 @@ def test_tracememo_sync_uses_rolling_import_days_and_source_datetime(tmp_path, m
     assert db.one("SELECT external_message_id FROM raw_messages")["external_message_id"] == "inside-window"
 
 
+def test_tracememo_messages_are_cached_until_force_refetch(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    from app import main as main_module
+
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+            ("trace", "tracememo", "http://trace", 1, "{}", db.utc_now()),
+        )
+        connection.execute(
+            "INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            ("group", "trace", "room", "招聘群", 1, 1, db.utc_now(), db.utc_now()),
+        )
+    calls: list[str] = []
+    now = datetime.now(timezone.utc)
+
+    class FakeTraceMemoClient:
+        def __init__(self, base_url, token):
+            pass
+
+        def messages(self, talker, start, end):
+            calls.append(talker)
+            return [{"id": "cached-message", "type": "普通文本", "text": "缓存招聘信息", "datetime": (now - timedelta(hours=1)).isoformat(timespec="seconds")}]
+
+    monkeypatch.setattr(main_module, "TraceMemoClient", FakeTraceMemoClient)
+    first = main_module._sync_tracememo_once()
+    second = main_module._sync_tracememo_once()
+    forced = main_module._sync_tracememo_once(force=True)
+
+    assert calls == ["room", "room"]
+    assert first["cache_mode"] == "tracememo"
+    assert first["remote_fetches"] == 1
+    assert second["cache_mode"] == "cache"
+    assert second["cached_messages"] == 1
+    assert forced["cache_mode"] == "tracememo"
+    assert db.one("SELECT COUNT(*) AS count FROM tracememo_message_cache")["count"] == 1
+
+
+def test_admin_can_manage_local_storage_and_edit_company(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+    from app import main as main_module
+    from app.tracememo_cache import store_messages
+
+    monkeypatch.setattr(main_module, "process_one_batch", lambda limit: None)
+    monkeypatch.setattr(main_module, "process_one_enrichment", lambda: None)
+    with TestClient(app, client=("127.0.0.1", 50010)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        now = datetime.now(timezone.utc)
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+                ("trace", "tracememo", "http://trace", 1, "{}", db.utc_now()),
+            )
+            connection.execute(
+                "INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                ("group", "trace", "room", "招聘群", 1, 1, db.utc_now(), db.utc_now()),
+            )
+            connection.execute(
+                "INSERT INTO companies(id,display_name,primary_industry,created_at,updated_at) VALUES(?,?,?,?,?)",
+                ("company", "原始企业名", "other", db.utc_now(), db.utc_now()),
+            )
+        store_messages("trace", "group", [{"id": "cached", "type": "普通文本", "text": "缓存消息", "datetime": now.isoformat(timespec="seconds")}], now - timedelta(days=1), now)
+        raw_id = main_module.ingest_message({"id": "raw", "type": "普通文本", "text": "本地聊天记录", "datetime": now.isoformat(timespec="seconds")}, "manual", None)
+        assert raw_id
+        backup_dir = db.config.data_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        (backup_dir / "manual-test.db").write_bytes(b"test backup")
+
+        snapshot = client.get("/api/v1/admin/local-storage")
+        assert snapshot.status_code == 200
+        assert snapshot.json()["tracememo_cache"]["messages"] == 1
+        assert snapshot.json()["chat_records"]["messages"] == 1
+        assert snapshot.json()["backups"][0]["name"] == "manual-test.db"
+
+        edited = client.put(
+            "/api/v1/companies/company",
+            json={
+                "display_name": "管理员企业名",
+                "legal_name": "管理员企业全称",
+                "aliases": ["招聘品牌名"],
+                "summary": "管理员确认的企业简介",
+                "primary_industry": "electronics_semiconductor",
+                "businesses": ["逆变器"],
+            },
+        )
+        assert edited.status_code == 200
+        assert edited.json()["display_name"] == "管理员企业名"
+        assert edited.json()["aliases"] == ["招聘品牌名"]
+        stored = db.one("SELECT display_name,summary,manual_overrides_json FROM companies WHERE id='company'")
+        assert stored["display_name"] == "管理员企业名"
+        assert json.loads(stored["manual_overrides_json"])["display_name"] == "管理员企业名"
+
+        cleared_cache = client.delete("/api/v1/admin/local-storage/cache")
+        assert cleared_cache.status_code == 200
+        assert cleared_cache.json()["deleted"]["messages"] == 1
+        cleared_chat = client.delete("/api/v1/admin/local-storage/chat-records")
+        assert cleared_chat.status_code == 200
+        assert cleared_chat.json()["deleted"]["messages"] == 1
+        assert cleared_chat.json()["storage"]["chat_records"]["messages"] == 0
+        deleted_backup = client.delete("/api/v1/admin/local-storage/backups/manual-test.db")
+        assert deleted_backup.status_code == 200
+        assert not (backup_dir / "manual-test.db").exists()
+
+
 def test_local_admin_initial_password_recovery(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")

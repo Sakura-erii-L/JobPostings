@@ -42,6 +42,52 @@ def json_text(value: Any, default: Any) -> str:
     return json.dumps(value if value is not None else default, ensure_ascii=False)
 
 
+COMPANY_OVERRIDE_COLUMNS = {
+    "display_name": "display_name",
+    "legal_name": "legal_name",
+    "aliases": "aliases_json",
+    "summary": "summary",
+    "primary_industry": "primary_industry",
+    "secondary_industries": "secondary_industries_json",
+    "website": "website",
+    "company_nature": "company_nature",
+    "founded_at": "founded_at",
+    "company_size": "company_size",
+    "headquarters": "headquarters",
+    "businesses": "businesses_json",
+    "highlights": "highlights_json",
+    "official_channels": "official_channels_json",
+}
+COMPANY_OVERRIDE_LIST_FIELDS = {
+    "aliases",
+    "secondary_industries",
+    "businesses",
+    "highlights",
+    "official_channels",
+}
+
+
+def apply_company_overrides(connection: Any, company_id: str, overrides: dict[str, Any], updated_at: str | None = None) -> None:
+    changed_at = updated_at or utc_now()
+    for field, column in COMPANY_OVERRIDE_COLUMNS.items():
+        if field not in overrides:
+            continue
+        value = overrides[field]
+        if field in COMPANY_OVERRIDE_LIST_FIELDS:
+            value = json_text(value if isinstance(value, list) else [], [])
+        connection.execute(f"UPDATE companies SET {column}=?,updated_at=? WHERE id=?", (value, changed_at, company_id))
+
+
+def company_overrides(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _merge_list(old_value: str | None, new_value: Any) -> list[Any]:
     try:
         old = json.loads(old_value or "[]")
@@ -99,6 +145,7 @@ def _company_for(connection, company_data: dict[str, Any]) -> str:
              company_data.get("headquarters") or None, json_text(merged_businesses, []),
              json_text(merged_highlights, []), json_text(merged_channels, []), now, company_id),
         )
+        apply_company_overrides(connection, company_id, company_overrides(existing["manual_overrides_json"]), now)
         return company_id
     company_id = str(uuid4())
     connection.execute(
