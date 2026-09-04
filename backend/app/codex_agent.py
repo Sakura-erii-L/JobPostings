@@ -121,6 +121,7 @@ def run_codex_json(
             creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             child_env = os.environ.copy()
             child_env.pop("OPENAI_API_KEY", None)
+            child_env.pop("CODEX_API_KEY", None)
             child_env["CODEX_HOME"] = str(codex_home)
             process = subprocess.Popen(
                 command,
