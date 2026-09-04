@@ -141,14 +141,31 @@ def process_one_batch(limit: int = 100) -> dict[str, Any] | None:
                         )
             with connect() as connection:
                 connection.execute("UPDATE processing_jobs SET status='succeeded', updated_at=?, error=NULL WHERE id=?", (utc_now(), row["processing_id"]))
+                connection.execute(
+                    "UPDATE review_items SET status='resolved',resolved_by='system',resolved_at=? WHERE kind='processing_failed' AND entity_id=? AND status='open'",
+                    (utc_now(), row["id"]),
+                )
         return {"processed": len(rows), "input_tokens": result.input_tokens, "output_tokens": result.output_tokens}
     except Exception as exc:
+        error = str(exc)
         with connect() as connection:
             for row in rows:
-                status = "paused_quota" if "budget" in str(exc).lower() else "needs_review"
-                connection.execute("UPDATE processing_jobs SET status=?, error=?, updated_at=? WHERE id=?", (status, str(exc), utc_now(), row["processing_id"]))
-                connection.execute("INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)", (str(uuid4()), "processing_failed", "raw_message", row["id"], json.dumps({"error": str(exc)}, ensure_ascii=False), utc_now()))
-        return {"processed": 0, "error": str(exc)}
+                status = "paused_quota" if "budget" in error.lower() else "needs_review"
+                now = utc_now()
+                connection.execute("UPDATE processing_jobs SET status=?, error=?, updated_at=? WHERE id=?", (status, error, now, row["processing_id"]))
+                existing_review = connection.execute(
+                    "SELECT id FROM review_items WHERE kind='processing_failed' AND entity_id=? AND status='open' LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                payload = json.dumps({"error": error}, ensure_ascii=False)
+                if existing_review:
+                    connection.execute(
+                        "UPDATE review_items SET payload_json=?,created_at=? WHERE id=?",
+                        (payload, now, existing_review["id"]),
+                    )
+                else:
+                    connection.execute("INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)", (str(uuid4()), "processing_failed", "raw_message", row["id"], payload, now))
+        return {"processed": 0, "error": error}
 
 
 def process_one_enrichment() -> dict[str, Any] | None:

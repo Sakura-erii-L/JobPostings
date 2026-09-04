@@ -201,6 +201,13 @@ def sync_tracememo_once() -> dict[str, Any]:
     settings = json.loads(row["config_json"])
     client = TraceMemoClient(row["base_url"], SecretVault().decrypt(settings["token"]) if settings.get("token") else "")
     groups = all_rows("SELECT * FROM source_groups WHERE connector_id=? AND selected=1 AND enabled=1", (row["id"],))
+    if not groups:
+        return {
+            "status": "no_groups",
+            "fetched": 0,
+            "groups": 0,
+            "message": "没有已选中的微信群，请先读取并保存招聘群选择",
+        }
     fetched = 0
     for group in groups:
         cursor = one("SELECT * FROM sync_cursors WHERE source_group_id=?", (group["id"],))
@@ -449,7 +456,16 @@ def update_tracememo(body: dict[str, Any], _: dict[str, Any] = Depends(require_a
                 previous_config = {}
     safe_config = {"token": vault.encrypt(str(body["token"])) if body.get("token") else previous_config.get("token", "")}
     with connect() as connection:
-        connection.execute("INSERT OR REPLACE INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)", (cid, "tracememo", base_url, int(bool(body.get("enabled", True))), json.dumps(safe_config), utc_now()))
+        if connector_id:
+            connection.execute(
+                "UPDATE connectors SET base_url=?,enabled=?,config_json=?,updated_at=? WHERE id=?",
+                (base_url, int(bool(body.get("enabled", True))), json.dumps(safe_config), utc_now(), cid),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+                (cid, "tracememo", base_url, int(bool(body.get("enabled", True))), json.dumps(safe_config), utc_now()),
+            )
     return {"id": cid, "kind": "tracememo", "base_url": base_url, "enabled": bool(body.get("enabled", True))}
 
 
@@ -472,11 +488,33 @@ def tracememo_groups(_: dict[str, Any] = Depends(require_admin)) -> list[dict[st
     if not row:
         raise HTTPException(400, "TraceMemo is not configured")
     settings = json.loads(row["config_json"])
+    saved_groups = all_rows(
+        "SELECT id,external_id,name,selected,enabled FROM source_groups WHERE connector_id=? ORDER BY name COLLATE NOCASE",
+        (row["id"],),
+    )
+
+    def saved_group_payload() -> list[dict[str, Any]]:
+        return [
+            {
+                "id": group["id"],
+                "external_id": group["external_id"],
+                "name": group["name"],
+                "avatar": None,
+                "selected": bool(group["selected"]),
+                "enabled": bool(group["enabled"]),
+            }
+            for group in saved_groups
+        ]
+
     client = TraceMemoClient(row["base_url"], SecretVault().decrypt(settings["token"]) if settings.get("token") else "")
     try:
         groups = client.groups()
     except Exception as exc:
+        if saved_groups:
+            return saved_group_payload()
         raise HTTPException(502, f"TraceMemo group query failed: {exc}") from exc
+    if not groups and saved_groups:
+        return saved_group_payload()
     result = []
     with connect() as connection:
         for group in groups:
@@ -514,8 +552,58 @@ async def manual_sync(_: dict[str, Any] = Depends(require_admin)) -> dict[str, A
     result = await asyncio.to_thread(sync_tracememo_once)
     if result.get("status") == "disabled":
         raise HTTPException(400, "Enabled TraceMemo connector not found")
+    if result.get("status") == "no_groups":
+        raise HTTPException(400, result["message"])
     await events.publish("sync.completed", result)
     return result
+
+
+@app.get("/api/v1/admin/processing-queue")
+def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    allowed_statuses = {"pending", "running", "succeeded", "needs_review", "paused_quota", "failed"}
+    if status and status not in allowed_statuses:
+        raise HTTPException(400, f"Unknown processing status: {status}")
+    limit = min(max(limit, 1), 200)
+    params: list[Any] = []
+    where = ""
+    if status:
+        where = "WHERE p.status=?"
+        params.append(status)
+    params.append(limit)
+    rows = all_rows(
+        f"""
+        SELECT p.id,p.kind,p.raw_message_id,p.status,p.attempts,p.lease_until,p.error,p.created_at,p.updated_at,
+               r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,
+               substr(COALESCE(r.text_content,''),1,240) AS text_preview,
+               sg.name AS source_group_name
+        FROM processing_jobs p
+        LEFT JOIN raw_messages r ON r.id=p.raw_message_id
+        LEFT JOIN source_groups sg ON sg.id=r.source_group_id
+        {where}
+        ORDER BY p.updated_at DESC, p.created_at DESC
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+    stats = {name: 0 for name in allowed_statuses}
+    for row in all_rows("SELECT status,COUNT(*) AS count FROM processing_jobs GROUP BY status"):
+        stats[row["status"]] = row["count"]
+    return {"stats": stats, "items": [dict(row) for row in rows], "total": sum(stats.values())}
+
+
+@app.post("/api/v1/admin/processing-queue/{job_id}/retry")
+def retry_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    job = one("SELECT id,status FROM processing_jobs WHERE id=?", (job_id,))
+    if not job:
+        raise HTTPException(404, "Processing job not found")
+    if job["status"] not in {"needs_review", "paused_quota", "failed"}:
+        raise HTTPException(409, "Only failed processing jobs can be retried")
+    with connect() as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET status='pending',lease_until=NULL,error=NULL,updated_at=? WHERE id=?",
+            (utc_now(), job_id),
+        )
+    return {"id": job_id, "status": "pending"}
 
 
 @app.post("/api/v1/imports/text")

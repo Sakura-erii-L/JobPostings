@@ -1,0 +1,26 @@
+.queue-toolbar { align-items: center; }
+.queue-total { color: #8994a8; font-size: 12px; }
+.queue-list { display: flex; flex-direction: column; gap: 14px; }
+.queue-item { margin-bottom: 0; }
+.queue-item-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.queue-item-head > div:first-child { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.queue-item-head strong { color: #35415d; font-size: 14px; }
+.queue-item-head span:not(.status) { color: #8994a8; font-size: 11px; }
+.queue-item-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.queue-item-actions .secondary { padding: 7px 10px; font-size: 12px; }
+.queue-status.pending { color: #4e70e7; background: #e8edff; }
+.queue-status.running { color: #815ddd; background: #f0eaff; }
+.queue-status.succeeded { color: #239268; background: #e4f7ee; }
+.queue-status.needs_review, .queue-status.failed { color: #b4314e; background: #fff0f3; }
+.queue-status.paused_quota { color: #b97827; background: #fff0d9; }
+.queue-preview { color: #52607c; line-height: 1.7; font-size: 13px; margin: 16px 0 12px; white-space: pre-wrap; word-break: break-word; }
+.queue-error { margin: 0 0 12px; padding: 10px 12px; border-radius: 9px; background: #fff6f7; color: #a8334b; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+.queue-meta { display: flex; gap: 12px; flex-wrap: wrap; color: #8994a8; font-size: 11px; }
+.queue-id { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media(max-width:680px) {
+  .queue-toolbar { align-items: flex-start; }
+  .queue-total { padding: 10px 0; }
+  .queue-item-head { display: block; }
+  .queue-item-actions { margin-top: 12px; }
+}

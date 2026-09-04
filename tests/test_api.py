@@ -94,3 +94,57 @@ def test_tracememo_groups_keep_distinct_trace_memo_ids_and_names(tmp_path, monke
         assert [group["external_id"] for group in groups] == ["room-1", "room-2"]
         assert [group["name"] for group in groups] == ["招聘群一", "招聘群二"]
         assert len({group["id"] for group in groups}) == 2
+
+        selected = client.put(
+            "/api/v1/admin/source-groups",
+            json={"groups": [{"id": groups[0]["id"], "selected": True, "enabled": True}]},
+        )
+        assert selected.status_code == 200
+        assert client.put("/api/v1/admin/connectors/tracememo", json={"enabled": True}).status_code == 200
+        persisted = client.get("/api/v1/admin/connectors/tracememo/groups")
+        assert persisted.status_code == 200
+        assert persisted.json()[0]["selected"] is True
+
+
+def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module, "process_one_batch", lambda limit: None)
+    monkeypatch.setattr(main_module, "process_one_enrichment", lambda: None)
+    with TestClient(app, client=("127.0.0.1", 50004)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        imported = client.post("/api/v1/imports/text", json={"text": "锦浪科技招聘产品研发类岗位"})
+        assert imported.status_code == 200
+        raw_message_id = imported.json()["raw_message_id"]
+        job = db.one("SELECT id FROM processing_jobs WHERE raw_message_id=?", (raw_message_id,))
+        assert job
+        with db.connect() as connection:
+            connection.execute(
+                "UPDATE processing_jobs SET status='needs_review',error='test failure',updated_at=? WHERE id=?",
+                ("2026-09-04T00:00:00+00:00", job["id"]),
+            )
+
+        queue = client.get("/api/v1/admin/processing-queue?status=needs_review")
+        assert queue.status_code == 200
+        assert queue.json()["items"][0]["raw_message_id"] == raw_message_id
+        assert queue.json()["items"][0]["text_preview"].startswith("锦浪科技")
+
+        retried = client.post(f"/api/v1/admin/processing-queue/{job['id']}/retry")
+        assert retried.status_code == 200
+        assert retried.json() == {"id": job["id"], "status": "pending"}
+
+
+def test_manual_sync_requires_selected_groups(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("127.0.0.1", 50005)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        assert client.put("/api/v1/admin/connectors/tracememo", json={"enabled": True}).status_code == 200
+        response = client.post("/api/v1/admin/sync")
+        assert response.status_code == 400
+        assert "没有已选中的微信群" in response.json()["detail"]
