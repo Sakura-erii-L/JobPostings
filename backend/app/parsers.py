@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -294,6 +294,27 @@ def validate_public_url(url: str) -> str:
     return url
 
 
+def recover_original_source_url(value: Any) -> str | None:
+    """Recover the original WeChat URL from a temporary verification redirect."""
+    candidate = str(value or "").strip()
+    if not candidate:
+        return None
+    for _ in range(2):
+        parsed = urlparse(candidate)
+        host = (parsed.hostname or "").lower()
+        if host != "mp.weixin.qq.com" and not host.endswith(".weixin.qq.com"):
+            break
+        target_values = parse_qs(parsed.query).get("target_url")
+        if not target_values:
+            break
+        target = str(target_values[0] or "").strip()
+        target_parsed = urlparse(target)
+        if not target or target == candidate or target_parsed.scheme not in {"http", "https"} or not target_parsed.hostname:
+            break
+        candidate = target
+    return candidate
+
+
 def fetch_public_http(url: str, timeout: float = 30, max_bytes: int = 10 * 1024 * 1024) -> httpx.Response:
     current_url = url
     for _ in range(6):
@@ -496,6 +517,7 @@ def parse_message_payload(message: dict[str, Any]) -> tuple[str, dict[str, Any]]
     url = message.get("url") or nested.get("url")
     if url:
         metadata["url"] = str(url)
+        metadata["source_url"] = str(url)
     if nested.get("title"):
         metadata["shared_title"] = str(nested["title"])
     if nested.get("des") or nested.get("description"):

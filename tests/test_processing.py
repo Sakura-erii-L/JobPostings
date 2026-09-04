@@ -2,7 +2,7 @@ import json
 import sqlite3
 
 from app import db
-from app.maintenance import repair_raw_message_times, reset_recruitment_data
+from app.maintenance import repair_raw_message_times, repair_source_urls, reset_recruitment_data
 from app.model_provider import ModelResult, classify_messages
 from app.processing import _extract_source_text, _fail, ingest_message, log_processing, process_one_batch
 
@@ -127,6 +127,29 @@ def test_repair_raw_message_times_uses_stored_trace_datetime(tmp_path, monkeypat
     assert db.one("SELECT sent_at FROM raw_messages WHERE id=?", (raw_id,))["sent_at"] == "2026-08-31T03:16:30+00:00"
 
 
+def test_repair_source_urls_restores_original_links_and_keeps_redirect(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    original_url = "https://mp.weixin.qq.com/s/legacy"
+    challenge_url = "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=temporary&target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Flegacy"
+    raw_id = ingest_message({"id": "legacy-link", "type": "article", "text": "公众号文章", "url": original_url}, "manual", None)
+    assert raw_id
+    with db.connect() as connection:
+        connection.execute("UPDATE raw_messages SET metadata_json=? WHERE id=?", (json.dumps({"url": challenge_url}, ensure_ascii=False), raw_id))
+        connection.execute(
+            "INSERT INTO evidences(id,raw_message_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?)",
+            ("legacy-evidence", raw_id, challenge_url, "public_web", "旧证据", db.utc_now()),
+        )
+
+    result = repair_source_urls()
+    assert result["raw_messages_updated"] == 1
+    assert result["evidences_updated"] == 1
+    raw_metadata = json.loads(db.one("SELECT metadata_json FROM raw_messages WHERE id=?", (raw_id,))["metadata_json"])
+    assert raw_metadata == {"url": original_url, "source_url": original_url, "resolved_url": challenge_url}
+    assert db.one("SELECT source_url FROM evidences WHERE id='legacy-evidence'")["source_url"] == original_url
+
+
 def test_system_messages_are_filtered_before_queueing(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
@@ -182,17 +205,19 @@ def test_wechat_environment_challenge_uses_codex_fallback(tmp_path, monkeypatch)
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
     db.init_db()
+    original_url = "https://mp.weixin.qq.com/s/example"
+    challenge_url = "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=temporary&target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fexample"
     raw_id = ingest_message({
         "id": "wechat-link-1",
         "type": "公众号链接",
         "text": "锦浪科技校招",
-        "contentData": {"type": "share", "title": "锦浪科技校招", "url": "https://mp.weixin.qq.com/s/example"},
+        "contentData": {"type": "share", "title": "锦浪科技校招", "url": original_url},
     }, "tracememo", "group-1")
     assert raw_id
     job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
     raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
     monkeypatch.setattr("app.processing.fetch_public_url", lambda url: {
-        "url": url,
+        "url": challenge_url,
         "text": "",
         "content_type": "text/html",
         "images": [],
@@ -212,6 +237,12 @@ def test_wechat_environment_challenge_uses_codex_fallback(tmp_path, monkeypatch)
     assert "当前环境异常" not in text
     assert metadata["web_access_status"] == "challenge"
     assert metadata["web_access_error"] == "微信返回环境验证页面"
+    assert metadata["source_url"] == original_url
+    assert metadata["url"] == original_url
+    assert metadata["resolved_url"] == challenge_url
+    stored_metadata = json.loads(db.one("SELECT metadata_json FROM raw_messages WHERE id=?", (raw_id,))["metadata_json"])
+    assert stored_metadata["source_url"] == original_url
+    assert stored_metadata["resolved_url"] == challenge_url
     assert captured["reason"] == "公众号页面返回微信环境验证页"
 
 

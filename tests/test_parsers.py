@@ -1,6 +1,6 @@
 import pytest
 
-from app.parsers import detect_image_suffix, extract_html, extract_file, fetch_public_url, is_access_challenge_page, is_link_message, is_system_message, parse_message_payload, parse_message_time
+from app.parsers import detect_image_suffix, extract_html, extract_file, fetch_public_url, is_access_challenge_page, is_link_message, is_system_message, parse_message_payload, parse_message_time, recover_original_source_url
 
 
 def test_html_extraction():
@@ -27,6 +27,7 @@ def test_public_account_link_content_data_is_parsed():
     })
     assert "锦浪科技校招" in text
     assert metadata["url"] == "https://example.com/recruit"
+    assert metadata["source_url"] == "https://example.com/recruit"
 
 
 def test_message_url_is_treated_as_public_web_source():
@@ -57,3 +58,10 @@ def test_wechat_environment_challenge_page_is_detected_only_for_wechat_hosts():
     body = "<html><body>当前环境异常，完成验证后即可继续访问</body></html>"
     assert is_access_challenge_page("https://mp.weixin.qq.com/s/example", body)
     assert not is_access_challenge_page("https://example.com/recruit", body)
+
+
+def test_wechat_verification_redirect_recovers_original_source_url():
+    original = "https://mp.weixin.qq.com/s/example?mid=123"
+    redirected = "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=temporary&target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fexample%3Fmid%3D123"
+    assert recover_original_source_url(redirected) == original
+    assert recover_original_source_url(original) == original

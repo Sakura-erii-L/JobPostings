@@ -25,6 +25,7 @@ from .parsers import (
     is_text_message,
     parse_message_time,
     parse_message_payload,
+    recover_original_source_url,
     sha256_bytes,
 )
 
@@ -453,13 +454,20 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
         metadata = {}
     text = str(raw.get("text_content") or "").strip()
     _stage(job["id"], "extracting", "开始提取来源文字", "local_parser")
-    url = metadata.get("url")
+    source_url = recover_original_source_url(metadata.get("source_url") or metadata.get("url"))
+    if source_url:
+        metadata["source_url"] = source_url
+        metadata["url"] = source_url
+    url = source_url
     if is_link_message(raw["message_type"], metadata) and url:
         try:
             parsed = fetch_public_url(str(url))
             access_challenge = bool(parsed.get("access_challenge"))
+            resolved_url = str(parsed.get("url") or url)
             metadata.update({
-                "url": parsed.get("url", url),
+                "source_url": url,
+                "url": url,
+                "resolved_url": resolved_url,
                 "title": parsed.get("title", ""),
                 "web_content_type": parsed.get("content_type", ""),
                 "backend_fetched": not access_challenge,

@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import config
 from .db import connect, utc_now
-from .parsers import parse_message_time
+from .parsers import parse_message_time, recover_original_source_url
 
 
 # Imported recruitment content and its derived catalog are reset together so
@@ -115,4 +115,64 @@ def repair_raw_message_times() -> dict[str, int]:
             if row["sent_at"] != source_time:
                 connection.execute("UPDATE raw_messages SET sent_at=? WHERE id=?", (source_time, row["id"]))
                 result["updated"] += 1
+    return result
+
+
+def repair_source_urls() -> dict[str, int]:
+    """Restore original source URLs after a WeChat verification redirect."""
+    result = {
+        "raw_messages_checked": 0,
+        "raw_messages_updated": 0,
+        "evidences_checked": 0,
+        "evidences_updated": 0,
+        "company_claims_checked": 0,
+        "company_claims_updated": 0,
+    }
+    raw_sources: dict[str, str] = {}
+    with connect() as connection:
+        raw_rows = connection.execute("SELECT id,metadata_json FROM raw_messages").fetchall()
+        for row in raw_rows:
+            result["raw_messages_checked"] += 1
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                continue
+            original = recover_original_source_url(metadata.get("source_url") or metadata.get("url"))
+            if not original:
+                continue
+            raw_sources[row["id"]] = original
+            changed = False
+            if metadata.get("source_url") != original:
+                metadata["source_url"] = original
+                changed = True
+            current_url = str(metadata.get("url") or "").strip()
+            if current_url and current_url != original:
+                if not metadata.get("resolved_url"):
+                    metadata["resolved_url"] = current_url
+                metadata["url"] = original
+                changed = True
+            if changed:
+                connection.execute(
+                    "UPDATE raw_messages SET metadata_json=? WHERE id=?",
+                    (json.dumps(metadata, ensure_ascii=False), row["id"]),
+                )
+                result["raw_messages_updated"] += 1
+
+        evidence_rows = connection.execute("SELECT id,raw_message_id,source_url FROM evidences").fetchall()
+        for row in evidence_rows:
+            result["evidences_checked"] += 1
+            original = raw_sources.get(row["raw_message_id"]) or recover_original_source_url(row["source_url"])
+            if original and original != row["source_url"]:
+                connection.execute("UPDATE evidences SET source_url=? WHERE id=?", (original, row["id"]))
+                result["evidences_updated"] += 1
+
+        claim_rows = connection.execute("SELECT id,source_url FROM company_claims").fetchall()
+        for row in claim_rows:
+            result["company_claims_checked"] += 1
+            original = recover_original_source_url(row["source_url"])
+            if original and original != row["source_url"]:
+                connection.execute("UPDATE company_claims SET source_url=? WHERE id=?", (original, row["id"]))
+                result["company_claims_updated"] += 1
     return result

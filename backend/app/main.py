@@ -23,7 +23,7 @@ from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
-from .maintenance import reset_recruitment_data
+from .maintenance import repair_source_urls, reset_recruitment_data
 from .parsers import is_file_message, is_image_message, parse_message_time
 from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
 from .security import SecretVault, hash_password, hash_value, token
@@ -351,6 +351,7 @@ async def auto_sync_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    repair_source_urls()
     config.ensure_dirs()
     SecretVault()
     with connect() as connection:

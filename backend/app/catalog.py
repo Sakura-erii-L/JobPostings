@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .db import connect, one, utc_now
-from .parsers import is_link_message
+from .parsers import is_link_message, recover_original_source_url
 
 
 INDUSTRIES = {
@@ -240,11 +240,7 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
                 raw_metadata = {}
             if is_link_message(raw_row["message_type"], raw_metadata):
                 source_type = "public_web"
-        if raw_row:
-            try:
-                source_url = json.loads(raw_row["metadata_json"] or "{}").get("url")
-            except json.JSONDecodeError:
-                source_url = None
+            source_url = recover_original_source_url(raw_metadata.get("source_url") or raw_metadata.get("url"))
     connection.execute(
         "INSERT INTO evidences(id,job_id,raw_message_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?)",
         (evidence_id, job_id, evidence_raw_message_id, source_url, source_type, json.dumps(payload, ensure_ascii=False), observed_at),
@@ -270,18 +266,19 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         source_type = "manual_import" if raw_row and raw_row["connector_id"] == "manual" else "wechat_group"
         if raw_row and is_link_message(raw_row["message_type"], metadata):
             source_type = "public_web"
+        source_url = recover_original_source_url(metadata.get("source_url") or metadata.get("url"))
         artifact_id = metadata.get("artifact_id")
         evidence_id = str(uuid4())
         connection.execute(
             "INSERT INTO evidences(id,company_id,raw_message_id,artifact_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?,?)",
-            (evidence_id, company_id, raw_message_id if raw_row else None, artifact_id, metadata.get("url"), source_type, json.dumps(item, ensure_ascii=False), observed),
+            (evidence_id, company_id, raw_message_id if raw_row else None, artifact_id, source_url, source_type, json.dumps(item, ensure_ascii=False), observed),
         )
         for field_name, value in company.items():
             if field_name in {"matched_company_id", "relationship"} or value in (None, "", []):
                 continue
             connection.execute(
                 "INSERT INTO company_claims(id,company_id,field_name,field_value,source_url,source_type,retrieved_at,confidence,is_current) VALUES(?,?,?,?,?,?,?,?,1)",
-                (str(uuid4()), company_id, field_name, json.dumps(value, ensure_ascii=False), metadata.get("url"), source_type, observed, 1.0),
+                (str(uuid4()), company_id, field_name, json.dumps(value, ensure_ascii=False), source_url, source_type, observed, 1.0),
             )
         recruitment_type = str((item.get("batch") or {}).get("recruitment_type") or "unknown")
         if recruitment_type not in RECRUITMENT_TYPES:
