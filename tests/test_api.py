@@ -21,6 +21,28 @@ def test_bootstrap_import_and_query(tmp_path, monkeypatch):
         assert client.get(exported.json()["download_url"]).status_code == 200
 
 
+def test_admin_can_create_and_list_invitations(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("127.0.0.1", 50002)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        created = client.post(
+            "/api/v1/admin/invitations",
+            json={"email": "member@example.com", "role": "member"},
+        )
+        assert created.status_code == 200
+        assert created.json()["email"] == "member@example.com"
+        assert created.json()["expires_in_hours"] == 72
+
+        listed = client.get("/api/v1/admin/invitations")
+        assert listed.status_code == 200
+        assert listed.json()[0]["email"] == "member@example.com"
+        assert listed.json()[0]["role"] == "member"
+        assert listed.json()[0]["used_at"] is None
+
+
 def test_connector_secret_is_preserved_and_agent_scopes_are_enforced(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")

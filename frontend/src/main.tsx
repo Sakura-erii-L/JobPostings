@@ -8,6 +8,7 @@ type Job = { id: string; canonical_title: string; recruitment_type: string; empl
 type Application = Job & { state: string; favorite: number; updated_at: string }
 type CompanyDetail = Company & { aliases: string[]; jobs: Job[]; evidences: { source_url?: string; source_type: string; excerpt?: string }[] }
 type Notification = { id: string; title: string; body: string; read_at?: string | null }
+type Invitation = { id: string; email: string; role: string; expires_at: string; used_at?: string | null; created_at: string }
 type ReviewItem = { id: string; kind: string; entity_type?: string; entity_id?: string; payload: Record<string, any> }
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -28,7 +29,7 @@ function App() {
   const [initialized, setInitialized] = useState<boolean | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [page, setPage] = useState<'companies' | 'applications' | 'import' | 'settings' | 'review'>('companies')
+  const [page, setPage] = useState<'companies' | 'applications' | 'import' | 'admin' | 'settings' | 'review'>('companies')
   const [companies, setCompanies] = useState<Company[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [applications, setApplications] = useState<Application[]>([])
@@ -116,6 +117,7 @@ function App() {
         <NavButton active={page === 'companies'} onClick={() => { setPage('companies'); setSelected(null) }} icon="⌂">企业与岗位</NavButton>
         <NavButton active={page === 'applications'} onClick={() => { setPage('applications'); setSelected(null) }} icon="✓">求职进度</NavButton>
         <NavButton active={page === 'import'} onClick={() => { setPage('import'); setSelected(null) }} icon="＋">导入信息</NavButton>
+        {user.role === 'admin' && <NavButton active={page === 'admin'} onClick={() => { setPage('admin'); setSelected(null) }} icon="▦">管理台</NavButton>}
         {user.role === 'admin' && <NavButton active={page === 'settings'} onClick={() => { setPage('settings'); setSelected(null) }} icon="⚙">系统设置</NavButton>}
         {user.role === 'admin' && <NavButton active={page === 'review'} onClick={() => { setPage('review'); setSelected(null) }} icon="!">待审核</NavButton>}
       </nav>
@@ -125,7 +127,7 @@ function App() {
       {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
       {notice && <div className="notice">{notice}</div>}
       {!selected && notifications.filter(item => !item.read_at).slice(0, 3).map(item => <div className="notification-strip" key={item.id}><div><strong>{item.title}</strong><span>{item.body}</span></div><button onClick={() => markNotificationRead(item.id)}>知道了</button></div>)}
-      {selected ? <CompanyView company={selected} onBack={() => setSelected(null)} onState={updateState} onFollow={followCompany} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={user.role === 'admin' ? sync : undefined} onOpen={openCompany} onExport={exportJobs} onImport={() => setPage('import')} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData() }} /> : page === 'review' ? <ReviewPage onResolved={async () => { flash('审核项已处理'); await loadData() }} /> : <SettingsPage onSaved={flash} />}
+      {selected ? <CompanyView company={selected} onBack={() => setSelected(null)} onState={updateState} onFollow={followCompany} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={user.role === 'admin' ? sync : undefined} onOpen={openCompany} onExport={exportJobs} onImport={() => setPage('import')} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData() }} /> : page === 'admin' ? <AdminPage onNavigate={target => { setPage(target); setSelected(null) }} /> : page === 'review' ? <ReviewPage onResolved={async () => { flash('审核项已处理'); await loadData() }} /> : <SettingsPage onSaved={flash} />}
     </main>
   </div>
 }
@@ -166,6 +168,66 @@ function JobRow({ job, onState }: { job: Job; onState: (id: string, state: strin
 
 function ApplicationsPage({ applications, onState }: { applications: Application[]; onState: (id: string, state: string, favorite?: boolean) => void }) { const columns = [['interested', '感兴趣'], ['applied', '已投递'], ['interview', '面试中'], ['offer', 'Offer']] as const; return <><PageHeader eyebrow="我的行动" title="求职进度" description="把感兴趣的岗位，从看到变成投递和面试。" /><div className="kanban">{columns.map(([state, title]) => <ApplicationColumn key={state} title={title} state={state} jobs={applications.filter(job => job.state === state)} onState={onState} />)}</div>{!applications.length && <div className="empty-state compact"><div className="empty-icon">✓</div><h3>收藏岗位后，它们会出现在这里</h3><p>在企业详情中点击星标，即可开始记录求职进度。</p></div>}</> }
 function ApplicationColumn({ title, state, jobs, onState }: { title: string; state: string; jobs: Job[]; onState: (id: string, state: string, favorite?: boolean) => void }) { return <div className="kanban-column"><div className="column-head"><strong>{title}</strong><span>{jobs.length}</span></div>{jobs.map(job => <button className="application-card" key={job.id} onClick={() => onState(job.id, state)}><strong>{job.canonical_title}</strong><small>{job.company_name}</small></button>)}<button className="add-card">＋ 添加岗位</button></div> }
+
+function AdminPage({ onNavigate }: { onNavigate: (page: 'settings' | 'review') => void }) {
+  const [invitations, setInvitations] = useState<Invitation[]>([])
+  const [email, setEmail] = useState('')
+  const [role, setRole] = useState<'member' | 'admin'>('member')
+  const [busy, setBusy] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [message, setMessage] = useState('')
+
+  const load = async () => {
+    try {
+      setInvitations(await api<Invitation[]>('/admin/invitations'))
+      setMessage('')
+    } catch (e) {
+      setMessage((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { load() }, [])
+
+  const invite = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!email.trim()) return
+    setBusy(true)
+    try {
+      await api('/admin/invitations', { method: 'POST', body: JSON.stringify({ email: email.trim(), role }) })
+      setEmail('')
+      setRole('member')
+      await load()
+      setMessage('邀请已创建；如果已配置 SMTP，邀请邮件会发送到该邮箱。')
+    } catch (e) {
+      setMessage((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const activeCount = invitations.filter(item => !item.used_at && new Date(item.expires_at).getTime() > Date.now()).length
+  const usedCount = invitations.filter(item => Boolean(item.used_at)).length
+  const expiredCount = invitations.filter(item => !item.used_at && new Date(item.expires_at).getTime() <= Date.now()).length
+
+  return <><PageHeader eyebrow="管理员" title="管理台" description="管理访问权限，并从这里进入系统配置和审核队列。"><button className="secondary" onClick={() => onNavigate('settings')}>系统设置</button><button className="secondary" onClick={() => onNavigate('review')}>待审核</button></PageHeader><div className="metrics"><Metric label="邀请总数" value={invitations.length} tone="blue" /><Metric label="待登录" value={activeCount} tone="green" /><Metric label="已使用" value={usedCount} tone="violet" /><Metric label="已过期" value={expiredCount} tone="orange" /></div><div className="admin-grid"><section className="detail-card setting-section"><h2>邀请用户</h2><p className="setting-help">邀请有效期为 72 小时。受邀用户使用该邮箱申请登录验证码，默认角色为受邀用户。</p><form className="invite-form" onSubmit={invite}><label>邮箱<input type="email" required value={email} onChange={event => setEmail(event.target.value)} placeholder="name@example.com" /></label><label>角色<select value={role} onChange={event => setRole(event.target.value as 'member' | 'admin')}><option value="member">受邀用户</option><option value="admin">管理员</option></select></label><button className="primary" disabled={busy || !email.trim()} type="submit">{busy ? '创建中…' : '创建邀请'}</button></form>{message && <p className="setting-help admin-message">{message}</p>}</section><section className="detail-card setting-section"><h2>管理员工作流</h2><div className="admin-guide"><div><strong>1. 配置数据源</strong><p>在“系统设置”连接 TraceMemo，读取并选择招聘群。</p><button className="secondary" onClick={() => onNavigate('settings')}>打开系统设置 →</button></div><div><strong>2. 处理异常信息</strong><p>低置信度识别、字段冲突和失败任务会进入“待审核”。</p><button className="secondary" onClick={() => onNavigate('review')}>打开待审核 →</button></div><div><strong>3. 同步和导入</strong><p>回到“企业与岗位”点击“立即同步”，或使用“导入信息”手工补录。</p></div></div></section></div><section className="detail-card invitation-section"><div className="section-title"><h2>邀请记录</h2><div className="section-actions"><span>{invitations.length} 条</span><button className="secondary" onClick={load} disabled={loading}>↻ 刷新</button></div></div>{loading ? <div className="loading-inline">加载邀请记录…</div> : invitations.length ? <div className="invitation-list">{invitations.map(item => <InvitationRow key={item.id} invitation={item} />)}</div> : <div className="empty-inline">还没有邀请记录</div>}</section></>
+}
+
+function InvitationRow({ invitation }: { invitation: Invitation }) {
+  const expired = !invitation.used_at && new Date(invitation.expires_at).getTime() <= Date.now()
+  const status = invitation.used_at ? '已使用' : expired ? '已过期' : '待登录'
+  const statusClass = invitation.used_at ? 'used' : expired ? 'expired' : 'active'
+  const role = invitation.role === 'admin' ? '管理员' : '受邀用户'
+  return <div className="invitation-row"><div className="invitation-avatar">{invitation.email.slice(0, 1).toUpperCase()}</div><div className="invitation-main"><strong>{invitation.email}</strong><div><span>{role}</span><span>创建于 {formatDate(invitation.created_at)}</span><span>{invitation.used_at ? `使用于 ${formatDate(invitation.used_at)}` : `有效至 ${formatDate(invitation.expires_at)}`}</span></div></div><span className={`status ${statusClass}`}>{status}</span></div>
+}
+
+function formatDate(value?: string | null) {
+  if (!value) return '—'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value.replace('T', ' ').slice(0, 16)
+  return date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
 
 function ReviewPage({ onResolved }: { onResolved: () => Promise<void> }) {
   const [items, setItems] = useState<ReviewItem[]>([])
