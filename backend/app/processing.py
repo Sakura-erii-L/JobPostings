@@ -2,16 +2,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from urllib.parse import urlparse
 
 from .catalog import apply_model_item
 from .db import connect, one, utc_now
 from .model_provider import classify_messages, consolidate_company_profile, get_setting
-from .parsers import extract_file, fetch_public_url, parse_message_payload, sha256_bytes
+from .parsers import (
+    extract_file,
+    fetch_public_http,
+    fetch_public_url,
+    is_file_message,
+    is_image_message,
+    is_link_message,
+    is_system_message,
+    detect_image_suffix,
+    is_text_message,
+    parse_message_payload,
+    sha256_bytes,
+)
 
 
 def message_hash(connector_id: str | None, group_id: str | None, message: dict[str, Any]) -> str:
@@ -57,6 +71,9 @@ def attach_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: 
             except json.JSONDecodeError:
                 pass
         metadata["artifact_id"] = artifact["id"]
+        artifact_ids = list(dict.fromkeys([*(metadata.get("artifact_ids") or []), artifact["id"]]))
+        metadata["artifact_ids"] = artifact_ids
+        metadata["qr_values"] = list(dict.fromkeys([*(metadata.get("qr_values") or []), *(artifact.get("qr_values") or [])]))
         connection.execute(
             "UPDATE raw_messages SET text_content=?,metadata_json=? WHERE id=?",
             (merged, json.dumps(metadata, ensure_ascii=False), raw_message_id),
@@ -92,9 +109,15 @@ def _queue_classification(connection: Any, raw_id: str) -> None:
 
 
 def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: str | None, stats: dict[str, int] | None = None) -> str | None:
+    message_type = str(message.get("type") or message.get("msgType") or "text").strip().lower()
+    original_text = str(message.get("text") or message.get("content") or "")
+    if is_system_message(message_type, original_text, message):
+        _increment_ingest_stat(stats, "filtered_system")
+        return None
     text, metadata = parse_message_payload(message)
     digest = message_hash(connector_id, group_id, message)
-    message_type = str(message.get("type") or message.get("msgType") or "text").lower()
+    metadata["_original_text_content"] = original_text
+    metadata["_parsed_text_content"] = text
     external_id = str(message.get("id") or message.get("messageId") or "") or None
     sent_at = str(message.get("sent_at") or message.get("time") or message.get("timestamp") or utc_now())
     raw_id = str(uuid4())
@@ -211,10 +234,13 @@ def _stage(job_id: str, stage: str, message: str, processor: str | None = None) 
 def _codex_extract(job: dict[str, Any], raw: dict[str, Any], metadata: dict[str, Any], reason: str) -> str:
     from .codex_agent import run_codex_json
 
-    artifact = one("SELECT * FROM artifacts WHERE raw_message_id=? ORDER BY created_at DESC LIMIT 1", (raw["id"],))
-    images = []
-    if artifact and str(artifact["mime_type"] or "").startswith("image/"):
-        images = [artifact["path"]]
+    image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+    artifacts = [
+        row for row in _artifact_rows(raw["id"])
+        if str(row["mime_type"] or "").startswith("image/") or Path(str(row["filename"] or "")).suffix.lower() in image_suffixes
+    ]
+    images = [row["path"] for row in artifacts if row["path"]]
+    artifact = artifacts[-1] if artifacts else None
     payload = {
         "reason": reason,
         "source_type": raw["message_type"],
@@ -244,6 +270,176 @@ def _codex_extract(job: dict[str, Any], raw: dict[str, Any], metadata: dict[str,
     return text
 
 
+def _artifact_rows(raw_message_id: str) -> list[dict[str, Any]]:
+    return [dict(row) for row in _all_rows("SELECT * FROM artifacts WHERE raw_message_id=? ORDER BY created_at", (raw_message_id,))]
+
+
+def _all_rows(sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+    with connect() as connection:
+        return connection.execute(sql, params).fetchall()
+
+
+def _web_image_filename(url: str, content_type: str, index: int, detected_suffix: str | None = None) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}:
+        suffix = mimetypes.guess_extension(content_type.split(";", 1)[0].strip().lower()) or detected_suffix or ".bin"
+    return f"linked-image-{index}{suffix}"
+
+
+def _merge_texts(*values: Any) -> str:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return "\n".join(result)
+
+
+def _raw_snapshot(raw_message_id: str | None) -> dict[str, Any] | None:
+    if not raw_message_id:
+        return None
+    row = one("SELECT * FROM raw_messages WHERE id=?", (raw_message_id,))
+    if not row:
+        return None
+    value = dict(row)
+    try:
+        metadata = json.loads(value.get("metadata_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        metadata = {"_invalid_metadata_json": value.get("metadata_json") or ""}
+    original_text = metadata.get("_original_text_content")
+    return {
+        "id": value.get("id"),
+        "connector_id": value.get("connector_id"),
+        "source_group_id": value.get("source_group_id"),
+        "external_message_id": value.get("external_message_id"),
+        "sender": value.get("sender"),
+        "sent_at": value.get("sent_at"),
+        "message_type": value.get("message_type"),
+        "original_text_content": original_text if original_text is not None else value.get("text_content") or "",
+        "current_text_content": value.get("text_content") or "",
+        "metadata": metadata,
+        "content_hash": value.get("content_hash"),
+        "created_at": value.get("created_at"),
+    }
+
+
+def _job_snapshot(job_id: str) -> dict[str, Any] | None:
+    row = one("SELECT * FROM processing_jobs WHERE id=?", (job_id,))
+    return dict(row) if row else None
+
+
+def _processing_log_snapshots(job_id: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in _all_rows("SELECT * FROM processing_logs WHERE processing_job_id=? ORDER BY created_at", (job_id,)):
+        value = dict(row)
+        try:
+            value["details"] = json.loads(value.pop("details_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            value["details"] = {"_invalid_details_json": value.pop("details_json", "")}
+        result.append(value)
+    return result
+
+
+def _review_context(job_id: str, raw_message_id: str | None = None, company_id: str | None = None) -> dict[str, Any]:
+    job = _job_snapshot(job_id)
+    raw = _raw_snapshot(raw_message_id or (job or {}).get("raw_message_id"))
+    return {
+        "job": job,
+        "original_message": raw,
+        "processing_logs": _processing_log_snapshots(job_id),
+        "company_id": company_id or (job or {}).get("company_id"),
+    }
+
+
+def enrich_review_payload(payload: dict[str, Any], entity_type: str | None, entity_id: str | None) -> dict[str, Any]:
+    """Add durable task/source context to both new and legacy review records."""
+    result = dict(payload)
+    if entity_type == "processing_job":
+        job_id = str(result.get("job_id") or entity_id or "")
+        if job_id and not _job_snapshot(job_id) and entity_id:
+            linked_job = one("SELECT id FROM processing_jobs WHERE raw_message_id=? ORDER BY created_at DESC LIMIT 1", (entity_id,))
+            job_id = linked_job["id"] if linked_job else job_id
+        if job_id:
+            context = _review_context(job_id)
+            if context["job"]:
+                result["job"] = context["job"]
+                if context["job"].get("error") and not result.get("error"):
+                    result["error"] = {"type": "processing_error", "message": context["job"]["error"]}
+            if context["original_message"]:
+                result["original_message"] = context["original_message"]
+            result["processing_logs"] = context["processing_logs"]
+        return result
+    if entity_type == "company" and entity_id and not result.get("original_messages"):
+        raw_ids = [row["raw_message_id"] for row in _all_rows(
+            "SELECT DISTINCT raw_message_id FROM evidences WHERE company_id=? AND raw_message_id IS NOT NULL ORDER BY observed_at",
+            (entity_id,),
+        )]
+        result["original_messages"] = [snapshot for raw_id in raw_ids if (snapshot := _raw_snapshot(raw_id))]
+    return result
+
+
+def _persist_raw_extraction(raw_message_id: str, text: str, metadata: dict[str, Any]) -> None:
+    with connect() as connection:
+        connection.execute(
+            "UPDATE raw_messages SET text_content=?,metadata_json=? WHERE id=?",
+            (text, json.dumps(metadata, ensure_ascii=False), raw_message_id),
+        )
+
+
+def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[str, Any], metadata: dict[str, Any]) -> tuple[list[str], str]:
+    qr_values: list[str] = []
+    ocr_texts: list[str] = []
+    artifact_ids: list[str] = []
+    image_urls = [str(value) for value in parsed.get("images") or [] if value]
+    downloaded = 0
+    direct_data = parsed.get("data")
+    if isinstance(direct_data, bytes) and direct_data:
+        try:
+            artifact = attach_artifact(
+                raw["id"],
+                str(parsed.get("filename") or "web-image.bin"),
+                direct_data,
+                str(parsed.get("content_type") or "") or None,
+            )
+            artifact_ids.append(artifact["id"])
+            qr_values.extend(artifact.get("qr_values") or [])
+            ocr_texts.append(str(artifact.get("text") or ""))
+            downloaded += 1
+        except Exception as exc:
+            log_processing(job["id"], "extracting", "网页本身为图片，但图片提取失败", "warning", {"error": str(exc)})
+    for index, image_url in enumerate(image_urls[:12], start=1):
+        try:
+            response = fetch_public_http(image_url, timeout=30, max_bytes=10 * 1024 * 1024)
+            content_type = response.headers.get("content-type", "")
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            detected_suffix = detect_image_suffix(response.content)
+            if not media_type.startswith("image/") and not detected_suffix:
+                continue
+            artifact = attach_artifact(
+                raw["id"],
+                _web_image_filename(image_url, content_type, index, detected_suffix),
+                response.content,
+                content_type or None,
+            )
+            artifact_ids.append(artifact["id"])
+            qr_values.extend(artifact.get("qr_values") or [])
+            ocr_texts.append(str(artifact.get("text") or ""))
+            downloaded += 1
+        except Exception as exc:
+            log_processing(job["id"], "extracting", "网页图片提取失败", "warning", {"url": image_url, "error": str(exc)})
+    if image_urls:
+        metadata["linked_image_urls"] = image_urls[:12]
+    if artifact_ids:
+        metadata["artifact_id"] = artifact_ids[-1]
+        metadata["artifact_ids"] = list(dict.fromkeys([*(metadata.get("artifact_ids") or []), *artifact_ids]))
+    if qr_values:
+        metadata["qr_values"] = list(dict.fromkeys([*(metadata.get("qr_values") or []), *qr_values]))
+    if downloaded:
+        metadata["linked_images_downloaded"] = downloaded
+        log_processing(job["id"], "extracting", f"已下载并识别 {downloaded} 个网页图片资源", details={"qr_values": list(dict.fromkeys(qr_values))})
+    return list(dict.fromkeys(qr_values)), _merge_texts(*ocr_texts)
+
+
 def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     try:
         metadata = json.loads(raw.get("metadata_json") or "{}")
@@ -252,16 +448,24 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
     text = str(raw.get("text_content") or "").strip()
     _stage(job["id"], "extracting", "开始提取来源文字", "local_parser")
     url = metadata.get("url")
-    if raw["message_type"] in {"article", "link", "url"} and url and len(text) < 20:
+    if is_link_message(raw["message_type"], metadata) and url:
         try:
             parsed = fetch_public_url(str(url))
-            text = str(parsed.get("text") or "").strip()
-            metadata.update({"url": parsed.get("url", url), "title": parsed.get("title", ""), "backend_fetched": True})
-            with connect() as connection:
-                connection.execute("UPDATE raw_messages SET text_content=?,metadata_json=? WHERE id=?", (text, json.dumps(metadata, ensure_ascii=False), raw["id"]))
+            text = _merge_texts(text, parsed.get("text"))
+            metadata.update({
+                "url": parsed.get("url", url),
+                "title": parsed.get("title", ""),
+                "web_content_type": parsed.get("content_type", ""),
+                "backend_fetched": True,
+            })
+            _, image_text = _extract_link_images(job, raw, parsed, metadata)
+            text = _merge_texts(text, image_text)
+            _persist_raw_extraction(raw["id"], text, metadata)
+            raw["text_content"] = text
+            raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
         except Exception as exc:
             log_processing(job["id"], "extracting", "后端网页提取失败", "warning", {"error": str(exc)})
-    if len(text) < 20 and not (raw["message_type"] == "text" and text):
+    if len(text) < 20 and not is_text_message(raw["message_type"], metadata):
         text = _codex_extract(job, raw, metadata, "正文为空、过短或本地解析失败")
     log_processing(job["id"], "extracting", "来源文字提取完成", details={"characters": len(text)})
     return text, metadata
@@ -296,6 +500,8 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
             )
         else:
             status = "paused_quota" if "budget" in error.lower() else "needs_review"
+            review_payload = _review_context(job["id"], job.get("raw_message_id"), job.get("company_id"))
+            review_payload["error"] = {"type": type(exc).__name__, "message": error}
             connection.execute(
                 "UPDATE processing_jobs SET status=?,stage='failed',lease_until=NULL,error=?,finished_at=?,updated_at=? WHERE id=?",
                 (status, error, utc_now(), utc_now(), job["id"]),
@@ -303,7 +509,7 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
             entity_id = job.get("raw_message_id") or job.get("company_id") or job["id"]
             connection.execute(
                 "INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
-                (str(uuid4()), "processing_failed", "processing_job", entity_id, json.dumps({"job_id": job["id"], "stage": job.get("stage"), "error": error}, ensure_ascii=False), utc_now()),
+                (str(uuid4()), "processing_failed", "processing_job", entity_id, json.dumps(review_payload, ensure_ascii=False), utc_now()),
             )
     if retry_at:
         log_processing(job["id"], "retry_wait", f"处理失败，将自动进行第 {attempts + 1} 次尝试", "warning", {"error": error, "retry_at": retry_at})
@@ -395,6 +601,15 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
     if not raw_row:
         raise RuntimeError("Raw message not found")
     raw = dict(raw_row)
+    try:
+        raw_metadata = json.loads(raw.get("metadata_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        raw_metadata = {}
+    if is_system_message(raw["message_type"], raw.get("text_content") or "", raw_metadata):
+        with connect() as connection:
+            connection.execute("UPDATE raw_messages SET is_recruitment=0 WHERE id=?", (raw["id"],))
+        _finish(job["id"], {"is_recruitment": False, "reason": "system_message_filtered"})
+        return {"status": "succeeded", "is_recruitment": False, "filtered": "system_message", "id": job["id"]}
     text, metadata = _extract_source_text(job, raw)
     if not _still_active(job["id"]):
         return {"status": "canceled", "id": job["id"]}
@@ -429,27 +644,36 @@ def _process_company_consolidation(job: dict[str, Any]) -> dict[str, Any]:
             except json.JSONDecodeError:
                 pass
     source_rows = []
+    raw_message_ids: list[str] = []
     with connect() as connection:
         rows = connection.execute(
-            """SELECT e.id,e.source_type,e.source_url,e.observed_at,e.excerpt,r.text_content,r.sent_at
+            """SELECT e.id,e.source_type,e.source_url,e.observed_at,e.excerpt,r.id AS raw_message_id,r.text_content,r.sent_at
                FROM evidences e LEFT JOIN raw_messages r ON r.id=e.raw_message_id
                WHERE e.company_id=? ORDER BY e.observed_at""",
             (job["company_id"],),
         ).fetchall()
         for row in rows:
+            if row["raw_message_id"]:
+                raw_message_ids.append(row["raw_message_id"])
             source_rows.append({"evidence_id": row["id"], "source_type": row["source_type"], "source_url": row["source_url"], "observed_at": row["observed_at"], "text": row["text_content"] or row["excerpt"] or ""})
     _stage(job["id"], "consolidating", "合并企业事实并优化企业介绍")
     result = consolidate_company_profile(company, source_rows, job["id"])
     payload = result.payload
+    review_context = {
+        "original_messages": [snapshot for raw_id in raw_message_ids if (snapshot := _raw_snapshot(raw_id))],
+        "processing_job": _job_snapshot(job["id"]),
+        "processing_logs": _processing_log_snapshots(job["id"]),
+    }
     with connect() as connection:
         connection.execute(
             "INSERT INTO company_versions(id,company_id,profile_json,decision,reason,processor,created_at) VALUES(?,?,?,?,?,?,?)",
             (str(uuid4()), job["company_id"], json.dumps(payload.get("profile") or {}, ensure_ascii=False), payload.get("decision", "abnormal"), payload.get("reason"), result.provider + ":" + result.model, utc_now()),
         )
         if payload.get("decision") != "normal":
+            review_payload = {**payload, **review_context}
             connection.execute(
                 "INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
-                (str(uuid4()), "company_consolidation_abnormal", "company", job["company_id"], json.dumps(payload, ensure_ascii=False), utc_now()),
+                (str(uuid4()), "company_consolidation_abnormal", "company", job["company_id"], json.dumps(review_payload, ensure_ascii=False), utc_now()),
             )
             connection.execute("UPDATE processing_jobs SET status='needs_review',stage='review',error=?,finished_at=?,updated_at=? WHERE id=?", (payload.get("reason") or "Model marked consolidation abnormal", utc_now(), utc_now(), job["id"]))
             abnormal = True

@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .db import connect, one, utc_now
+from .parsers import is_link_message
 
 
 INDUSTRIES = {
@@ -232,8 +233,13 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         evidence_raw_message_id = raw_row["id"] if raw_row else None
         if raw_row and raw_row["connector_id"] == "manual":
             source_type = "manual_import"
-        if raw_row and raw_row["message_type"] in {"article", "link", "url"}:
-            source_type = "public_web"
+        if raw_row:
+            try:
+                raw_metadata = json.loads(raw_row["metadata_json"] or "{}")
+            except json.JSONDecodeError:
+                raw_metadata = {}
+            if is_link_message(raw_row["message_type"], raw_metadata):
+                source_type = "public_web"
         if raw_row:
             try:
                 source_url = json.loads(raw_row["metadata_json"] or "{}").get("url")
@@ -262,7 +268,7 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             except json.JSONDecodeError:
                 metadata = {}
         source_type = "manual_import" if raw_row and raw_row["connector_id"] == "manual" else "wechat_group"
-        if raw_row and raw_row["message_type"] in {"article", "link", "url"}:
+        if raw_row and is_link_message(raw_row["message_type"], metadata):
             source_type = "public_web"
         artifact_id = metadata.get("artifact_id")
         evidence_id = str(uuid4())

@@ -1,3 +1,5 @@
+import json
+
 from app import db
 from app.main import app
 
@@ -181,6 +183,54 @@ def test_manual_sync_requires_selected_groups(tmp_path, monkeypatch):
         response = client.post("/api/v1/admin/sync")
         assert response.status_code == 400
         assert "没有已选中的微信群" in response.json()["detail"]
+
+
+def test_review_items_include_current_task_original_message_and_logs(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("127.0.0.1", 50008)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        imported = client.post("/api/v1/imports/text", json={"text": "审核用的完整原始招聘正文"})
+        assert imported.status_code == 200
+        raw_id = imported.json()["raw_message_id"]
+        job = db.one("SELECT id FROM processing_jobs WHERE raw_message_id=?", (raw_id,))
+        assert job
+        with db.connect() as connection:
+            connection.execute("UPDATE processing_jobs SET status='needs_review',stage='failed',error='完整错误信息' WHERE id=?", (job["id"],))
+            connection.execute(
+                "INSERT INTO processing_logs(id,processing_job_id,stage,level,message,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                ("review-log", job["id"], "failed", "error", "失败阶段日志", json.dumps({"detail": "保留"}, ensure_ascii=False), db.utc_now()),
+            )
+            connection.execute(
+                "INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+                ("review-1", "processing_failed", "processing_job", raw_id, json.dumps({"job_id": job["id"]}, ensure_ascii=False), db.utc_now()),
+            )
+        response = client.get("/api/v1/admin/review-items")
+        assert response.status_code == 200
+        payload = response.json()[0]["payload"]
+        assert payload["job"]["error"] == "完整错误信息"
+        assert payload["original_message"]["original_text_content"] == "审核用的完整原始招聘正文"
+        assert payload["processing_logs"][0]["message"] == "失败阶段日志"
+
+
+def test_manual_sync_accepts_force_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module, "sync_tracememo_once", lambda force=False: {"status": "completed", "force": force, "fetched": 0, "created": 0, "updated": 0, "duplicates": 0, "ignored": 0, "groups": 1})
+    with TestClient(app, client=("127.0.0.1", 50009)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        assert client.put("/api/v1/admin/connectors/tracememo", json={"enabled": True}).status_code == 200
+        with db.connect() as connection:
+            connector_id = connection.execute("SELECT id FROM connectors WHERE kind='tracememo'").fetchone()["id"]
+            connection.execute("INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", ("group", connector_id, "room", "招聘群", 1, 1, db.utc_now(), db.utc_now()))
+        response = client.post("/api/v1/admin/sync", json={"force": True})
+        assert response.status_code == 200
+        assert response.json()["force"] is True
 
 
 def test_local_admin_initial_password_recovery(tmp_path, monkeypatch):

@@ -19,6 +19,12 @@
 .secondary.danger { color:#b4314e; background:#fff0f3; }
 .queue-preview { color: #52607c; line-height: 1.7; font-size: 13px; margin: 16px 0 12px; white-space: pre-wrap; word-break: break-word; }
 .queue-error { margin: 0 0 12px; padding: 10px 12px; border-radius: 9px; background: #fff6f7; color: #a8334b; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+.queue-current-step { display:flex; align-items:center; gap:9px; margin:14px 0 2px; padding:10px 12px; border-radius:10px; background:#f4f6ff; color:#5369ca; }
+.queue-current-step span { font-size:11px; color:#8994a8; }
+.queue-current-step strong { font-size:13px; }
+.queue-current-step.running { background:#f0eaff; color:#7655c5; }
+.queue-current-step.succeeded, .queue-current-step.canceled { background:#f0f3f7; color:#69758c; }
+.queue-current-step.needs_review, .queue-current-step.failed { background:#fff0f3; color:#b4314e; }
 .queue-meta { display: flex; gap: 12px; flex-wrap: wrap; color: #8994a8; font-size: 11px; }
 .queue-id { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .processing-log { margin-top:14px; border-top:1px solid #edf0f6; padding-top:10px; }

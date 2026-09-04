@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import hashlib
 import io
@@ -21,15 +22,32 @@ class TextExtractor(HTMLParser):
         super().__init__()
         self.parts: list[str] = []
         self.links: list[str] = []
+        self.images: list[str] = []
         self._skip = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in {"script", "style", "noscript", "svg"}:
             self._skip += 1
-        if tag == "a":
-            for key, value in attrs:
-                if key == "href" and value:
-                    self.links.append(value)
+        attributes = {key.lower(): value for key, value in attrs if value}
+        if tag == "a" and attributes.get("href"):
+            self.links.append(str(attributes["href"]))
+        if tag == "img":
+            for key in ("src", "data-src", "data-original", "data-lazy-src"):
+                value = attributes.get(key)
+                if value and not str(value).lower().startswith("data:"):
+                    self.images.append(str(value))
+                    break
+            else:
+                srcset = attributes.get("srcset") or ""
+                if srcset:
+                    value = str(srcset).split(",", 1)[0].strip().split(" ", 1)[0]
+                    if value and not value.lower().startswith("data:"):
+                        self.images.append(value)
+        if tag == "meta":
+            property_name = str(attributes.get("property") or attributes.get("name") or "").lower()
+            content = attributes.get("content")
+            if property_name in {"og:image", "twitter:image"} and content and not str(content).lower().startswith("data:"):
+                self.images.append(str(content))
 
     def handle_endtag(self, tag: str) -> None:
         if tag in {"script", "style", "noscript", "svg"} and self._skip:
@@ -48,12 +66,34 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def detect_image_suffix(data: bytes) -> str | None:
+    """Return a common image suffix when a response has no useful MIME type."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"BM"):
+        return ".bmp"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return ".tiff"
+    return None
+
+
 def extract_html(html: str) -> dict[str, Any]:
     parser = TextExtractor()
     parser.feed(html)
     text = "\n".join(parser.parts)
     title = parser.parts[0] if parser.parts else ""
-    return {"title": title[:300], "text": text[:2_000_000], "links": parser.links[:100]}
+    return {
+        "title": title[:300],
+        "text": text[:2_000_000],
+        "links": list(dict.fromkeys(parser.links))[:100],
+        "images": list(dict.fromkeys(parser.images))[:50],
+    }
 
 
 def _safe_decode(data: bytes) -> str:
@@ -217,19 +257,170 @@ def fetch_public_http(url: str, timeout: float = 30, max_bytes: int = 10 * 1024 
 def fetch_public_url(url: str) -> dict[str, Any]:
     response = fetch_public_http(url)
     content_type = response.headers.get("content-type", "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    detected_suffix = detect_image_suffix(response.content)
+    if media_type.startswith("image/") or detected_suffix:
+        suffix = mimetypes.guess_extension(media_type) or detected_suffix or Path(urlparse(str(response.url)).path).suffix or ".bin"
+        return {
+            "url": str(response.url),
+            "text": "",
+            "content_type": content_type,
+            "images": [],
+            "data": response.content,
+            "filename": f"web-image{suffix}",
+        }
     if "html" not in content_type and not response.text.lstrip().startswith("<"):
         return {"url": str(response.url), "text": response.text[:2_000_000], "content_type": content_type}
     result = extract_html(response.text)
+    result["links"] = [urljoin(str(response.url), link) for link in result.get("links", []) if link]
+    result["images"] = [urljoin(str(response.url), image) for image in result.get("images", []) if image]
     result.update({"url": str(response.url), "content_type": content_type})
     return result
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or len(value) > 2_000_000:
+        return {}
+    candidate = value.strip()
+    if not candidate:
+        return {}
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            result = loader(candidate)
+        except (ValueError, SyntaxError, TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(result, dict):
+            return result
+    return {}
+
+
+def content_data(message: dict[str, Any]) -> dict[str, Any]:
+    return _mapping(message.get("contentData") or message.get("content_data"))
+
+
+def normalized_message_type(value: Any) -> str:
+    return str(value or "text").strip().lower()
+
+
+SYSTEM_MESSAGE_TYPES = frozenset({
+    "system",
+    "system_message",
+    "system message",
+    "system_notification",
+    "system-notification",
+    "notification",
+    "group_notification",
+    "group_notice",
+    "sysmsg",
+    "sys_msg",
+    "系统",
+    "系统消息",
+    "系统信息",
+    "系统通知",
+    "通知",
+    "群通知",
+    "群消息通知",
+    "群聊通知",
+    "群聊系统通知",
+    "群系统消息",
+})
+LINK_MESSAGE_TYPES = frozenset({
+    "article",
+    "link",
+    "url",
+    "公众号链接",
+    "分享消息",
+    "分享",
+})
+IMAGE_MESSAGE_TYPES = frozenset({
+    "image",
+    "picture",
+    "photo",
+    "图片",
+    "图像",
+})
+FILE_MESSAGE_TYPES = frozenset({
+    "file",
+    "attachment",
+    "document",
+    "文件",
+    "文档",
+})
+
+
+def is_system_message(message_type: Any, text: str = "", message: dict[str, Any] | None = None) -> bool:
+    normalized = normalized_message_type(message_type)
+    if normalized in SYSTEM_MESSAGE_TYPES:
+        return True
+    message = message or {}
+    if str(message.get("from") or message.get("source") or "").strip().lower() == "system":
+        return True
+    nested = content_data(message)
+    if str(nested.get("type") or "").strip().lower() in SYSTEM_MESSAGE_TYPES:
+        return True
+    compact = normalize_text(text)
+    return bool(re.search(
+        r"(?:邀请.{0,120}(?:加入|进入)群聊|(?:加入|进入)了群聊|(?:退出|离开)了群聊|(?:被|将|把).{0,100}移出群聊|撤回了?(?:一条)?消息|修改群名|设置了群公告|拍了拍)",
+        compact,
+    ))
+
+
+def is_link_message(message_type: Any, metadata: dict[str, Any] | None = None) -> bool:
+    normalized = normalized_message_type(message_type)
+    if normalized in LINK_MESSAGE_TYPES:
+        return True
+    if metadata and metadata.get("url"):
+        return True
+    nested = _mapping((metadata or {}).get("contentData") or (metadata or {}).get("content_data"))
+    return str(nested.get("type") or "").strip().lower() in {"share", "link", "url", "article"}
+
+
+def is_image_message(message_type: Any, message: dict[str, Any] | None = None) -> bool:
+    normalized = normalized_message_type(message_type)
+    if normalized in IMAGE_MESSAGE_TYPES:
+        return True
+    message = message or {}
+    nested = content_data(message)
+    media = _mapping(message.get("media"))
+    return str(nested.get("type") or "").strip().lower() == "image" or str(media.get("type") or "").strip().lower() == "image"
+
+
+def is_file_message(message_type: Any, message: dict[str, Any] | None = None) -> bool:
+    normalized = normalized_message_type(message_type)
+    if normalized in FILE_MESSAGE_TYPES:
+        return True
+    nested = content_data(message or {})
+    return str(nested.get("type") or "").strip().lower() in {"file", "document", "attachment"}
+
+
+def is_text_message(message_type: Any, message: dict[str, Any] | None = None) -> bool:
+    return not (
+        is_link_message(message_type, message)
+        or is_image_message(message_type, message)
+        or is_file_message(message_type, message)
+    )
+
+
 def parse_message_payload(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    message_type = str(message.get("type") or message.get("msgType") or "text").lower()
+    message_type = normalized_message_type(message.get("type") or message.get("msgType") or "text")
     text = str(message.get("text") or message.get("content") or "")
     metadata = dict(message)
     metadata.pop("text", None)
     metadata.pop("content", None)
-    if message_type in {"link", "url", "article"} and message.get("url"):
-        metadata["url"] = message["url"]
-    return normalize_text(text), metadata
+    nested = content_data(message)
+    if nested:
+        metadata["contentData"] = nested
+    url = message.get("url") or nested.get("url")
+    if url:
+        metadata["url"] = str(url)
+    if nested.get("title"):
+        metadata["shared_title"] = str(nested["title"])
+    if nested.get("des") or nested.get("description"):
+        metadata["shared_description"] = str(nested.get("des") or nested.get("description"))
+    segments = [normalize_text(text)]
+    if is_link_message(message_type, metadata):
+        segments.extend(normalize_text(str(value)) for value in (nested.get("title"), nested.get("des") or nested.get("description")) if value)
+    deduplicated = list(dict.fromkeys(value for value in segments if value))
+    return "\n".join(deduplicated), metadata

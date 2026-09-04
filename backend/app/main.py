@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +23,9 @@ from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
-from .processing import attach_artifact, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
+from .maintenance import reset_recruitment_data
+from .parsers import is_file_message, is_image_message
+from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
 from .security import SecretVault, hash_password, hash_value, token
 from .tracememo import TraceMemoClient, normalize_group
 
@@ -70,6 +73,10 @@ class TextImportRequest(BaseModel):
 class UrlImportRequest(BaseModel):
     url: str
     source_group_id: str | None = None
+
+
+class SyncRequest(BaseModel):
+    force: bool = False
 
 
 class GroupSelection(BaseModel):
@@ -122,6 +129,7 @@ class QueueBulkRequest(BaseModel):
 
 
 background_tasks: set[asyncio.Task[Any]] = set()
+_sync_lock = threading.Lock()
 
 
 async def worker_loop() -> None:
@@ -235,7 +243,12 @@ def _setting_value(key: str, default: Any) -> Any:
         return default
 
 
-def sync_tracememo_once() -> dict[str, Any]:
+def sync_tracememo_once(force: bool = False) -> dict[str, Any]:
+    with _sync_lock:
+        return _sync_tracememo_once(force)
+
+
+def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
     row = one("SELECT * FROM connectors WHERE kind='tracememo' AND enabled=1")
     if not row:
         return {"status": "disabled", "fetched": 0, "groups": 0}
@@ -249,8 +262,9 @@ def sync_tracememo_once() -> dict[str, Any]:
             "groups": 0,
             "message": "没有已选中的微信群，请先读取并保存招聘群选择",
         }
+    reset_result = reset_recruitment_data() if force else None
     fetched = 0
-    ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "ignored": 0}
+    ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "ignored": 0, "filtered_system": 0, "media_attached": 0, "media_failed": 0}
     for group in groups:
         cursor = one("SELECT * FROM sync_cursors WHERE source_group_id=?", (group["id"],))
         end = datetime.now(timezone.utc)
@@ -266,14 +280,20 @@ def sync_tracememo_once() -> dict[str, Any]:
             raw_id = ingest_message(message, row["id"], group["id"], ingest_stats)
             if raw_id:
                 message_type = str(message.get("type") or message.get("msgType") or "").lower()
-                media_id = str(message.get("media_id") or message.get("mediaId") or message.get("attachment_id") or (message.get("id") if message_type in {"image", "file", "attachment", "picture", "document"} else "") or "")
-                if media_id and message_type in {"image", "file", "attachment", "picture", "document"}:
+                media_info = message.get("media") if isinstance(message.get("media"), dict) else {}
+                media_url = str(media_info.get("url") or "")
+                media_id = str(message.get("media_id") or message.get("mediaId") or message.get("attachment_id") or (media_url.rstrip("/").rsplit("/", 1)[-1] if media_url else "") or (message.get("id") if is_image_message(message_type, message) or is_file_message(message_type, message) else "") or "")
+                if media_id and (is_image_message(message_type, message) or is_file_message(message_type, message)):
                     try:
                         media, suggested_name = client.media(media_id)
                         filename = str(message.get("filename") or message.get("fileName") or suggested_name or f"{media_id}.bin")
                         attach_artifact(raw_id, filename, media, message.get("mime_type") or message.get("mimeType"))
-                    except Exception:
-                        pass
+                        ingest_stats["media_attached"] += 1
+                    except Exception as exc:
+                        ingest_stats["media_failed"] += 1
+                        processing_job = one("SELECT id FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))
+                        if processing_job:
+                            log_processing(processing_job["id"], "extracting", "TraceMemo 媒体下载失败，后续将保留原消息并尝试其他提取方式", "warning", {"media_id": media_id, "error": str(exc)})
         with connect() as connection:
             connection.execute("INSERT OR REPLACE INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)", (group["id"], end.isoformat(), None, utc_now()))
     return {
@@ -284,6 +304,11 @@ def sync_tracememo_once() -> dict[str, Any]:
         "updated": ingest_stats["updated"],
         "duplicates": ingest_stats["duplicates"],
         "ignored": ingest_stats["ignored"],
+        "filtered_system": ingest_stats["filtered_system"],
+        "media_attached": ingest_stats["media_attached"],
+        "media_failed": ingest_stats["media_failed"],
+        "force": force,
+        "reset": reset_result,
         "groups": len(groups),
     }
 
@@ -643,8 +668,8 @@ def select_groups(body: GroupSelection, _: dict[str, Any] = Depends(require_admi
 
 
 @app.post("/api/v1/admin/sync")
-async def manual_sync(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-    result = await asyncio.to_thread(sync_tracememo_once)
+async def manual_sync(body: SyncRequest | None = None, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    result = await asyncio.to_thread(sync_tracememo_once, bool(body and body.force))
     if result.get("status") == "disabled":
         raise HTTPException(400, "Enabled TraceMemo connector not found")
     if result.get("status") == "no_groups":
@@ -883,7 +908,18 @@ def evidence_detail(evidence_id: str, _: dict[str, Any] = Depends(require_scope(
         raise HTTPException(404, "Evidence not found")
     value = dict(row)
     value["metadata"] = json.loads(value.pop("metadata_json") or "{}")
-    value["qr_values"] = json.loads(value.pop("qr_values_json") or "[]")
+    first_qr_values = json.loads(value.pop("qr_values_json") or "[]")
+    artifact_rows = all_rows("SELECT id,qr_values_json FROM artifacts WHERE raw_message_id=? ORDER BY created_at", (value.get("raw_message_id"),)) if value.get("raw_message_id") else []
+    value["artifact_ids"] = [artifact["id"] for artifact in artifact_rows]
+    value["qr_values"] = list(dict.fromkeys([
+        *first_qr_values,
+        *[
+            qr
+            for artifact in artifact_rows
+            for qr in json.loads(artifact["qr_values_json"] or "[]")
+        ],
+        *((value["metadata"].get("qr_values") or []) if isinstance(value["metadata"], dict) else []),
+    ]))
     return value
 
 
@@ -1010,7 +1046,17 @@ def review_items(_: dict[str, Any] = Depends(require_admin)) -> list[dict[str, A
     result = []
     for row in rows:
         value = dict(row)
-        value["payload"] = json.loads(value.pop("payload_json"))
+        payload_json = value.pop("payload_json")
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError:
+            payload = {"error": {"type": "invalid_review_payload", "message": payload_json}}
+        if not isinstance(payload, dict):
+            payload = {
+                "error": {"type": "invalid_review_payload", "message": "审核载荷不是 JSON 对象"},
+                "raw_payload": payload,
+            }
+        value["payload"] = enrich_review_payload(payload, value.get("entity_type"), value.get("entity_id"))
         result.append(value)
     return result
 
