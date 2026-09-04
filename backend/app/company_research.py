@@ -99,13 +99,10 @@ def ensure_company_research_jobs(force: bool = False, company_ids: list[str] | N
                 "SELECT id,status,error FROM processing_jobs WHERE kind='research_company' AND company_id=? ORDER BY created_at DESC",
                 (company["id"],),
             ).fetchall()
-            if any(row["status"] in {"pending", "running", "retry_wait"} for row in jobs):
-                result["skipped_active"] += 1
-                continue
             stale = next(
                 (
                     row for row in jobs
-                    if row["status"] in {"needs_review", "failed"}
+                    if row["status"] in {"pending", "needs_review", "failed"}
                     and str(row["error"] or "").startswith("Unknown processing job kind: research_company")
                 ),
                 None,
@@ -118,6 +115,9 @@ def ensure_company_research_jobs(force: bool = False, company_ids: list[str] | N
                     (now, stale["id"]),
                 )
                 result["queued"] += 1
+                continue
+            if any(row["status"] in {"pending", "running", "retry_wait"} for row in jobs):
+                result["skipped_active"] += 1
                 continue
             if jobs and not force:
                 result["skipped_existing"] += 1
