@@ -23,7 +23,12 @@ def test_bootstrap_import_and_query(tmp_path, monkeypatch):
         assert client.post("/api/v1/auth/logout").status_code == 200
         assert client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 401
         assert client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "NewAdminPass123!"}).status_code == 200
-        assert client.get("/api/v1/auth/options").json() == {"password_login_enabled": True, "otp_login_enabled": False}
+        assert client.get("/api/v1/auth/options").json() == {
+            "password_login_enabled": True,
+            "otp_login_enabled": False,
+            "initial_admin_password_required": False,
+            "local_password_setup_allowed": True,
+        }
         assert client.post("/api/v1/auth/request-code", json={"email": "admin@example.com"}).status_code == 403
         imported = client.post("/api/v1/imports/text", json={"text": "测试科技招聘算法工程师，地点南京"})
         assert imported.status_code == 200
@@ -170,3 +175,40 @@ def test_manual_sync_requires_selected_groups(tmp_path, monkeypatch):
         response = client.post("/api/v1/admin/sync")
         assert response.status_code == 400
         assert "没有已选中的微信群" in response.json()["detail"]
+
+
+def test_local_admin_initial_password_recovery(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("127.0.0.1", 50006)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        with db.connect() as connection:
+            connection.execute("UPDATE users SET password_hash=NULL WHERE email=?", ("admin@example.com",))
+        assert client.post("/api/v1/auth/logout").status_code == 200
+        options = client.get("/api/v1/auth/options")
+        assert options.status_code == 200
+        assert options.json()["initial_admin_password_required"] is True
+        recovered = client.post("/api/v1/auth/initial-password", json={"email": "admin@example.com", "password": "RecoveredPass123!"})
+        assert recovered.status_code == 200
+        assert recovered.json()["user"]["password_configured"] is True
+        assert client.post("/api/v1/auth/logout").status_code == 200
+        assert client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "RecoveredPass123!"}).status_code == 200
+        assert client.post("/api/v1/auth/initial-password", json={"email": "admin@example.com", "password": "AnotherPass123!"}).status_code == 409
+
+
+def test_remote_admin_initial_password_recovery_is_blocked(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO users(id,email,role,created_at) VALUES(?,?,?,?)",
+            ("admin-id", "admin@example.com", "admin", "2026-09-04T00:00:00+00:00"),
+        )
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("203.0.113.10", 50007)) as client:
+        blocked = client.post("/api/v1/auth/initial-password", json={"email": "admin@example.com", "password": "RemotePass123!"})
+        assert blocked.status_code == 403

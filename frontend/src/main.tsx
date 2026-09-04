@@ -162,13 +162,34 @@ function Login({ onLoggedIn }: { onLoggedIn: (user: User) => void }) {
   const [code, setCode] = useState('')
   const [debug, setDebug] = useState('')
   const [otpEnabled, setOtpEnabled] = useState(false)
+  const [initialPasswordRequired, setInitialPasswordRequired] = useState(false)
+  const [localPasswordSetupAllowed, setLocalPasswordSetupAllowed] = useState(false)
+  const [optionsLoaded, setOptionsLoaded] = useState(false)
   const [message, setMessage] = useState('')
-  useEffect(() => { api<{ otp_login_enabled: boolean }>('/auth/options').then(value => setOtpEnabled(value.otp_login_enabled)).catch(() => undefined) }, [])
+  useEffect(() => { api<{ otp_login_enabled: boolean; initial_admin_password_required: boolean; local_password_setup_allowed: boolean }>('/auth/options').then(value => { setOtpEnabled(value.otp_login_enabled); setInitialPasswordRequired(value.initial_admin_password_required); setLocalPasswordSetupAllowed(value.local_password_setup_allowed) }).catch(() => undefined).finally(() => setOptionsLoaded(true)) }, [])
   const login = async (event: FormEvent) => { event.preventDefault(); try { const result = await api<{ user: User }>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }); onLoggedIn(result.user) } catch (e) { setMessage((e as Error).message) } }
   const send = async (event: FormEvent) => { event.preventDefault(); try { const result = await api<{ challenge_id: string; debug_code?: string }>('/auth/request-code', { method: 'POST', body: JSON.stringify({ email }) }); setChallenge(result.challenge_id); setDebug(result.debug_code || '') } catch (e) { setMessage((e as Error).message) } }
   const verify = async (event: FormEvent) => { event.preventDefault(); try { const result = await api<{ user: User }>('/auth/verify-code', { method: 'POST', body: JSON.stringify({ challenge_id: challenge, code }) }); onLoggedIn(result.user) } catch (e) { setMessage((e as Error).message) } }
   const useOtp = () => { setMessage(''); setMethod('otp'); setChallenge(''); setCode('') }
+  if (optionsLoaded && initialPasswordRequired) return <InitialAdminPassword localAllowed={localPasswordSetupAllowed} onLoggedIn={onLoggedIn} />
   return <AuthFrame title="欢迎回来" subtitle="使用账号密码进入招聘信息工作台"><form onSubmit={method === 'password' ? login : challenge ? verify : send}><input autoFocus type="email" required placeholder="账号邮箱" value={email} onChange={e => setEmail(e.target.value)} />{method === 'password' && <input type="password" required minLength={8} maxLength={128} placeholder="密码" value={password} onChange={e => setPassword(e.target.value)} />}{method === 'otp' && challenge && <><div className="sent-hint">验证码已发送至 <strong>{email}</strong></div><input autoFocus inputMode="numeric" required minLength={6} maxLength={6} placeholder="6 位验证码" value={code} onChange={e => setCode(e.target.value)} />{debug && <div className="debug-code">开发验证码：{debug}</div>}</>}<button className="primary full" type="submit">{method === 'password' ? '登录' : challenge ? '进入工作台' : '发送验证码'}</button>{method === 'password' ? <button className="auth-link" type="button" disabled={!otpEnabled} onClick={useOtp}>{otpEnabled ? '使用邮箱验证码登录' : '邮箱验证码登录（当前关闭）'}</button> : <button className="auth-link" type="button" onClick={() => { setMethod('password'); setChallenge(''); setMessage('') }}>返回密码登录</button>}{message && <div className="form-error">{message}</div>}</form></AuthFrame>
+}
+
+function InitialAdminPassword({ localAllowed, onLoggedIn }: { localAllowed: boolean; onLoggedIn: (user: User) => void }) {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [message, setMessage] = useState('')
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (password !== confirm) { setMessage('两次输入的密码不一致'); return }
+    try {
+      const result = await api<{ user: User }>('/auth/initial-password', { method: 'POST', body: JSON.stringify({ email, password }) })
+      onLoggedIn(result.user)
+    } catch (e) { setMessage((e as Error).message) }
+  }
+  if (!localAllowed) return <AuthFrame title="请在本机完成管理员设置" subtitle="当前管理员账号尚未设置密码"><p className="setting-help">为保护管理员账号，初始密码只能在运行 JobPostings 的电脑上设置。请在该电脑打开 <strong>http://127.0.0.1:17879</strong>，完成一次初始密码设置。</p></AuthFrame>
+  return <AuthFrame title="设置管理员密码" subtitle="这是旧账号迁移后的首次密码设置"><form onSubmit={submit}><input autoFocus type="email" required placeholder="管理员邮箱" value={email} onChange={e => setEmail(e.target.value)} /><input type="password" required minLength={8} maxLength={128} placeholder="设置密码（至少 8 位）" value={password} onChange={e => setPassword(e.target.value)} /><input type="password" required minLength={8} maxLength={128} placeholder="再次输入密码" value={confirm} onChange={e => setConfirm(e.target.value)} /><button className="primary full" type="submit">设置并进入工作台</button>{message && <div className="form-error">{message}</div>}</form></AuthFrame>
 }
 
 function Bootstrap({ onLoggedIn }: { onLoggedIn: (user: User) => void }) {

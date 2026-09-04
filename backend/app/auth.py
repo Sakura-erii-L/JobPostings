@@ -130,6 +130,10 @@ def otp_login_enabled() -> bool:
         return False
 
 
+def initial_admin_password_required() -> bool:
+    return bool(one("SELECT id FROM users WHERE role='admin' AND active=1 AND (password_hash IS NULL OR password_hash='')"))
+
+
 def _complete_login(user: Any) -> tuple[dict[str, Any], str]:
     with connect() as connection:
         connection.execute("UPDATE users SET last_login_at=? WHERE id=?", (utc_now(), user["id"]))
@@ -165,6 +169,25 @@ def authenticate_password(email: str, password: str) -> tuple[dict[str, Any], st
 def set_user_password(user_id: str, password: str) -> None:
     with connect() as connection:
         connection.execute("UPDATE users SET password_hash=? WHERE id=? AND active=1", (hash_password(password), user_id))
+
+
+def set_initial_admin_password(email: str, password: str) -> tuple[dict[str, Any], str]:
+    email = email.strip().lower()
+    user = one(
+        "SELECT * FROM users WHERE email=? AND role='admin' AND active=1 AND (password_hash IS NULL OR password_hash='')",
+        (email,),
+    )
+    if not user:
+        raise HTTPException(status_code=409, detail="管理员密码已经设置，或邮箱不是待初始化的管理员账号")
+    with connect() as connection:
+        updated = connection.execute(
+            "UPDATE users SET password_hash=? WHERE id=? AND active=1 AND (password_hash IS NULL OR password_hash='')",
+            (hash_password(password), user["id"]),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(status_code=409, detail="管理员密码已经设置，请直接使用密码登录")
+    user = one("SELECT * FROM users WHERE id=?", (user["id"],))
+    return _complete_login(user)
 
 
 def request_code(email: str) -> dict[str, Any]:

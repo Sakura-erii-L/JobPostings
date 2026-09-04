@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 
-from .auth import authenticate_password, create_session, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_user_password, verify_code
+from .auth import authenticate_password, create_session, initial_admin_password_required, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_initial_admin_password, set_user_password, verify_code
 from .backups import WebDAVClient, _backup_credentials, create_backup, list_backups, validate_remote_backup
 from .catalog import refresh_expiration
 from .config import config
@@ -42,6 +42,11 @@ class PasswordLoginRequest(BaseModel):
 
 
 class PasswordSetRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=128)
+
+
+class InitialAdminPasswordRequest(BaseModel):
+    email: EmailStr
     password: str = Field(min_length=8, max_length=128)
 
 
@@ -340,8 +345,13 @@ def bootstrap_status() -> dict[str, bool]:
 
 
 @app.get("/api/v1/auth/options")
-def auth_options() -> dict[str, bool]:
-    return {"password_login_enabled": True, "otp_login_enabled": otp_login_enabled()}
+def auth_options(request: Request) -> dict[str, bool]:
+    return {
+        "password_login_enabled": True,
+        "otp_login_enabled": otp_login_enabled(),
+        "initial_admin_password_required": initial_admin_password_required(),
+        "local_password_setup_allowed": local_bootstrap_allowed(request),
+    }
 
 
 @app.post("/api/v1/auth/login")
@@ -356,6 +366,16 @@ def auth_login(body: PasswordLoginRequest) -> JSONResponse:
 def auth_set_password(body: PasswordSetRequest, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
     set_user_password(user["id"], body.password)
     return {"ok": True, "password_configured": True}
+
+
+@app.post("/api/v1/auth/initial-password")
+def auth_set_initial_password(body: InitialAdminPasswordRequest, request: Request) -> JSONResponse:
+    if not local_bootstrap_allowed(request):
+        raise HTTPException(status_code=403, detail="管理员初始密码只能在运行服务的本机设置")
+    user, session = set_initial_admin_password(str(body.email), body.password)
+    response = JSONResponse({"user": user})
+    response.set_cookie("jp_session", session, httponly=True, samesite="lax", secure=config.public_base_url.startswith("https://"), max_age=60 * 60 * 24 * 7)
+    return response
 
 
 @app.post("/api/v1/auth/request-code")
