@@ -133,12 +133,34 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL,
   raw_message_id TEXT REFERENCES raw_messages(id) ON DELETE CASCADE,
+  company_id TEXT,
   status TEXT NOT NULL,
+  stage TEXT NOT NULL DEFAULT 'queued',
   attempts INTEGER NOT NULL DEFAULT 0,
   lease_until TEXT,
+  next_attempt_at TEXT,
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
+  processor TEXT,
+  result_json TEXT,
+  started_at TEXT,
+  finished_at TEXT,
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS queue_control (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  state TEXT NOT NULL DEFAULT 'paused',
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS processing_logs (
+  id TEXT PRIMARY KEY,
+  processing_job_id TEXT NOT NULL REFERENCES processing_jobs(id) ON DELETE CASCADE,
+  stage TEXT NOT NULL,
+  level TEXT NOT NULL DEFAULT 'info',
+  message TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS companies (
   id TEXT PRIMARY KEY,
@@ -149,9 +171,35 @@ CREATE TABLE IF NOT EXISTS companies (
   primary_industry TEXT NOT NULL DEFAULT 'other',
   secondary_industries_json TEXT NOT NULL DEFAULT '[]',
   website TEXT,
+  company_nature TEXT,
+  founded_at TEXT,
+  company_size TEXT,
+  headquarters TEXT,
+  businesses_json TEXT NOT NULL DEFAULT '[]',
+  highlights_json TEXT NOT NULL DEFAULT '[]',
+  official_channels_json TEXT NOT NULL DEFAULT '[]',
+  summary_locked INTEGER NOT NULL DEFAULT 0,
+  last_consolidated_at TEXT,
   verification_status TEXT NOT NULL DEFAULT 'unverified',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS company_versions (
+  id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  profile_json TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  reason TEXT,
+  processor TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS company_relations (
+  id TEXT PRIMARY KEY,
+  parent_company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  child_company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  relation_type TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(parent_company_id, child_company_id, relation_type)
 );
 CREATE TABLE IF NOT EXISTS company_claims (
   id TEXT PRIMARY KEY,
@@ -233,6 +281,40 @@ CREATE TABLE IF NOT EXISTS evidences (
   excerpt TEXT,
   location TEXT,
   observed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recruitment_events (
+  id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  batch_id TEXT REFERENCES recruitment_batches(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  start_at TEXT,
+  end_at TEXT,
+  timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
+  format TEXT NOT NULL DEFAULT 'unknown',
+  city TEXT,
+  campus TEXT,
+  location TEXT,
+  application_url TEXT,
+  audience TEXT,
+  notes TEXT,
+  job_ids_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'upcoming',
+  current_version INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recruitment_event_versions (
+  id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL REFERENCES recruitment_events(id) ON DELETE CASCADE,
+  payload_json TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  is_current INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS recruitment_event_evidences (
+  event_id TEXT NOT NULL REFERENCES recruitment_events(id) ON DELETE CASCADE,
+  evidence_id TEXT NOT NULL REFERENCES evidences(id) ON DELETE CASCADE,
+  PRIMARY KEY(event_id, evidence_id)
 );
 CREATE TABLE IF NOT EXISTS review_items (
   id TEXT PRIMARY KEY,
@@ -333,8 +415,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
 );
 CREATE INDEX IF NOT EXISTS idx_raw_messages_group_time ON raw_messages(source_group_id, sent_at);
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_processing_logs_job ON processing_logs(processing_job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id);
 CREATE INDEX IF NOT EXISTS idx_claims_company ON company_claims(company_id);
+CREATE INDEX IF NOT EXISTS idx_recruitment_events_time ON recruitment_events(start_at, company_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
 """
 
@@ -355,6 +439,41 @@ def init_db() -> None:
     config.ensure_dirs()
     with connect() as connection:
         connection.executescript(SCHEMA)
+        migrations = {
+            "processing_jobs": {
+                "company_id": "TEXT",
+                "stage": "TEXT NOT NULL DEFAULT 'queued'",
+                "next_attempt_at": "TEXT",
+                "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+                "processor": "TEXT",
+                "result_json": "TEXT",
+                "started_at": "TEXT",
+                "finished_at": "TEXT",
+            },
+            "companies": {
+                "company_nature": "TEXT",
+                "founded_at": "TEXT",
+                "company_size": "TEXT",
+                "headquarters": "TEXT",
+                "businesses_json": "TEXT NOT NULL DEFAULT '[]'",
+                "highlights_json": "TEXT NOT NULL DEFAULT '[]'",
+                "official_channels_json": "TEXT NOT NULL DEFAULT '[]'",
+                "summary_locked": "INTEGER NOT NULL DEFAULT 0",
+                "last_consolidated_at": "TEXT",
+            },
+        }
+        for table, columns in migrations.items():
+            existing_columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+            for column, definition in columns.items():
+                if column not in existing_columns:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processing_jobs_ready ON processing_jobs(status, next_attempt_at, created_at)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO queue_control(id,state,updated_at) VALUES(1,'paused',?)",
+            (utc_now(),),
+        )
         connection.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '1')"
         )
@@ -373,6 +492,12 @@ def init_db() -> None:
             "search": {"enabled": True, "cache_days": 30},
             "backup": {"enabled": False, "schedule": "02:00", "retention_count": 30},
             "agent_api_enabled": False,
+            "processing_engine": "codex",
+            "model_concurrency": 2,
+            "codex_concurrency": 1,
+            "extract_concurrency": 4,
+            "codex_model": "gpt-5.6-luna",
+            "processing_log_retention_days": 30,
         }
         for key, value in defaults.items():
             connection.execute(

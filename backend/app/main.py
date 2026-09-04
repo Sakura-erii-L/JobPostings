@@ -22,7 +22,7 @@ from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
-from .processing import attach_artifact, import_file, import_text, import_url, ingest_message, process_one_batch, process_one_enrichment
+from .processing import attach_artifact, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
 from .security import SecretVault, hash_value, token
 from .tracememo import TraceMemoClient, normalize_group
 
@@ -93,22 +93,42 @@ class BackupValidationRequest(BaseModel):
     backup_password: str | None = None
 
 
+class QueueControlRequest(BaseModel):
+    action: str
+
+
+class QueueTextRequest(BaseModel):
+    text: str = Field(min_length=1)
+
+
+class QueueBulkRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=200)
+
+
 background_tasks: set[asyncio.Task[Any]] = set()
 
 
 async def worker_loop() -> None:
+    running: set[asyncio.Task[Any]] = set()
     while True:
-        result = None
         try:
-            result = await asyncio.to_thread(process_one_batch, 100)
-            if result is None:
-                result = await asyncio.to_thread(process_one_enrichment)
-            if result:
-                await events.publish("processing.updated", result)
-            await asyncio.to_thread(refresh_expiration)
+            finished = {task for task in running if task.done()}
+            for task in finished:
+                running.remove(task)
+                result = task.result()
+                if result:
+                    await events.publish("processing.updated", result)
+            if queue_is_running():
+                engine = str(_setting_value("processing_engine", "codex") or "codex")
+                limit_key = "codex_concurrency" if engine == "codex" else "model_concurrency"
+                maximum = max(1, min(4 if engine == "codex" else 8, int(_setting_value(limit_key, 1))))
+                while len(running) < maximum:
+                    running.add(asyncio.create_task(asyncio.to_thread(process_one_batch, 1)))
+            if not running:
+                await asyncio.to_thread(refresh_expiration)
         except Exception as exc:
             await events.publish("sync.failed", {"error": str(exc)})
-        await asyncio.sleep(2 if result else 30)
+        await asyncio.sleep(1 if running else 3)
 
 
 async def retention_loop() -> None:
@@ -116,12 +136,17 @@ async def retention_loop() -> None:
         try:
             with connect() as connection:
                 connection.execute(
-                    "DELETE FROM raw_messages WHERE (is_recruitment=0 OR is_recruitment IS NULL) AND retention_until<?",
+                    """DELETE FROM raw_messages
+                       WHERE (is_recruitment=0 OR is_recruitment IS NULL) AND retention_until<?
+                         AND NOT EXISTS (SELECT 1 FROM processing_jobs p WHERE p.raw_message_id=raw_messages.id)""",
                     (utc_now(),),
                 )
                 connection.execute(
                     "DELETE FROM artifacts WHERE raw_message_id NOT IN (SELECT id FROM raw_messages)"
                 )
+                days = max(1, int(_setting_value("processing_log_retention_days", 30)))
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+                connection.execute("DELETE FROM processing_logs WHERE created_at<?", (cutoff,))
         except Exception:
             pass
         await asyncio.sleep(3600)
@@ -252,6 +277,11 @@ async def lifespan(app: FastAPI):
     init_db()
     config.ensure_dirs()
     SecretVault()
+    with connect() as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET status='pending',stage='queued',lease_until=NULL,updated_at=? WHERE status='running' AND cancel_requested=0",
+            (utc_now(),),
+        )
     task1 = asyncio.create_task(worker_loop())
     task2 = asyncio.create_task(retention_loop())
     task3 = asyncio.create_task(auto_sync_loop())
@@ -378,6 +408,8 @@ def update_settings(body: SettingsUpdate, _: dict[str, Any] = Depends(require_ad
         "sync_interval_minutes", "initial_import_days", "redaction_enabled", "llm_input_budget",
         "llm_output_budget", "llm_budget_warning_percent", "ordinary_retention_days",
         "possibly_expired_days", "smtp", "llm_provider", "search", "backup", "agent_api_enabled",
+        "processing_engine", "model_concurrency", "codex_concurrency", "extract_concurrency",
+        "processing_log_retention_days",
     }
     vault = SecretVault()
     with connect() as connection:
@@ -560,7 +592,7 @@ async def manual_sync(_: dict[str, Any] = Depends(require_admin)) -> dict[str, A
 
 @app.get("/api/v1/admin/processing-queue")
 def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-    allowed_statuses = {"pending", "running", "succeeded", "needs_review", "paused_quota", "failed"}
+    allowed_statuses = {"pending", "running", "succeeded", "needs_review", "paused_quota", "failed", "canceled"}
     if status and status not in allowed_statuses:
         raise HTTPException(400, f"Unknown processing status: {status}")
     limit = min(max(limit, 1), 200)
@@ -572,7 +604,8 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     params.append(limit)
     rows = all_rows(
         f"""
-        SELECT p.id,p.kind,p.raw_message_id,p.status,p.attempts,p.lease_until,p.error,p.created_at,p.updated_at,
+        SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
+               p.cancel_requested,p.processor,p.error,p.created_at,p.updated_at,p.started_at,p.finished_at,
                r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,
                substr(COALESCE(r.text_content,''),1,240) AS text_preview,
                sg.name AS source_group_name
@@ -588,7 +621,102 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     stats = {name: 0 for name in allowed_statuses}
     for row in all_rows("SELECT status,COUNT(*) AS count FROM processing_jobs GROUP BY status"):
         stats[row["status"]] = row["count"]
-    return {"stats": stats, "items": [dict(row) for row in rows], "total": sum(stats.values())}
+    control = one("SELECT state,updated_at FROM queue_control WHERE id=1")
+    return {"state": control["state"] if control else "paused", "state_updated_at": control["updated_at"] if control else None, "stats": stats, "items": [dict(row) for row in rows], "total": sum(stats.values())}
+
+
+@app.post("/api/v1/admin/processing-queue/control")
+def control_processing_queue(body: QueueControlRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    if body.action not in {"run", "pause", "cancel_all"}:
+        raise HTTPException(400, "action must be run, pause or cancel_all")
+    state = "running" if body.action == "run" else "paused"
+    with connect() as connection:
+        connection.execute("UPDATE queue_control SET state=?,updated_at=? WHERE id=1", (state, utc_now()))
+        running_ids: list[str] = []
+        canceled_ids: list[str] = []
+        if body.action == "cancel_all":
+            running_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status='running'").fetchall()]
+            canceled_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status IN ('pending','running','needs_review','paused_quota','failed')").fetchall()]
+            connection.execute(
+                "UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE status IN ('pending','running','needs_review','paused_quota','failed')",
+                (utc_now(), utc_now()),
+            )
+    if body.action == "cancel_all":
+        from .codex_agent import cancel_codex_job
+
+        for job_id in canceled_ids:
+            log_processing(job_id, "canceled", "管理员取消了任务", "warning")
+        for job_id in running_ids:
+            cancel_codex_job(job_id)
+    return {"state": state, "action": body.action, "canceled": len(canceled_ids) if body.action == "cancel_all" else 0}
+
+
+@app.post("/api/v1/admin/processing-queue/cancel")
+def cancel_processing_jobs(body: QueueBulkRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    ids = list(dict.fromkeys(body.ids))
+    placeholders = ",".join("?" for _ in ids)
+    with connect() as connection:
+        rows = connection.execute(
+            f"SELECT id,status FROM processing_jobs WHERE id IN ({placeholders})",
+            tuple(ids),
+        ).fetchall()
+        cancellable = [row["id"] for row in rows if row["status"] not in {"succeeded", "canceled"}]
+        running_ids = [row["id"] for row in rows if row["status"] == "running"]
+        if cancellable:
+            cancellable_placeholders = ",".join("?" for _ in cancellable)
+            connection.execute(
+                f"UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE id IN ({cancellable_placeholders})",
+                (utc_now(), utc_now(), *cancellable),
+            )
+    from .codex_agent import cancel_codex_job
+
+    for job_id in cancellable:
+        log_processing(job_id, "canceled", "管理员批量取消了任务", "warning")
+    for job_id in running_ids:
+        cancel_codex_job(job_id)
+    return {"canceled": len(cancellable), "ids": cancellable}
+
+
+@app.post("/api/v1/admin/processing-queue/{job_id}/cancel")
+def cancel_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    job = one("SELECT id,status FROM processing_jobs WHERE id=?", (job_id,))
+    if not job:
+        raise HTTPException(404, "Processing job not found")
+    if job["status"] in {"succeeded", "canceled"}:
+        raise HTTPException(409, "Completed or canceled task cannot be canceled")
+    with connect() as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE id=?",
+            (utc_now(), utc_now(), job_id),
+        )
+    from .codex_agent import cancel_codex_job
+
+    cancel_codex_job(job_id)
+    log_processing(job_id, "canceled", "管理员取消了任务", "warning")
+    return {"id": job_id, "status": "canceled"}
+
+
+@app.get("/api/v1/admin/processing-queue/{job_id}/logs")
+def processing_job_logs(job_id: str, _: dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
+    if not one("SELECT id FROM processing_jobs WHERE id=?", (job_id,)):
+        raise HTTPException(404, "Processing job not found")
+    result = []
+    for row in all_rows("SELECT * FROM processing_logs WHERE processing_job_id=? ORDER BY created_at", (job_id,)):
+        value = dict(row)
+        value["details"] = json.loads(value.pop("details_json") or "{}")
+        result.append(value)
+    return result
+
+
+@app.put("/api/v1/admin/processing-queue/{job_id}/text")
+def update_processing_text(job_id: str, body: QueueTextRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    job = one("SELECT raw_message_id FROM processing_jobs WHERE id=?", (job_id,))
+    if not job or not job["raw_message_id"]:
+        raise HTTPException(404, "Processing source was not found")
+    with connect() as connection:
+        connection.execute("UPDATE raw_messages SET text_content=? WHERE id=?", (body.text, job["raw_message_id"]))
+        connection.execute("UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,error=NULL,next_attempt_at=NULL,finished_at=NULL,updated_at=? WHERE id=?", (utc_now(), job_id))
+    return {"id": job_id, "status": "pending"}
 
 
 @app.post("/api/v1/admin/processing-queue/{job_id}/retry")
@@ -596,13 +724,14 @@ def retry_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin)
     job = one("SELECT id,status FROM processing_jobs WHERE id=?", (job_id,))
     if not job:
         raise HTTPException(404, "Processing job not found")
-    if job["status"] not in {"needs_review", "paused_quota", "failed"}:
+    if job["status"] not in {"needs_review", "paused_quota", "failed", "canceled"}:
         raise HTTPException(409, "Only failed processing jobs can be retried")
     with connect() as connection:
         connection.execute(
-            "UPDATE processing_jobs SET status='pending',lease_until=NULL,error=NULL,updated_at=? WHERE id=?",
+            "UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,lease_until=NULL,next_attempt_at=NULL,error=NULL,finished_at=NULL,updated_at=? WHERE id=?",
             (utc_now(), job_id),
         )
+    log_processing(job_id, "queued", "管理员将任务重新加入队列")
     return {"id": job_id, "status": "pending"}
 
 
@@ -668,8 +797,57 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
     result = dict(company)
     result["aliases"] = json.loads(result.pop("aliases_json"))
     result["secondary_industries"] = json.loads(result.pop("secondary_industries_json"))
+    for key in ("businesses_json", "highlights_json", "official_channels_json"):
+        result[key[:-5]] = json.loads(result.pop(key) or "[]")
     result["jobs"] = jobs
     result["evidences"] = evidences
+    result["events"] = recruitment_events(company_id=company_id, _=_)
+    return result
+
+
+@app.get("/api/v1/evidences/{evidence_id}")
+def evidence_detail(evidence_id: str, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> dict[str, Any]:
+    row = one(
+        """SELECT e.*,r.text_content AS raw_text,r.sender,r.sent_at,r.message_type,r.metadata_json,
+                  sg.name AS source_group_name,a.filename,a.mime_type,a.ocr_text,a.qr_values_json
+           FROM evidences e LEFT JOIN raw_messages r ON r.id=e.raw_message_id
+           LEFT JOIN source_groups sg ON sg.id=r.source_group_id
+           LEFT JOIN artifacts a ON a.id=e.artifact_id WHERE e.id=?""",
+        (evidence_id,),
+    )
+    if not row:
+        raise HTTPException(404, "Evidence not found")
+    value = dict(row)
+    value["metadata"] = json.loads(value.pop("metadata_json") or "{}")
+    value["qr_values"] = json.loads(value.pop("qr_values_json") or "[]")
+    return value
+
+
+@app.get("/api/v1/artifacts/{artifact_id}")
+def artifact_download(artifact_id: str, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> FileResponse:
+    row = one("SELECT path,filename,mime_type FROM artifacts WHERE id=?", (artifact_id,))
+    if not row or not Path(row["path"]).exists():
+        raise HTTPException(404, "Artifact not found")
+    return FileResponse(row["path"], media_type=row["mime_type"], filename=row["filename"])
+
+
+@app.get("/api/v1/recruitment-events")
+def recruitment_events(company_id: str | None = None, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> list[dict[str, Any]]:
+    params: tuple[Any, ...] = (company_id,) if company_id else ()
+    where = "WHERE e.company_id=?" if company_id else ""
+    rows = all_rows(
+        f"""SELECT e.*,c.display_name AS company_name,b.name AS batch_name
+            FROM recruitment_events e JOIN companies c ON c.id=e.company_id
+            LEFT JOIN recruitment_batches b ON b.id=e.batch_id {where}
+            ORDER BY CASE WHEN e.start_at IS NULL THEN 1 ELSE 0 END,e.start_at""",
+        params,
+    )
+    result = []
+    for row in rows:
+        value = dict(row)
+        value["job_ids"] = json.loads(value.pop("job_ids_json") or "[]")
+        value["evidence_ids"] = [item["evidence_id"] for item in all_rows("SELECT evidence_id FROM recruitment_event_evidences WHERE event_id=?", (row["id"],))]
+        result.append(value)
     return result
 
 
