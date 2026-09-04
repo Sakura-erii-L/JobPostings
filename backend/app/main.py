@@ -23,7 +23,8 @@ from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
-from .maintenance import repair_source_urls, reset_recruitment_data
+from .company_research import ensure_company_research_jobs
+from .maintenance import repair_existing_catalog, repair_source_urls, reset_recruitment_data
 from .local_storage import clear_cache, clear_chat_records, delete_local_database_backup, storage_snapshot
 from .parsers import is_file_message, is_image_message, parse_message_time
 from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
@@ -78,6 +79,10 @@ class UrlImportRequest(BaseModel):
 
 
 class SyncRequest(BaseModel):
+    force: bool = False
+
+
+class CompanyResearchRequest(BaseModel):
     force: bool = False
 
 
@@ -386,6 +391,8 @@ async def auto_sync_loop() -> None:
 async def lifespan(app: FastAPI):
     init_db()
     repair_source_urls()
+    repair_existing_catalog()
+    ensure_company_research_jobs()
     config.ensure_dirs()
     SecretVault()
     with connect() as connection:
@@ -739,6 +746,12 @@ async def manual_sync(body: SyncRequest | None = None, _: dict[str, Any] = Depen
     return result
 
 
+@app.post("/api/v1/admin/company-research")
+def trigger_company_research(body: CompanyResearchRequest | None = None, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    result = ensure_company_research_jobs(bool(body and body.force))
+    return {"status": "queued", **result}
+
+
 @app.get("/api/v1/admin/processing-queue")
 def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     allowed_statuses = {"pending", "running", "succeeded", "needs_review", "paused_quota", "failed", "canceled"}
@@ -927,6 +940,7 @@ def companies(q: str | None = None, industry: str | None = None, _: dict[str, An
         value.pop("manual_overrides_json", None)
         value["aliases"] = json.loads(value.pop("aliases_json"))
         value["secondary_industries"] = json.loads(value.pop("secondary_industries_json"))
+        value["tags"] = json.loads(value.pop("company_tags_json", "[]") or "[]")
         result.append(value)
     return result
 
@@ -945,14 +959,17 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
                 except json.JSONDecodeError:
                     pass
     evidences = [dict(row) for row in all_rows("SELECT * FROM evidences WHERE company_id=? OR job_id IN (SELECT id FROM jobs WHERE company_id=?) ORDER BY observed_at DESC", (company_id, company_id))]
+    public_findings = [dict(row) for row in all_rows("SELECT id,finding_type,title,summary,source_title,source_url,resolved_url,published_at,severity,retrieved_at FROM company_public_findings WHERE company_id=? ORDER BY retrieved_at DESC", (company_id,))]
     result = dict(company)
     result.pop("manual_overrides_json", None)
     result["aliases"] = json.loads(result.pop("aliases_json"))
     result["secondary_industries"] = json.loads(result.pop("secondary_industries_json"))
+    result["tags"] = json.loads(result.pop("company_tags_json", "[]") or "[]")
     for key in ("businesses_json", "highlights_json", "official_channels_json"):
         result[key[:-5]] = json.loads(result.pop(key) or "[]")
     result["jobs"] = jobs
     result["evidences"] = evidences
+    result["public_findings"] = public_findings
     result["events"] = recruitment_events(company_id=company_id, _=_)
     return result
 

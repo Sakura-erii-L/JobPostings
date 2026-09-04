@@ -204,9 +204,11 @@ CREATE TABLE IF NOT EXISTS companies (
   businesses_json TEXT NOT NULL DEFAULT '[]',
   highlights_json TEXT NOT NULL DEFAULT '[]',
   official_channels_json TEXT NOT NULL DEFAULT '[]',
+  company_tags_json TEXT NOT NULL DEFAULT '[]',
   summary_locked INTEGER NOT NULL DEFAULT 0,
   manual_overrides_json TEXT NOT NULL DEFAULT '{}',
   last_consolidated_at TEXT,
+  public_researched_at TEXT,
   verification_status TEXT NOT NULL DEFAULT 'unverified',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -238,6 +240,21 @@ CREATE TABLE IF NOT EXISTS company_claims (
   retrieved_at TEXT NOT NULL,
   confidence REAL NOT NULL DEFAULT 0.0,
   is_current INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS company_public_findings (
+  id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  finding_type TEXT NOT NULL DEFAULT 'negative_news',
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  source_title TEXT,
+  source_url TEXT NOT NULL,
+  resolved_url TEXT,
+  published_at TEXT,
+  severity TEXT NOT NULL DEFAULT 'unknown',
+  content_hash TEXT NOT NULL,
+  retrieved_at TEXT NOT NULL,
+  UNIQUE(company_id, content_hash)
 );
 CREATE TABLE IF NOT EXISTS company_merge_rules (
   id TEXT PRIMARY KEY,
@@ -447,6 +464,7 @@ CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status,
 CREATE INDEX IF NOT EXISTS idx_processing_logs_job ON processing_logs(processing_job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id);
 CREATE INDEX IF NOT EXISTS idx_claims_company ON company_claims(company_id);
+CREATE INDEX IF NOT EXISTS idx_public_findings_company ON company_public_findings(company_id, retrieved_at);
 CREATE INDEX IF NOT EXISTS idx_recruitment_events_time ON recruitment_events(start_at, company_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
 """
@@ -493,9 +511,11 @@ def init_db() -> None:
                 "businesses_json": "TEXT NOT NULL DEFAULT '[]'",
                 "highlights_json": "TEXT NOT NULL DEFAULT '[]'",
                 "official_channels_json": "TEXT NOT NULL DEFAULT '[]'",
+                "company_tags_json": "TEXT NOT NULL DEFAULT '[]'",
                 "summary_locked": "INTEGER NOT NULL DEFAULT 0",
                 "manual_overrides_json": "TEXT NOT NULL DEFAULT '{}'",
                 "last_consolidated_at": "TEXT",
+                "public_researched_at": "TEXT",
             },
         }
         for table, columns in migrations.items():
@@ -511,7 +531,7 @@ def init_db() -> None:
             (utc_now(),),
         )
         connection.execute(
-            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '1')"
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '2')"
         )
         connection.execute(
             """INSERT OR IGNORE INTO system_settings(key, value_json, updated_at)

@@ -73,3 +73,24 @@ button { cursor: pointer; }
 @media(max-width:680px){.storage-summary,.editor-grid{grid-template-columns:1fr}.company-edit-bar{display:block}.company-edit-bar .secondary{margin-top:10px}}
 .setting-warning { color:#a86c25; background:#fff7e8; border-radius:9px; padding:9px 11px; font-size:11px; line-height:1.6; }
 .review-sections { display:flex; flex-direction:column; gap:8px; margin-top:16px; }.review-section { border:1px solid #edf0f6; border-radius:10px; background:#fbfcff; }.review-section summary { cursor:pointer; padding:10px 12px; color:#53617d; font-size:12px; font-weight:700; }.review-section pre { max-height:420px; overflow:auto; margin:0; padding:0 12px 12px; color:#52607c; font-size:11px; white-space:pre-wrap; word-break:break-word; }.qr-list { display:flex; flex-direction:column; gap:5px; padding:0 0 4px; }.qr-list a,.qr-list span { overflow-wrap:anywhere; font-size:11px; }
+.company-card-meta { margin-top: 8px; }
+.company-tags { margin-top: 7px; }
+.company-tags span.company-tag.company_type { color: #8a5b25; background: #fff2d9; }
+.company-tags span.company-tag.industry { color: #5269c8; background: #eef1ff; }
+.alias-tags { margin-top: 10px; }
+.alias-tags span { color: #7c879b; background: #f4f5f8; }
+.research-time { display: block; color: #9aa5b8; font-size: 11px; margin-top: 12px; }
+.public-findings { border-color: #f0d9df; }
+.research-disclaimer, .empty-public-findings p { color: #8a7180; font-size: 12px; line-height: 1.65; margin: 0 0 12px; }
+.public-finding { border-top: 1px solid #f2e5e8; padding: 14px 0 2px; }
+.public-finding-head { display: flex; align-items: center; gap: 10px; }
+.public-finding-head strong { color: #5d3441; font-size: 13px; }
+.public-finding-head .severity { padding: 4px 7px; border-radius: 99px; font-size: 10px; }
+.severity.high { color: #a42f48; background: #ffe7ed; }
+.severity.medium { color: #a56820; background: #fff0d6; }
+.severity.low, .severity.unknown { color: #69758c; background: #eef1f5; }
+.public-finding p { color: #6f5963; font-size: 12px; line-height: 1.65; margin: 8px 0; white-space: pre-wrap; }
+.public-finding-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: #9a8790; font-size: 11px; }
+.public-finding-meta a { color: #596fd1; }
+.resolved-source { margin-top: 8px; color: #8994a8; font-size: 11px; }
+.resolved-source code { display: block; margin-top: 5px; white-space: pre-wrap; word-break: break-all; color: #65718d; }

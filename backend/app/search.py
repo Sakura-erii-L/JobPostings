@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 import httpx
 
 from .db import connect, one, utc_now
-from .model_provider import get_setting, summarize_company
+from .model_provider import get_setting
 from .parsers import extract_html, fetch_public_http, validate_public_url
 
 
@@ -33,21 +33,23 @@ def _extract_result_links(html: str) -> list[tuple[str, str]]:
 def search_company(name: str) -> list[dict[str, Any]]:
     queries = [
         ("bing", f"https://www.bing.com/search?q={quote_plus(name + ' 官网 招聘') }"),
+        ("bing", f"https://www.bing.com/search?q={quote_plus(name + ' 处罚 诉讼 事故 失信 欠薪 裁员') }"),
         ("baidu", f"https://www.baidu.com/s?wd={quote_plus(name + ' 官网 招聘') }"),
+        ("baidu", f"https://www.baidu.com/s?wd={quote_plus(name + ' 处罚 诉讼 事故 失信 欠薪 裁员') }"),
     ]
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for provider, url in queries:
         try:
             response = httpx.get(url, headers={"User-Agent": "Mozilla/5.0 JobPostings/0.1"}, timeout=20, follow_redirects=True)
             response.raise_for_status()
-            results = []
             for title, link in _extract_result_links(response.text):
-                if _safe_url(link):
-                    results.append({"provider": provider, "title": title, "url": link})
-            if results:
-                return results
+                if link not in seen and _safe_url(link):
+                    seen.add(link)
+                    result.append({"provider": provider, "title": title, "url": link})
         except Exception:
             continue
-    return []
+    return result[:20]
 
 
 def fetch_search_sources(results: list[dict[str, Any]], max_pages: int = 5) -> list[dict[str, Any]]:
@@ -64,48 +66,7 @@ def fetch_search_sources(results: list[dict[str, Any]], max_pages: int = 5) -> l
 
 
 def enrich_company(company_id: str) -> dict[str, Any]:
-    """Best-effort public-web enrichment; never raises into recruitment ingestion."""
-    company = one("SELECT * FROM companies WHERE id=?", (company_id,))
-    if not company:
-        return {"company_id": company_id, "status": "missing"}
-    search_settings = get_setting("search", {}) or {}
-    if not search_settings.get("enabled", True):
-        return {"company_id": company_id, "status": "disabled"}
-    recent = one(
-        "SELECT retrieved_at FROM company_claims WHERE company_id=? ORDER BY retrieved_at DESC LIMIT 1",
-        (company_id,),
-    )
-    if recent:
-        from datetime import datetime, timedelta, timezone
+    """Run the durable public research flow from legacy callers."""
+    from .company_research import execute_company_research
 
-        try:
-            cache_days = max(1, int(search_settings.get("cache_days", 30)))
-            if datetime.fromisoformat(recent["retrieved_at"]) > datetime.now(timezone.utc) - timedelta(days=cache_days):
-                return {"company_id": company_id, "status": "cached"}
-        except ValueError:
-            pass
-    results = search_company(company["display_name"])
-    sources = fetch_search_sources(results)
-    if not sources:
-        with connect() as connection:
-            connection.execute("UPDATE companies SET verification_status='search_failed',updated_at=? WHERE id=?", (utc_now(), company_id))
-        return {"company_id": company_id, "status": "search_failed"}
-    summary = ""
-    facts: list[dict[str, Any]] = []
-    try:
-        model_result = summarize_company(company["display_name"], sources)
-        summary = str(model_result.payload.get("summary") or "").strip()
-        facts = model_result.payload.get("facts") or []
-    except Exception:
-        summary = sources[0]["text"][:600].strip()
-    now = utc_now()
-    with connect() as connection:
-        connection.execute("UPDATE companies SET summary=?,verification_status='public_web',updated_at=? WHERE id=?", (summary[:3000], now, company_id))
-        connection.execute("UPDATE company_claims SET is_current=0 WHERE company_id=? AND field_name='summary'", (company_id,))
-        connection.execute("INSERT INTO company_claims(id,company_id,field_name,field_value,source_url,source_type,retrieved_at,confidence,is_current) VALUES(?,?,?,?,?,?,?,?,1)", (__import__('uuid').uuid4().hex, company_id, "summary", summary[:3000], sources[0].get("final_url") or sources[0].get("url"), "public_web", now, 0.75 if summary else 0.35))
-        for fact in facts:
-            if isinstance(fact, dict) and fact.get("fact"):
-                connection.execute("INSERT INTO company_claims(id,company_id,field_name,field_value,source_url,source_type,retrieved_at,confidence,is_current) VALUES(?,?,?,?,?,?,?,?,0)", (__import__('uuid').uuid4().hex, company_id, "fact", str(fact["fact"])[:1000], fact.get("source_url"), "public_web", now, 0.65))
-        for source in sources:
-            connection.execute("INSERT INTO evidences(id,company_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?)", (__import__('uuid').uuid4().hex, company_id, source.get("final_url") or source.get("url"), "public_web", source.get("text", "")[:4000], now))
-    return {"company_id": company_id, "status": "enriched", "sources": len(sources)}
+    return execute_company_research(company_id, f"enrichment-{company_id}")

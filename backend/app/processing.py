@@ -11,7 +11,8 @@ from uuid import uuid4
 from urllib.parse import urlparse
 
 from .browser import fetch_public_browser
-from .catalog import apply_company_overrides, apply_model_item, company_overrides
+from .catalog import INDUSTRIES, apply_company_overrides, apply_model_item, company_overrides, deduplicate_company_jobs, normalize_company_tags
+from .company_research import execute_company_research
 from .db import connect, one, utc_now
 from .model_provider import classify_messages, consolidate_company_profile, get_setting
 from .parsers import (
@@ -685,6 +686,20 @@ def _unique_dicts(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _merge_json_list(old_value: Any, new_value: Any) -> list[Any]:
+    try:
+        old = json.loads(old_value or "[]") if isinstance(old_value, str) else (old_value or [])
+    except (TypeError, json.JSONDecodeError):
+        old = []
+    incoming = new_value if isinstance(new_value, list) else []
+    values = [value for value in [*old, *incoming] if value not in (None, "")]
+    result: list[Any] = []
+    for value in values:
+        if value not in result:
+            result.append(value)
+    return result
+
+
 def _merge_extracted_items(items: list[dict[str, Any]], message_id: str) -> dict[str, Any]:
     recruitment = [item for item in items if item.get("is_recruitment")]
     if not recruitment:
@@ -785,6 +800,8 @@ def _process_company_consolidation(job: dict[str, Any]) -> dict[str, Any]:
                 company[key[:-5]] = json.loads(company.pop(key) or "[]")
             except json.JSONDecodeError:
                 pass
+    if "company_tags" in company:
+        company["tags"] = company.pop("company_tags")
     source_rows = []
     raw_message_ids: list[str] = []
     with connect() as connection:
@@ -827,25 +844,53 @@ def _process_company_consolidation(job: dict[str, Any]) -> dict[str, Any]:
             profile = payload.get("profile") or {}
             existing_aliases = json.loads(company_row["aliases_json"] or "[]")
             aliases = list(dict.fromkeys([*existing_aliases, *(profile.get("aliases") or [])]))
-            industries = [value for value in profile.get("industry_codes") or [] if value]
+            industries = [value for value in profile.get("industry_codes") or [] if value in INDUSTRIES]
+            existing_industries = [company_row["primary_industry"], *json.loads(company_row["secondary_industries_json"] or "[]")]
+            merged_industries = list(dict.fromkeys([*existing_industries, *industries]))
+            primary_industry = industries[0] if industries else company_row["primary_industry"]
+            secondary_industries = [value for value in merged_industries if value and value != primary_industry]
+            existing_tags = json.loads(company_row["company_tags_json"] or "[]")
+            tags = normalize_company_tags(
+                [*existing_tags, *(profile.get("tags") or [])],
+                profile.get("company_nature") or company_row["company_nature"],
+                merged_industries,
+            )
             summary = company_row["summary"] if company_row["summary_locked"] else profile.get("summary") or company_row["summary"]
+            businesses = _merge_json_list(company_row["businesses_json"], profile.get("businesses"))
+            highlights = _merge_json_list(company_row["highlights_json"], profile.get("highlights"))
+            official_channels = _merge_json_list(company_row["official_channels_json"], profile.get("official_channels"))
             connection.execute(
                 """UPDATE companies SET display_name=COALESCE(NULLIF(?,''),display_name),legal_name=COALESCE(NULLIF(?,''),legal_name),
                    aliases_json=?,summary=?,primary_industry=COALESCE(?,primary_industry),secondary_industries_json=?,website=COALESCE(NULLIF(?,''),website),
                    company_nature=COALESCE(NULLIF(?,''),company_nature),founded_at=COALESCE(NULLIF(?,''),founded_at),company_size=COALESCE(NULLIF(?,''),company_size),
-                   headquarters=COALESCE(NULLIF(?,''),headquarters),businesses_json=?,highlights_json=?,official_channels_json=?,last_consolidated_at=?,updated_at=? WHERE id=?""",
+                   headquarters=COALESCE(NULLIF(?,''),headquarters),businesses_json=?,highlights_json=?,official_channels_json=?,company_tags_json=?,last_consolidated_at=?,updated_at=? WHERE id=?""",
                 (profile.get("display_name"), profile.get("legal_name"), json.dumps(aliases, ensure_ascii=False), summary,
-                 industries[0] if industries else None, json.dumps(industries[1:], ensure_ascii=False), profile.get("website"),
-                 profile.get("company_nature"), profile.get("founded_at"), profile.get("company_size"), profile.get("headquarters"),
-                 json.dumps(profile.get("businesses") or [], ensure_ascii=False), json.dumps(profile.get("highlights") or [], ensure_ascii=False),
-                 json.dumps(profile.get("official_channels") or [], ensure_ascii=False), utc_now(), utc_now(), job["company_id"]),
+                  primary_industry, json.dumps(secondary_industries, ensure_ascii=False), profile.get("website"),
+                  profile.get("company_nature"), profile.get("founded_at"), profile.get("company_size"), profile.get("headquarters"),
+                  json.dumps(businesses, ensure_ascii=False), json.dumps(highlights, ensure_ascii=False),
+                  json.dumps(official_channels, ensure_ascii=False), json.dumps(tags, ensure_ascii=False), utc_now(), utc_now(), job["company_id"]),
             )
             apply_company_overrides(connection, job["company_id"], company_overrides(company_row["manual_overrides_json"]))
+            deduplicate_company_jobs(connection, job["company_id"])
     if abnormal:
         log_processing(job["id"], "review", "模型判定企业整理结果异常，转入审核", "warning", payload)
         return {"status": "needs_review", "id": job["id"]}
     _finish(job["id"], {"company_id": job["company_id"], "decision": "normal"})
     return {"status": "succeeded", "company_id": job["company_id"], "id": job["id"]}
+
+
+def _process_company_research(job: dict[str, Any]) -> dict[str, Any]:
+    if not one("SELECT id FROM companies WHERE id=?", (job["company_id"],)):
+        raise RuntimeError("Company for public research was not found")
+    engine = str(get_setting("processing_engine", "codex") or "codex")
+    processor = "local_codex:gpt-5.6-luna" if engine == "codex" else "generic_llm"
+    _stage(job["id"], "researching", "联网检索企业官网、行业属性和负面公开报道", processor)
+    result = execute_company_research(job["company_id"], job["id"], lambda: _still_active(job["id"]))
+    if result.get("status") == "canceled" or not _still_active(job["id"]):
+        return {"status": "canceled", "id": job["id"]}
+    _stage(job["id"], "saving_research", "保存企业概览、标签、风险发现和来源 URL", processor)
+    _finish(job["id"], {**result, "id": job["id"]})
+    return {**result, "id": job["id"]}
 
 
 def process_one_job() -> dict[str, Any] | None:
@@ -858,6 +903,8 @@ def process_one_job() -> dict[str, Any] | None:
             return _process_classify(job)
         if job["kind"] == "consolidate_company":
             return _process_company_consolidation(job)
+        if job["kind"] == "research_company":
+            return _process_company_research(job)
         raise RuntimeError(f"Unknown processing job kind: {job['kind']}")
     except Exception as exc:
         return _fail(job, exc)

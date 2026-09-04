@@ -9,7 +9,7 @@ import json
 import mimetypes
 import re
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,22 @@ MESSAGE_TIME_FORMATS = (
     "%Y年%m月%d日 %H:%M",
     "%Y/%m/%d",
     "%Y-%m-%d",
+)
+EVENT_TIME_FORMATS = (
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%d",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+    "%Y.%m.%d %H:%M:%S",
+    "%Y.%m.%d %H:%M",
+    "%Y.%m.%d",
+    "%Y年%m月%d日 %H时%M分%S秒",
+    "%Y年%m月%d日 %H时%M分",
+    "%Y年%m月%d日 %H:%M:%S",
+    "%Y年%m月%d日 %H:%M",
+    "%Y年%m月%d日",
 )
 
 
@@ -78,6 +94,114 @@ def parse_message_time(message: dict[str, Any]) -> str | None:
         if parsed:
             return parsed
     return None
+
+
+def _parse_explicit_datetime(value: Any, timezone_name: str = "Asia/Shanghai") -> datetime | None:
+    """Parse a human date while never treating numeric metadata as an epoch."""
+    if value is None or isinstance(value, (int, float)):
+        return None
+    text = str(value).strip()
+    if not text or re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return None
+    candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        parsed = None
+        for time_format in EVENT_TIME_FORMATS:
+            try:
+                parsed = datetime.strptime(text, time_format)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        try:
+            parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
+        except Exception:
+            parsed = parsed.replace(tzinfo=SOURCE_TIMEZONE)
+    return parsed.astimezone(timezone.utc)
+
+
+def is_plausible_event_datetime(value: Any, reference_at: str | None = None, *, now: datetime | None = None) -> bool:
+    """Reject dates that are implausibly far from the source message.
+
+    Recruitment events can be in the past or future, but an event date many
+    years away from the message is generally a metadata/model parsing error.
+    The source message date is only a validation reference; it is never used
+    as the event date.
+    """
+    parsed = _parse_explicit_datetime(value)
+    if parsed is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    if parsed.year < 1970 or parsed > current + timedelta(days=366 * 5):
+        return False
+    if reference_at:
+        reference = _parse_explicit_datetime(reference_at)
+        if reference is not None and abs((parsed - reference).total_seconds()) > 366 * 5 * 24 * 60 * 60:
+            return False
+    elif parsed < current - timedelta(days=366 * 10):
+        # Without the source-message timestamp, very old dates are still
+        # almost certainly metadata/model parsing errors for recruitment data.
+        return False
+    return True
+
+
+def normalize_event_datetime(value: Any, timezone_name: str = "Asia/Shanghai", reference_at: str | None = None) -> str | None:
+    """Return a trusted event time in UTC ISO format, or None if implausible."""
+    parsed = _parse_explicit_datetime(value, timezone_name)
+    if parsed is None:
+        return None
+    if not is_plausible_event_datetime(parsed.isoformat(), reference_at):
+        return None
+    return parsed.isoformat(timespec="seconds")
+
+
+def extract_event_datetime_candidates(text: str, timezone_name: str = "Asia/Shanghai", reference_at: str | None = None) -> list[str]:
+    """Extract explicit dates from source text for repairing bad model dates."""
+    if not text:
+        return []
+    candidates: list[str] = []
+    full_date = re.compile(
+        r"(?P<year>20\d{2})\s*(?:年|[./-])\s*(?P<month>\d{1,2})\s*(?:月|[./-])\s*(?P<day>\d{1,2})\s*"
+        r"(?:(?P<ampm>上午|下午|早上|晚上|夜间)\s*)?(?P<hour>\d{1,2})?\s*(?:[:：时]\s*(?P<minute>\d{1,2}))?\s*(?:分\s*(?P<second>\d{1,2})\s*秒?)?"
+    )
+    month_day = re.compile(
+        r"(?<!\d)(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日\s*"
+        r"(?:(?P<ampm>上午|下午|早上|晚上|夜间)\s*)?(?P<hour>\d{1,2})?\s*(?:[:：时]\s*(?P<minute>\d{1,2}))?"
+    )
+    reference = _parse_explicit_datetime(reference_at) if reference_at else None
+    reference_year = reference.year if reference else datetime.now(SOURCE_TIMEZONE).year
+
+    def add_match(match: re.Match[str], year: int) -> None:
+        try:
+            hour = int(match.groupdict().get("hour") or 0)
+            minute = int(match.groupdict().get("minute") or 0)
+            second = int(match.groupdict().get("second") or 0)
+            ampm = match.groupdict().get("ampm") or ""
+            if ampm in {"下午", "晚上", "夜间"} and hour < 12:
+                hour += 12
+            candidate = datetime(
+                year,
+                int(match.group("month")),
+                int(match.group("day")),
+                hour,
+                minute,
+                second,
+            )
+        except (TypeError, ValueError):
+            return
+        normalized = normalize_event_datetime(candidate.isoformat(), timezone_name, reference_at)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    for match in full_date.finditer(text):
+        add_match(match, int(match.group("year")))
+    for match in month_day.finditer(text):
+        add_match(match, reference_year)
+    return candidates
 
 
 class TextExtractor(HTMLParser):
