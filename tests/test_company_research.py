@@ -139,6 +139,22 @@ def test_force_company_research_queues_a_new_job_after_previous_completion(tmp_p
     assert db.one("SELECT COUNT(*) AS count FROM processing_jobs WHERE kind='research_company' AND company_id=?", (company_id,))["count"] == 2
 
 
+def test_company_research_recovers_legacy_unknown_kind_failure(tmp_path, monkeypatch):
+    configure_test_db(tmp_path, monkeypatch)
+    apply_model_item({"is_recruitment": True, "company": {"display_name": "旧任务科技"}, "jobs": []}, None, "2026-09-04T00:00:00+00:00")
+    company_id = db.one("SELECT id FROM companies")["id"]
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET status='needs_review',stage='failed',error=? WHERE kind='research_company' AND company_id=?",
+            ("Unknown processing job kind: research_company", company_id),
+        )
+
+    result = ensure_company_research_jobs(company_ids=[company_id])
+    job = db.one("SELECT status,stage,error,attempts FROM processing_jobs WHERE kind='research_company' AND company_id=?", (company_id,))
+    assert result["queued"] == 1
+    assert dict(job) == {"status": "pending", "stage": "research_queued", "error": None, "attempts": 0}
+
+
 def test_legacy_implausible_timeline_date_is_recovered_from_version_source(tmp_path, monkeypatch):
     configure_test_db(tmp_path, monkeypatch)
     apply_model_item({"is_recruitment": True, "company": {"display_name": "时间修复科技"}, "jobs": []}, None, "2026-09-04T00:00:00+00:00")

@@ -96,11 +96,28 @@ def ensure_company_research_jobs(force: bool = False, company_ids: list[str] | N
         for company in companies:
             result["companies"] += 1
             jobs = connection.execute(
-                "SELECT id,status FROM processing_jobs WHERE kind='research_company' AND company_id=? ORDER BY created_at DESC",
+                "SELECT id,status,error FROM processing_jobs WHERE kind='research_company' AND company_id=? ORDER BY created_at DESC",
                 (company["id"],),
             ).fetchall()
             if any(row["status"] in {"pending", "running", "retry_wait"} for row in jobs):
                 result["skipped_active"] += 1
+                continue
+            stale = next(
+                (
+                    row for row in jobs
+                    if row["status"] in {"needs_review", "failed"}
+                    and str(row["error"] or "").startswith("Unknown processing job kind: research_company")
+                ),
+                None,
+            )
+            if stale and not force:
+                now = utc_now()
+                connection.execute(
+                    """UPDATE processing_jobs SET status='pending',stage='research_queued',attempts=0,
+                       lease_until=NULL,next_attempt_at=NULL,cancel_requested=0,error=NULL,finished_at=NULL,updated_at=? WHERE id=?""",
+                    (now, stale["id"]),
+                )
+                result["queued"] += 1
                 continue
             if jobs and not force:
                 result["skipped_existing"] += 1
