@@ -24,7 +24,7 @@ from .events import events
 from .exports import export_jobs
 from .processing import attach_artifact, import_file, import_text, import_url, ingest_message, process_one_batch, process_one_enrichment
 from .security import SecretVault, hash_value, token
-from .tracememo import TraceMemoClient
+from .tracememo import TraceMemoClient, normalize_group
 
 
 class BootstrapRequest(BaseModel):
@@ -480,13 +480,21 @@ def tracememo_groups(_: dict[str, Any] = Depends(require_admin)) -> list[dict[st
     result = []
     with connect() as connection:
         for group in groups:
-            external_id = str(group.get("id") or group.get("userName") or group.get("talker") or group.get("wxid") or "")
-            name = str(group.get("name") or group.get("nickName") or external_id)
+            if not isinstance(group, dict):
+                continue
+            normalized = normalize_group(group)
+            external_id = normalized["external_id"]
+            if not external_id:
+                continue
+            name = normalized["name"] or external_id
             existing = connection.execute("SELECT id,selected,enabled FROM source_groups WHERE connector_id=? AND external_id=?", (row["id"], external_id)).fetchone()
             group_id = existing["id"] if existing else str(uuid4())
             if not existing:
                 connection.execute("INSERT INTO source_groups(id,connector_id,external_id,name,created_at,updated_at) VALUES(?,?,?,?,?,?)", (group_id, row["id"], external_id, name, utc_now(), utc_now()))
-            result.append({"id": group_id, "external_id": external_id, "name": name, "selected": bool(existing["selected"]) if existing else False, "enabled": bool(existing["enabled"]) if existing else True})
+            else:
+                connection.execute("UPDATE source_groups SET name=?,updated_at=? WHERE id=?", (name, utc_now(), group_id))
+            result.append({"id": group_id, "external_id": external_id, "name": name, "avatar": normalized["avatar"], "selected": bool(existing["selected"]) if existing else False, "enabled": bool(existing["enabled"]) if existing else True})
+        connection.execute("UPDATE source_groups SET selected=0,enabled=0,updated_at=? WHERE connector_id=? AND TRIM(external_id)=''", (utc_now(), row["id"]))
     return result
 
 

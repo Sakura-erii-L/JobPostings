@@ -28,7 +28,10 @@ class TraceMemoClient:
     def groups(self) -> list[dict[str, Any]]:
         data = self._get("/chatroom")
         if isinstance(data, dict):
-            return data.get("data") or data.get("chatrooms") or data.get("items") or []
+            groups = data.get("data") or data.get("chatrooms") or data.get("items") or data.get("contacts") or []
+            if isinstance(groups, dict):
+                groups = groups.get("data") or groups.get("chatrooms") or groups.get("items") or groups.get("contacts") or []
+            return groups if isinstance(groups, list) else []
         return data or []
 
     def messages(self, talker: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
@@ -63,3 +66,43 @@ class TraceMemoClient:
         header = response.headers.get("content-disposition", "")
         match = re.search(r"filename\*?=(?:UTF-8''|\"?)([^\";]+)", header, re.I)
         return response.content, unquote(match.group(1)) if match else None
+
+
+def normalize_group(group: dict[str, Any]) -> dict[str, str | None]:
+    """Map TraceMemo and compatible chatroom fields to the local group shape."""
+    def first_value(*keys: str) -> str:
+        for key in keys:
+            value = group.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return ""
+
+    external_id = first_value(
+        "m_nsUsrName",
+        "userName",
+        "username",
+        "talker",
+        "wxid",
+        "id",
+        "chatroomId",
+        "chatroom_id",
+        "md5",
+    )
+    name = first_value(
+        "m_nsNickName",
+        "name",
+        "nickName",
+        "nickname",
+        "wechatNickname",
+        "displayName",
+        "remark",
+    )
+    avatar = first_value("avatar", "avatarUrl", "avatar_url")
+    return {
+        "external_id": external_id,
+        "name": name or external_id or "未命名群聊",
+        "avatar": avatar or None,
+    }

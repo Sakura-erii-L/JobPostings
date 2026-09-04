@@ -10,6 +10,7 @@ type CompanyDetail = Company & { aliases: string[]; jobs: Job[]; evidences: { so
 type Notification = { id: string; title: string; body: string; read_at?: string | null }
 type Invitation = { id: string; email: string; role: string; expires_at: string; used_at?: string | null; created_at: string }
 type ReviewItem = { id: string; kind: string; entity_type?: string; entity_id?: string; payload: Record<string, any> }
+type TraceMemoGroup = { id: string; external_id: string; name: string; avatar?: string | null; selected: boolean; enabled?: boolean }
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isForm = options.body instanceof FormData
@@ -273,17 +274,41 @@ function SettingsPage({ onSaved }: { onSaved: (message: string) => void }) {
 }
 
 function TraceMemoGroups() {
-  const [groups, setGroups] = useState<Array<{ id: string; name: string; selected: boolean }>>([])
+  const [groups, setGroups] = useState<TraceMemoGroup[]>([])
+  const [query, setQuery] = useState('')
   const [message, setMessage] = useState('')
   const refresh = async () => {
-    try { setGroups(await api<Array<{ id: string; name: string; selected: boolean }>>('/admin/connectors/tracememo/groups')); setMessage('') }
+    try {
+      const fetched = await api<TraceMemoGroup[]>('/admin/connectors/tracememo/groups')
+      const seen = new Set<string>()
+      const unique = fetched.filter(group => {
+        const key = group.id || group.external_id
+        if (!key || seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      setGroups(unique)
+      setMessage(unique.length ? `已读取 ${unique.length} 个群聊` : 'TraceMemo 暂未返回可用群聊')
+    }
     catch (e) { setMessage((e as Error).message) }
   }
   const save = async () => {
     try { await api('/admin/source-groups', { method: 'PUT', body: JSON.stringify({ groups }) }); setMessage('群组选择已保存') }
     catch (e) { setMessage((e as Error).message) }
   }
-  return <div className="group-picker"><div className="group-picker-head"><strong>招聘群选择</strong><span>{groups.filter(group => group.selected).length}/20</span></div><div className="group-picker-actions"><button className="secondary" onClick={refresh}>读取群列表</button><button className="secondary" onClick={save} disabled={!groups.length}>保存选择</button></div>{groups.map(group => <label className="check" key={group.id}><input type="checkbox" checked={group.selected} onChange={event => setGroups(current => current.map(item => item.id === group.id ? { ...item, selected: event.target.checked } : item))} />{group.name}</label>)}{message && <p className="setting-help">{message}</p>}</div>
+  const selectedCount = groups.filter(group => group.selected).length
+  const visibleGroups = groups.filter(group => `${group.name} ${group.external_id}`.toLowerCase().includes(query.trim().toLowerCase()))
+  const toggle = (groupId: string, selected: boolean) => {
+    if (selected && selectedCount >= 20) {
+      setMessage('最多选择 20 个招聘群')
+      return
+    }
+    setGroups(current => current.map(group => group.id === groupId ? { ...group, selected } : group))
+    setMessage('')
+  }
+  const avatarSource = (avatar?: string | null) => avatar && /^(data:image\/|https?:\/\/|\/)/i.test(avatar) ? avatar : ''
+  const initial = (name: string) => Array.from(name.trim())[0] || '群'
+  return <div className="group-picker"><div className="group-picker-head"><strong>招聘群选择</strong><span>{selectedCount}/20</span></div><div className="group-picker-actions"><button className="secondary" onClick={refresh}>读取群列表</button><button className="secondary" onClick={save} disabled={!groups.length}>保存选择</button></div>{groups.length > 0 && <div className="group-picker-toolbar"><input className="group-search" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索群名称或群标识" /><span>{visibleGroups.length} 个群聊</span></div>}<div className="group-options">{!groups.length ? <div className="group-empty">点击“读取群列表”载入 TraceMemo 中的群聊</div> : !visibleGroups.length ? <div className="group-empty">没有匹配的群聊</div> : visibleGroups.map(group => { const source = avatarSource(group.avatar); return <label className={`group-option${group.selected ? ' selected' : ''}`} key={group.id}><input type="checkbox" checked={group.selected} onChange={event => toggle(group.id, event.target.checked)} /><span className="group-avatar-wrap">{source ? <img className="group-avatar-image" src={source} alt={`${group.name}头像`} loading="lazy" /> : <span className="group-avatar" aria-hidden="true">{initial(group.name)}</span>}</span><span className="group-option-copy"><strong>{group.name}</strong><small>{group.external_id}</small></span></label> })}</div><p className="setting-help">TraceMemo 当前群聊接口未提供头像时显示群名首字母；如接口返回头像资源则自动使用。{message && ` ${message}`}</p></div>
 }
 
 function PageHeader({ eyebrow, title, description, children }: { eyebrow: string; title: string; description: string; children?: React.ReactNode }) { return <header className="page-header"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div><div className="header-actions">{children}</div></header> }

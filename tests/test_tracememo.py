@@ -30,3 +30,18 @@ def test_tracememo_response_shapes(monkeypatch):
     assert client.groups()[0]["id"] == "room-1"
     assert client.recent("room-1")[0]["id"] == "message-1"
     assert client.media("media-1") == (b"image-bytes", "notice.png")
+
+
+def test_tracememo_chatroom_fields_are_normalized():
+    normalized = tracememo.normalize_group(
+        {
+            "m_nsUsrName": "123@chatroom",
+            "m_nsNickName": "招聘交流群",
+            "md5": "room-md5",
+        }
+    )
+    assert normalized == {
+        "external_id": "123@chatroom",
+        "name": "招聘交流群",
+        "avatar": None,
+    }
