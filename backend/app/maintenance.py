@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -7,6 +8,7 @@ from typing import Any
 
 from .config import config
 from .db import connect, utc_now
+from .parsers import parse_message_time
 
 
 # Imported recruitment content and its derived catalog are reset together so
@@ -93,3 +95,24 @@ def reset_recruitment_data() -> dict[str, Any]:
         deleted["search_index"] = int(search_count)
         connection.execute("UPDATE queue_control SET state='paused',updated_at=? WHERE id=1", (utc_now(),))
     return {"backup_path": backup_path, "deleted": deleted, "canceled_running": len(running_ids)}
+
+
+def repair_raw_message_times() -> dict[str, int]:
+    """Repair raw chat times from stored explicit source dates only."""
+    result = {"checked": 0, "updated": 0, "unknown": 0}
+    with connect() as connection:
+        rows = connection.execute("SELECT id,sent_at,metadata_json FROM raw_messages").fetchall()
+        for row in rows:
+            result["checked"] += 1
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            source_time = parse_message_time(metadata) if isinstance(metadata, dict) else None
+            if not source_time:
+                result["unknown"] += 1
+                continue
+            if row["sent_at"] != source_time:
+                connection.execute("UPDATE raw_messages SET sent_at=? WHERE id=?", (source_time, row["id"]))
+                result["updated"] += 1
+    return result

@@ -23,6 +23,7 @@ from .parsers import (
     is_system_message,
     detect_image_suffix,
     is_text_message,
+    parse_message_time,
     parse_message_payload,
     sha256_bytes,
 )
@@ -119,7 +120,7 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
     metadata["_original_text_content"] = original_text
     metadata["_parsed_text_content"] = text
     external_id = str(message.get("id") or message.get("messageId") or "") or None
-    sent_at = str(message.get("sent_at") or message.get("time") or message.get("timestamp") or utc_now())
+    sent_at = parse_message_time(message)
     raw_id = str(uuid4())
     try:
         retention_days = max(1, int(get_setting("ordinary_retention_days", 30)))
@@ -127,8 +128,10 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
         retention_days = 30
     retention = (datetime.now(timezone.utc) + timedelta(days=retention_days)).isoformat(timespec="seconds")
     with connect() as connection:
-        existing = connection.execute("SELECT id FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
+        existing = connection.execute("SELECT id,sent_at FROM raw_messages WHERE content_hash=?", (digest,)).fetchone()
         if existing:
+            if sent_at and existing["sent_at"] != sent_at:
+                connection.execute("UPDATE raw_messages SET sent_at=? WHERE id=?", (sent_at, existing["id"]))
             _increment_ingest_stat(stats, "duplicates")
             return existing["id"]
         existing_external = None

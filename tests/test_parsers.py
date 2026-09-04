@@ -1,6 +1,6 @@
 import pytest
 
-from app.parsers import detect_image_suffix, extract_html, extract_file, fetch_public_url, is_link_message, is_system_message, parse_message_payload
+from app.parsers import detect_image_suffix, extract_html, extract_file, fetch_public_url, is_link_message, is_system_message, parse_message_payload, parse_message_time
 
 
 def test_html_extraction():
@@ -46,3 +46,8 @@ def test_system_messages_are_detected_without_filtering_recruitment_invitation_t
     assert is_system_message("公众号链接", '"甲"邀请"乙"加入了群聊')
     assert is_system_message("系统消息", '"甲"撤回了一条消息')
     assert not is_system_message("普通文本", "欢迎加入我们团队，招聘算法工程师")
+
+
+def test_trace_memo_datetime_is_used_but_numeric_creation_time_is_ignored():
+    assert parse_message_time({"datetime": "2026/8/31 11:16:30", "createTime": 1788146190}) == "2026-08-31T03:16:30+00:00"
+    assert parse_message_time({"createTime": 1788146190}) is None

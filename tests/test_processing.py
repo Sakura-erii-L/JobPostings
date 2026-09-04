@@ -2,7 +2,7 @@ import json
 import sqlite3
 
 from app import db
-from app.maintenance import reset_recruitment_data
+from app.maintenance import repair_raw_message_times, reset_recruitment_data
 from app.model_provider import ModelResult, classify_messages
 from app.processing import _extract_source_text, _fail, ingest_message, log_processing, process_one_batch
 
@@ -86,6 +86,45 @@ def test_ingest_message_updates_external_id_and_requeues_changed_content(tmp_pat
     duplicate_stats: dict[str, int] = {}
     assert ingest_message({**message, "text": "新招聘信息"}, "tracememo", "group-1", duplicate_stats) == raw_id
     assert duplicate_stats == {"duplicates": 1}
+
+
+def test_ingest_uses_trace_datetime_and_does_not_fallback_to_creation_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    dated_id = ingest_message({
+        "id": "dated-1",
+        "type": "普通文本",
+        "text": "历史招聘信息",
+        "datetime": "2026/8/31 11:16:30",
+        "createTime": 1788146190,
+    }, "tracememo", "group-1")
+    unknown_id = ingest_message({
+        "id": "unknown-1",
+        "type": "普通文本",
+        "text": "没有明确聊天时间",
+        "createTime": 1788146190,
+    }, "tracememo", "group-1")
+    assert db.one("SELECT sent_at FROM raw_messages WHERE id=?", (dated_id,))["sent_at"] == "2026-08-31T03:16:30+00:00"
+    assert db.one("SELECT sent_at FROM raw_messages WHERE id=?", (unknown_id,))["sent_at"] is None
+
+
+def test_repair_raw_message_times_uses_stored_trace_datetime(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    raw_id = ingest_message({
+        "id": "repair-1",
+        "type": "普通文本",
+        "text": "需要校正时间",
+        "datetime": "2026/8/31 11:16:30",
+        "createTime": 1788146190,
+    }, "tracememo", "group-1")
+    with db.connect() as connection:
+        connection.execute("UPDATE raw_messages SET sent_at=? WHERE id=?", ("2026-09-04T12:00:00+00:00", raw_id))
+    result = repair_raw_message_times()
+    assert result == {"checked": 1, "updated": 1, "unknown": 0}
+    assert db.one("SELECT sent_at FROM raw_messages WHERE id=?", (raw_id,))["sent_at"] == "2026-08-31T03:16:30+00:00"
 
 
 def test_system_messages_are_filtered_before_queueing(tmp_path, monkeypatch):

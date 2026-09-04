@@ -9,12 +9,75 @@ import json
 import mimetypes
 import re
 import socket
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
+
+
+SOURCE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+MESSAGE_TIME_FIELDS = (
+    "datetime",
+    "dateTime",
+    "message_datetime",
+    "messageDatetime",
+    "sent_at",
+    "sentAt",
+    "message_time",
+    "messageTime",
+    "time",
+    "timestamp",
+)
+MESSAGE_TIME_FORMATS = (
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y.%m.%d %H:%M:%S",
+    "%Y.%m.%d %H:%M",
+    "%Y年%m月%d日 %H:%M:%S",
+    "%Y年%m月%d日 %H:%M",
+    "%Y/%m/%d",
+    "%Y-%m-%d",
+)
+
+
+def _parse_message_time_value(value: Any) -> str | None:
+    """Normalize an explicit human-readable message time; never parse numeric epochs."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return None
+    candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        parsed = None
+        for time_format in MESSAGE_TIME_FORMATS:
+            try:
+                parsed = datetime.strptime(text, time_format)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=SOURCE_TIMEZONE)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_message_time(message: dict[str, Any]) -> str | None:
+    """Return the source chat time from an explicit date field, or None when unknown."""
+    for field in MESSAGE_TIME_FIELDS:
+        parsed = _parse_message_time_value(message.get(field))
+        if parsed:
+            return parsed
+    return None
 
 
 class TextExtractor(HTMLParser):
