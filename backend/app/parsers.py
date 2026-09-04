@@ -317,6 +317,15 @@ def fetch_public_http(url: str, timeout: float = 30, max_bytes: int = 10 * 1024 
     raise ValueError("Too many redirects")
 
 
+def is_access_challenge_page(url: str, text: str) -> bool:
+    """Detect the WeChat environment-verification page instead of treating it as article text."""
+    host = (urlparse(url).hostname or "").lower()
+    if host != "mp.weixin.qq.com" and not host.endswith(".weixin.qq.com"):
+        return False
+    compact = normalize_text(text)
+    return "当前环境异常" in compact and "完成验证后即可继续访问" in compact
+
+
 def fetch_public_url(url: str) -> dict[str, Any]:
     response = fetch_public_http(url)
     content_type = response.headers.get("content-type", "")
@@ -331,6 +340,15 @@ def fetch_public_url(url: str) -> dict[str, Any]:
             "images": [],
             "data": response.content,
             "filename": f"web-image{suffix}",
+        }
+    if is_access_challenge_page(str(response.url), response.text):
+        return {
+            "url": str(response.url),
+            "text": "",
+            "content_type": content_type,
+            "images": [],
+            "access_challenge": True,
+            "access_error": "微信返回环境验证页面",
         }
     if "html" not in content_type and not response.text.lstrip().startswith("<"):
         return {"url": str(response.url), "text": response.text[:2_000_000], "content_type": content_type}

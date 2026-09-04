@@ -24,7 +24,7 @@ from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
 from .maintenance import reset_recruitment_data
-from .parsers import is_file_message, is_image_message
+from .parsers import is_file_message, is_image_message, parse_message_time
 from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
 from .security import SecretVault, hash_password, hash_value, token
 from .tracememo import TraceMemoClient, normalize_group
@@ -243,6 +243,16 @@ def _setting_value(key: str, default: Any) -> Any:
         return default
 
 
+def _import_days() -> int:
+    value = _setting_value("import_days", None)
+    if value is None:
+        value = _setting_value("initial_import_days", 30)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 30
+
+
 def sync_tracememo_once(force: bool = False) -> dict[str, Any]:
     with _sync_lock:
         return _sync_tracememo_once(force)
@@ -264,19 +274,28 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
         }
     reset_result = reset_recruitment_data() if force else None
     fetched = 0
-    ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "ignored": 0, "filtered_system": 0, "media_attached": 0, "media_failed": 0}
+    import_days = _import_days()
+    ingest_stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "ignored": 0, "filtered_system": 0, "media_attached": 0, "media_failed": 0, "outside_window": 0, "missing_source_time": 0}
     for group in groups:
-        cursor = one("SELECT * FROM sync_cursors WHERE source_group_id=?", (group["id"],))
         end = datetime.now(timezone.utc)
-        if cursor and cursor["cursor_time"]:
-            start = datetime.fromisoformat(cursor["cursor_time"]) - timedelta(minutes=2)
-        else:
-            start = end - timedelta(days=int(_setting_value("initial_import_days", 30)))
+        start = end - timedelta(days=import_days)
         for message in client.messages(group["external_id"], start, end):
             if not isinstance(message, dict):
                 ingest_stats["ignored"] += 1
                 continue
             fetched += 1
+            source_time = parse_message_time(message)
+            if not source_time:
+                ingest_stats["missing_source_time"] += 1
+                continue
+            try:
+                message_time = datetime.fromisoformat(source_time)
+            except ValueError:
+                ingest_stats["missing_source_time"] += 1
+                continue
+            if message_time < start or message_time > end:
+                ingest_stats["outside_window"] += 1
+                continue
             raw_id = ingest_message(message, row["id"], group["id"], ingest_stats)
             if raw_id:
                 message_type = str(message.get("type") or message.get("msgType") or "").lower()
@@ -307,6 +326,9 @@ def _sync_tracememo_once(force: bool = False) -> dict[str, Any]:
         "filtered_system": ingest_stats["filtered_system"],
         "media_attached": ingest_stats["media_attached"],
         "media_failed": ingest_stats["media_failed"],
+        "outside_window": ingest_stats["outside_window"],
+        "missing_source_time": ingest_stats["missing_source_time"],
+        "import_days": import_days,
         "force": force,
         "reset": reset_result,
         "groups": len(groups),
@@ -493,7 +515,7 @@ def get_settings(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
 @app.put("/api/v1/admin/settings")
 def update_settings(body: SettingsUpdate, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     allowed = {
-        "sync_interval_minutes", "initial_import_days", "redaction_enabled", "llm_input_budget",
+        "sync_interval_minutes", "initial_import_days", "import_days", "redaction_enabled", "llm_input_budget",
         "llm_output_budget", "llm_budget_warning_percent", "ordinary_retention_days",
         "possibly_expired_days", "smtp", "llm_provider", "search", "backup", "agent_api_enabled",
         "processing_engine", "model_concurrency", "codex_concurrency", "extract_concurrency",
@@ -541,7 +563,11 @@ def update_settings(body: SettingsUpdate, _: dict[str, Any] = Depends(require_ad
                     value.setdefault("backup_password_enc", old_value.get("backup_password_enc", ""))
                     value.setdefault("webdav_password_configured", bool(old_value.get("password_enc")))
                     value.setdefault("backup_password_configured", bool(old_value.get("backup_password_enc")))
-            connection.execute("INSERT OR REPLACE INTO system_settings(key,value_json,updated_at) VALUES(?,?,?)", (key, json.dumps(value, ensure_ascii=False), utc_now()))
+            value_json = json.dumps(value, ensure_ascii=False)
+            connection.execute("INSERT OR REPLACE INTO system_settings(key,value_json,updated_at) VALUES(?,?,?)", (key, value_json, utc_now()))
+            if key in {"initial_import_days", "import_days"}:
+                alias = "import_days" if key == "initial_import_days" else "initial_import_days"
+                connection.execute("INSERT OR REPLACE INTO system_settings(key,value_json,updated_at) VALUES(?,?,?)", (alias, value_json, utc_now()))
     return get_settings(_)
 
 

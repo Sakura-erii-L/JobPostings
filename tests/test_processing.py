@@ -178,6 +178,43 @@ def test_link_page_images_are_ocr_and_qr_processed(tmp_path, monkeypatch):
     assert metadata["qr_values"] == ["https://apply.example.com"]
 
 
+def test_wechat_environment_challenge_uses_codex_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    raw_id = ingest_message({
+        "id": "wechat-link-1",
+        "type": "公众号链接",
+        "text": "锦浪科技校招",
+        "contentData": {"type": "share", "title": "锦浪科技校招", "url": "https://mp.weixin.qq.com/s/example"},
+    }, "tracememo", "group-1")
+    assert raw_id
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    monkeypatch.setattr("app.processing.fetch_public_url", lambda url: {
+        "url": url,
+        "text": "",
+        "content_type": "text/html",
+        "images": [],
+        "access_challenge": True,
+        "access_error": "微信返回环境验证页面",
+    })
+    captured: dict[str, object] = {}
+
+    def fake_codex(job_value, raw_value, metadata, reason):
+        captured["reason"] = reason
+        captured["metadata"] = metadata.copy()
+        return "通过 Codex 获取的真实招聘正文"
+
+    monkeypatch.setattr("app.processing._codex_extract", fake_codex)
+    text, metadata = _extract_source_text(job, raw)
+    assert "通过 Codex 获取的真实招聘正文" in text
+    assert "当前环境异常" not in text
+    assert metadata["web_access_status"] == "challenge"
+    assert metadata["web_access_error"] == "微信返回环境验证页面"
+    assert captured["reason"] == "公众号页面返回微信环境验证页"
+
+
 def test_plain_text_is_sent_directly_even_when_short(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")

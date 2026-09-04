@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta, timezone
 
 from app import db
 from app.main import app
@@ -231,6 +232,73 @@ def test_manual_sync_accepts_force_request(tmp_path, monkeypatch):
         response = client.post("/api/v1/admin/sync", json={"force": True})
         assert response.status_code == 200
         assert response.json()["force"] is True
+
+
+def test_tracememo_sync_uses_rolling_import_days_and_source_datetime(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    from app import main as main_module
+
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+            ("trace", "tracememo", "http://trace", 1, "{}", db.utc_now()),
+        )
+        connection.execute(
+            "INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            ("group", "trace", "room", "招聘群", 1, 1, db.utc_now(), db.utc_now()),
+        )
+        connection.execute(
+            "INSERT INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)",
+            ("group", "2026-01-01T00:00:00+00:00", "old-cursor", db.utc_now()),
+        )
+        connection.execute(
+            "UPDATE system_settings SET value_json=? WHERE key='import_days'",
+            (json.dumps(1),),
+        )
+
+    captured: dict[str, datetime] = {}
+    now = datetime.now(timezone.utc)
+
+    class FakeTraceMemoClient:
+        def __init__(self, base_url, token):
+            pass
+
+        def messages(self, talker, start, end):
+            captured["start"] = start
+            captured["end"] = end
+            return [
+                {
+                    "id": "inside-window",
+                    "type": "普通文本",
+                    "text": "窗口内招聘信息",
+                    "datetime": (now - timedelta(hours=2)).isoformat(timespec="seconds"),
+                },
+                {
+                    "id": "outside-window",
+                    "type": "普通文本",
+                    "text": "窗口外历史招聘信息",
+                    "datetime": (now - timedelta(days=2)).isoformat(timespec="seconds"),
+                },
+                {
+                    "id": "creation-only",
+                    "type": "普通文本",
+                    "text": "只有创建时间的消息",
+                    "createTime": int(now.timestamp()),
+                },
+            ]
+
+    monkeypatch.setattr(main_module, "TraceMemoClient", FakeTraceMemoClient)
+    result = main_module._sync_tracememo_once()
+    assert captured["end"] - captured["start"] == timedelta(days=1)
+    assert result["import_days"] == 1
+    assert result["fetched"] == 3
+    assert result["created"] == 1
+    assert result["outside_window"] == 1
+    assert result["missing_source_time"] == 1
+    assert db.one("SELECT COUNT(*) AS count FROM raw_messages")["count"] == 1
+    assert db.one("SELECT external_message_id FROM raw_messages")["external_message_id"] == "inside-window"
 
 
 def test_local_admin_initial_password_recovery(tmp_path, monkeypatch):

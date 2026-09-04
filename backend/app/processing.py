@@ -244,13 +244,16 @@ def _codex_extract(job: dict[str, Any], raw: dict[str, Any], metadata: dict[str,
     ]
     images = [row["path"] for row in artifacts if row["path"]]
     artifact = artifacts[-1] if artifacts else None
+    instruction = "提取来源中的完整可读正文。网页需要访问原始 URL；图片或附件需要读取内容。不要总结。"
+    if metadata.get("web_access_status") == "challenge":
+        instruction += "后端访问公众号 URL 返回了微信环境验证页，不能把验证页文字当作正文；请尝试通过公开可访问的转载、搜索结果或其他来源获取原文，无法取得时明确说明。"
     payload = {
         "reason": reason,
         "source_type": raw["message_type"],
         "url": metadata.get("url"),
         "filename": artifact["filename"] if artifact else metadata.get("filename"),
         "existing_text": raw.get("text_content") or "",
-        "instruction": "提取来源中的完整可读正文。网页需要访问原始 URL；图片或附件需要读取内容。不要总结。",
+        "instruction": instruction,
     }
     schema = {
         "type": "object",
@@ -454,13 +457,25 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
     if is_link_message(raw["message_type"], metadata) and url:
         try:
             parsed = fetch_public_url(str(url))
-            text = _merge_texts(text, parsed.get("text"))
+            access_challenge = bool(parsed.get("access_challenge"))
             metadata.update({
                 "url": parsed.get("url", url),
                 "title": parsed.get("title", ""),
                 "web_content_type": parsed.get("content_type", ""),
-                "backend_fetched": True,
+                "backend_fetched": not access_challenge,
+                "web_access_status": "challenge" if access_challenge else "ok",
             })
+            if access_challenge:
+                metadata["web_access_error"] = parsed.get("access_error") or "网页要求环境验证"
+                log_processing(
+                    job["id"],
+                    "extracting",
+                    "公众号页面要求环境验证，转交 Codex 兜底访问",
+                    "warning",
+                    {"url": metadata.get("url"), "error": metadata["web_access_error"]},
+                )
+            else:
+                text = _merge_texts(text, parsed.get("text"))
             _, image_text = _extract_link_images(job, raw, parsed, metadata)
             text = _merge_texts(text, image_text)
             _persist_raw_extraction(raw["id"], text, metadata)
@@ -468,8 +483,11 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
             raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
         except Exception as exc:
             log_processing(job["id"], "extracting", "后端网页提取失败", "warning", {"error": str(exc)})
-    if len(text) < 20 and not is_text_message(raw["message_type"], metadata):
-        text = _codex_extract(job, raw, metadata, "正文为空、过短或本地解析失败")
+    if not is_text_message(raw["message_type"], metadata):
+        if metadata.get("web_access_status") == "challenge":
+            text = _codex_extract(job, raw, metadata, "公众号页面返回微信环境验证页")
+        elif len(text) < 20:
+            text = _codex_extract(job, raw, metadata, "正文为空、过短或本地解析失败")
     log_processing(job["id"], "extracting", "来源文字提取完成", details={"characters": len(text)})
     return text, metadata
 

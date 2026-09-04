@@ -485,9 +485,16 @@ def init_db() -> None:
         connection.execute(
             "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '1')"
         )
+        connection.execute(
+            """INSERT OR IGNORE INTO system_settings(key, value_json, updated_at)
+               SELECT 'import_days', value_json, updated_at
+               FROM system_settings
+               WHERE key='initial_import_days'"""
+        )
         defaults = {
             "sync_interval_minutes": 10,
             "initial_import_days": 30,
+            "import_days": 30,
             "redaction_enabled": False,
             "llm_input_budget": 1_000_000,
             "llm_output_budget": 200_000,

@@ -1,6 +1,6 @@
 import pytest
 
-from app.parsers import detect_image_suffix, extract_html, extract_file, fetch_public_url, is_link_message, is_system_message, parse_message_payload, parse_message_time
+from app.parsers import detect_image_suffix, extract_html, extract_file, fetch_public_url, is_access_challenge_page, is_link_message, is_system_message, parse_message_payload, parse_message_time
 
 
 def test_html_extraction():
@@ -51,3 +51,9 @@ def test_system_messages_are_detected_without_filtering_recruitment_invitation_t
 def test_trace_memo_datetime_is_used_but_numeric_creation_time_is_ignored():
     assert parse_message_time({"datetime": "2026/8/31 11:16:30", "createTime": 1788146190}) == "2026-08-31T03:16:30+00:00"
     assert parse_message_time({"createTime": 1788146190}) is None
+
+
+def test_wechat_environment_challenge_page_is_detected_only_for_wechat_hosts():
+    body = "<html><body>当前环境异常，完成验证后即可继续访问</body></html>"
+    assert is_access_challenge_page("https://mp.weixin.qq.com/s/example", body)
+    assert not is_access_challenge_page("https://example.com/recruit", body)
