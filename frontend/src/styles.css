@@ -67,3 +67,5 @@ button { cursor: pointer; }
 .status.historical { color:#b97827; background:#fff0d9; }
 
 @media(max-width:680px){.header-actions{flex-wrap:wrap}.job-details,.company-facts{grid-template-columns:1fr;padding-left:0}.timeline-event summary{align-items:flex-start}.timeline-event summary>time{flex-basis:90px}.timeline-event-detail{padding-left:15px}}
+.auth-link { border: 0; background: transparent; color: #5a70e5; font-size: 12px; margin: 12px auto 0; display: block; padding: 4px; }
+.auth-link:disabled { color: #9aa4b8; cursor: not-allowed; }

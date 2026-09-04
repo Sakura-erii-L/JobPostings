@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL DEFAULT 'member',
+  password_hash TEXT,
   active INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   last_login_at TEXT
@@ -31,6 +32,7 @@ CREATE TABLE IF NOT EXISTS invitations (
   email TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL DEFAULT 'member',
+  password_hash TEXT,
   expires_at TEXT NOT NULL,
   used_at TEXT,
   created_by TEXT NOT NULL,
@@ -440,6 +442,12 @@ def init_db() -> None:
     with connect() as connection:
         connection.executescript(SCHEMA)
         migrations = {
+            "users": {
+                "password_hash": "TEXT",
+            },
+            "invitations": {
+                "password_hash": "TEXT",
+            },
             "processing_jobs": {
                 "company_id": "TEXT",
                 "stage": "TEXT NOT NULL DEFAULT 'queued'",
@@ -492,6 +500,7 @@ def init_db() -> None:
             "search": {"enabled": True, "cache_days": 30},
             "backup": {"enabled": False, "schedule": "02:00", "retention_count": 30},
             "agent_api_enabled": False,
+            "otp_login_enabled": False,
             "processing_engine": "codex",
             "model_concurrency": 2,
             "codex_concurrency": 1,

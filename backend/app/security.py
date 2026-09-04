@@ -20,6 +20,34 @@ def hash_value(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return "scrypt$16384$8$1$" + base64.urlsafe_b64encode(salt).decode("ascii") + "$" + base64.urlsafe_b64encode(derived).decode("ascii")
+
+
+def verify_password(password: str, encoded: str | None) -> bool:
+    if not encoded:
+        return False
+    try:
+        scheme, n_value, r_value, p_value, salt_value, digest_value = encoded.split("$", 5)
+        if scheme != "scrypt":
+            return False
+        salt = base64.urlsafe_b64decode(salt_value.encode("ascii"))
+        expected = base64.urlsafe_b64decode(digest_value.encode("ascii"))
+        actual = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=salt,
+            n=int(n_value),
+            r=int(r_value),
+            p=int(p_value),
+            dklen=len(expected),
+        )
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError, UnicodeError):
+        return False
+
+
 def hmac_value(value: str, key: bytes) -> str:
     return hmac.new(key, value.encode("utf-8"), hashlib.sha256).hexdigest()
 

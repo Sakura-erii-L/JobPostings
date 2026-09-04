@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 
-from .auth import create_session, local_bootstrap_allowed, request_code, require_admin, require_scope, require_user, verify_code
+from .auth import authenticate_password, create_session, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_user_password, verify_code
 from .backups import WebDAVClient, _backup_credentials, create_backup, list_backups, validate_remote_backup
 from .catalog import refresh_expiration
 from .config import config
@@ -23,16 +23,26 @@ from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
 from .processing import attach_artifact, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
-from .security import SecretVault, hash_value, token
+from .security import SecretVault, hash_password, hash_value, token
 from .tracememo import TraceMemoClient, normalize_group
 
 
 class BootstrapRequest(BaseModel):
     email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
 
 
 class CodeRequest(BaseModel):
     email: EmailStr
+
+
+class PasswordLoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordSetRequest(BaseModel):
+    password: str = Field(min_length=8, max_length=128)
 
 
 class VerifyRequest(BaseModel):
@@ -43,6 +53,7 @@ class VerifyRequest(BaseModel):
 class InviteRequest(BaseModel):
     email: EmailStr
     role: str = "member"
+    password: str = Field(min_length=8, max_length=128)
 
 
 class TextImportRequest(BaseModel):
@@ -316,9 +327,9 @@ def bootstrap(body: BootstrapRequest, request: Request) -> dict[str, Any]:
         raise HTTPException(409, "Bootstrap has already been completed")
     user_id = str(uuid4())
     with connect() as connection:
-        connection.execute("INSERT INTO users(id,email,role,created_at) VALUES(?,?,?,?)", (user_id, str(body.email).lower(), "admin", utc_now()))
+        connection.execute("INSERT INTO users(id,email,role,password_hash,created_at) VALUES(?,?,?,?,?)", (user_id, str(body.email).lower(), "admin", hash_password(body.password), utc_now()))
     session = create_session(user_id)
-    response = JSONResponse({"user": {"id": user_id, "email": str(body.email).lower(), "role": "admin"}})
+    response = JSONResponse({"user": {"id": user_id, "email": str(body.email).lower(), "role": "admin", "password_configured": True}})
     response.set_cookie("jp_session", session, httponly=True, samesite="lax", secure=config.public_base_url.startswith("https://"), max_age=60 * 60 * 24 * 7)
     return response
 
@@ -326,6 +337,25 @@ def bootstrap(body: BootstrapRequest, request: Request) -> dict[str, Any]:
 @app.get("/api/v1/bootstrap/status")
 def bootstrap_status() -> dict[str, bool]:
     return {"initialized": bool(one("SELECT id FROM users LIMIT 1"))}
+
+
+@app.get("/api/v1/auth/options")
+def auth_options() -> dict[str, bool]:
+    return {"password_login_enabled": True, "otp_login_enabled": otp_login_enabled()}
+
+
+@app.post("/api/v1/auth/login")
+def auth_login(body: PasswordLoginRequest) -> JSONResponse:
+    user, session = authenticate_password(str(body.email), body.password)
+    response = JSONResponse({"user": user})
+    response.set_cookie("jp_session", session, httponly=True, samesite="lax", secure=config.public_base_url.startswith("https://"), max_age=60 * 60 * 24 * 7)
+    return response
+
+
+@app.post("/api/v1/auth/password")
+def auth_set_password(body: PasswordSetRequest, user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
+    set_user_password(user["id"], body.password)
+    return {"ok": True, "password_configured": True}
 
 
 @app.post("/api/v1/auth/request-code")
@@ -352,7 +382,7 @@ def auth_logout(request: Request, user: dict[str, Any] = Depends(require_user)) 
 
 @app.get("/api/v1/auth/me")
 def auth_me(user: dict[str, Any] = Depends(require_user)) -> dict[str, Any]:
-    return {"user": user}
+    return {"user": public_user(user)}
 
 
 @app.post("/api/v1/admin/invitations")
@@ -361,8 +391,8 @@ def create_invitation(body: InviteRequest, user: dict[str, Any] = Depends(requir
     invitation_id = str(uuid4())
     with connect() as connection:
         connection.execute(
-            "INSERT INTO invitations(id,email,token_hash,role,expires_at,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
-            (invitation_id, str(body.email).lower(), hash_value(invite), body.role if body.role in {"admin", "member"} else "member", (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(timespec="seconds"), user["id"], utc_now()),
+            "INSERT INTO invitations(id,email,token_hash,role,password_hash,expires_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (invitation_id, str(body.email).lower(), hash_value(invite), body.role if body.role in {"admin", "member"} else "member", hash_password(body.password), (datetime.now(timezone.utc) + timedelta(hours=72)).isoformat(timespec="seconds"), user["id"], utc_now()),
         )
     from .auth import _send_email
 
@@ -370,7 +400,7 @@ def create_invitation(body: InviteRequest, user: dict[str, Any] = Depends(requir
         _send_email(
             str(body.email).lower(),
             "JobPostings 邀请",
-            f"你已被邀请使用 JobPostings。请使用此邮箱申请登录验证码：{str(body.email).lower()}\n邀请有效期 72 小时。",
+            f"你已被邀请使用 JobPostings。请使用此邮箱和管理员提供的初始密码登录：{str(body.email).lower()}\n邀请有效期 72 小时。",
         )
     except Exception:
         pass
@@ -409,7 +439,7 @@ def update_settings(body: SettingsUpdate, _: dict[str, Any] = Depends(require_ad
         "llm_output_budget", "llm_budget_warning_percent", "ordinary_retention_days",
         "possibly_expired_days", "smtp", "llm_provider", "search", "backup", "agent_api_enabled",
         "processing_engine", "model_concurrency", "codex_concurrency", "extract_concurrency",
-        "processing_log_retention_days",
+        "processing_log_retention_days", "otp_login_enabled",
     }
     vault = SecretVault()
     with connect() as connection:

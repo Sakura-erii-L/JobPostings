@@ -13,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .config import config
 from .db import connect, one, utc_now
-from .security import hash_value, random_code, token
+from .security import hash_password, hash_value, random_code, token, verify_password
 
 
 def parse_time(value: str) -> datetime:
@@ -114,7 +114,62 @@ def create_session(user_id: str) -> str:
     return value
 
 
+def public_user(user: Any) -> dict[str, Any]:
+    result = dict(user)
+    result["password_configured"] = bool(result.pop("password_hash", None))
+    return result
+
+
+def otp_login_enabled() -> bool:
+    row = one("SELECT value_json FROM system_settings WHERE key='otp_login_enabled'")
+    if not row:
+        return False
+    try:
+        return bool(json.loads(row["value_json"]))
+    except json.JSONDecodeError:
+        return False
+
+
+def _complete_login(user: Any) -> tuple[dict[str, Any], str]:
+    with connect() as connection:
+        connection.execute("UPDATE users SET last_login_at=? WHERE id=?", (utc_now(), user["id"]))
+    return public_user(user), create_session(user["id"])
+
+
+def authenticate_password(email: str, password: str) -> tuple[dict[str, Any], str]:
+    email = email.strip().lower()
+    user = one("SELECT * FROM users WHERE email=? AND active=1", (email,))
+    if user:
+        if not user["password_hash"]:
+            raise HTTPException(status_code=409, detail="该账号尚未设置密码，请在当前登录会话的“账户安全”中设置密码")
+        if not verify_password(password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="邮箱或密码错误")
+        return _complete_login(user)
+    invitation = one(
+        "SELECT * FROM invitations WHERE email=? AND used_at IS NULL AND expires_at>?",
+        (email, utc_now()),
+    )
+    if not invitation or not invitation["password_hash"] or not verify_password(password, invitation["password_hash"]):
+        raise HTTPException(status_code=401, detail="邮箱或密码错误")
+    user_id = str(uuid4())
+    with connect() as connection:
+        connection.execute(
+            "INSERT INTO users(id,email,role,password_hash,created_at) VALUES(?,?,?,?,?)",
+            (user_id, email, invitation["role"], invitation["password_hash"], utc_now()),
+        )
+        connection.execute("UPDATE invitations SET used_at=? WHERE id=?", (utc_now(), invitation["id"]))
+    user = one("SELECT * FROM users WHERE id=?", (user_id,))
+    return _complete_login(user)
+
+
+def set_user_password(user_id: str, password: str) -> None:
+    with connect() as connection:
+        connection.execute("UPDATE users SET password_hash=? WHERE id=? AND active=1", (hash_password(password), user_id))
+
+
 def request_code(email: str) -> dict[str, Any]:
+    if not otp_login_enabled():
+        raise HTTPException(status_code=403, detail="邮箱验证码登录当前已关闭")
     email = email.strip().lower()
     user = one("SELECT id FROM users WHERE email=? AND active=1", (email,))
     invitation = one(
@@ -143,6 +198,8 @@ def request_code(email: str) -> dict[str, Any]:
 
 
 def verify_code(challenge_id: str, code: str) -> tuple[dict[str, Any], str]:
+    if not otp_login_enabled():
+        raise HTTPException(status_code=403, detail="邮箱验证码登录当前已关闭")
     row = one("SELECT * FROM otp_challenges WHERE id=?", (challenge_id,))
     if not row or row["consumed_at"] or parse_time(row["expires_at"]) <= datetime.now(timezone.utc):
         raise HTTPException(status_code=400, detail="Verification code expired")
@@ -163,12 +220,11 @@ def verify_code(challenge_id: str, code: str) -> tuple[dict[str, Any], str]:
         user_id = str(uuid4())
         with connect() as connection:
             connection.execute(
-                "INSERT INTO users(id,email,role,created_at) VALUES(?,?,?,?)",
-                (user_id, row["email"], invitation["role"], utc_now()),
+                "INSERT INTO users(id,email,role,password_hash,created_at) VALUES(?,?,?,?,?)",
+                (user_id, row["email"], invitation["role"], invitation["password_hash"], utc_now()),
             )
             connection.execute("UPDATE invitations SET used_at=? WHERE id=?", (utc_now(), invitation["id"]))
         user = one("SELECT * FROM users WHERE id=?", (user_id,))
     with connect() as connection:
         connection.execute("UPDATE otp_challenges SET consumed_at=? WHERE id=?", (utc_now(), challenge_id))
-        connection.execute("UPDATE users SET last_login_at=? WHERE id=?", (utc_now(), user["id"]))
-    return dict(user), create_session(user["id"])
+    return _complete_login(user)

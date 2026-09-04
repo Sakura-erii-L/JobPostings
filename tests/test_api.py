@@ -10,9 +10,21 @@ def test_bootstrap_import_and_query(tmp_path, monkeypatch):
 
     with TestClient(app, client=("127.0.0.1", 50000)) as client:
         assert client.get("/api/v1/bootstrap/status").json() == {"initialized": False}
-        bootstrap = client.post("/api/v1/bootstrap", json={"email": "admin@example.com"})
+        bootstrap = client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"})
         assert bootstrap.status_code == 200
-        assert client.get("/api/v1/auth/me").json()["user"]["role"] == "admin"
+        current_user = client.get("/api/v1/auth/me").json()["user"]
+        assert current_user["role"] == "admin"
+        assert current_user["password_configured"] is True
+        assert "password_hash" not in current_user
+        assert client.post("/api/v1/auth/logout").status_code == 200
+        assert client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "wrong-pass"}).status_code == 401
+        assert client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        assert client.post("/api/v1/auth/password", json={"password": "NewAdminPass123!"}).json() == {"ok": True, "password_configured": True}
+        assert client.post("/api/v1/auth/logout").status_code == 200
+        assert client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 401
+        assert client.post("/api/v1/auth/login", json={"email": "admin@example.com", "password": "NewAdminPass123!"}).status_code == 200
+        assert client.get("/api/v1/auth/options").json() == {"password_login_enabled": True, "otp_login_enabled": False}
+        assert client.post("/api/v1/auth/request-code", json={"email": "admin@example.com"}).status_code == 403
         imported = client.post("/api/v1/imports/text", json={"text": "测试科技招聘算法工程师，地点南京"})
         assert imported.status_code == 200
         assert client.get("/api/v1/companies").status_code == 200
@@ -27,10 +39,10 @@ def test_admin_can_create_and_list_invitations(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     with TestClient(app, client=("127.0.0.1", 50002)) as client:
-        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
         created = client.post(
             "/api/v1/admin/invitations",
-            json={"email": "member@example.com", "role": "member"},
+            json={"email": "member@example.com", "role": "member", "password": "MemberPass123!"},
         )
         assert created.status_code == 200
         assert created.json()["email"] == "member@example.com"
@@ -41,6 +53,10 @@ def test_admin_can_create_and_list_invitations(tmp_path, monkeypatch):
         assert listed.json()[0]["email"] == "member@example.com"
         assert listed.json()[0]["role"] == "member"
         assert listed.json()[0]["used_at"] is None
+        logged_in = client.post("/api/v1/auth/login", json={"email": "member@example.com", "password": "MemberPass123!"})
+        assert logged_in.status_code == 200
+        assert logged_in.json()["user"]["role"] == "member"
+        assert db.one("SELECT used_at FROM invitations WHERE email=?", ("member@example.com",))["used_at"] is not None
 
 
 def test_connector_secret_is_preserved_and_agent_scopes_are_enforced(tmp_path, monkeypatch):
@@ -49,7 +65,7 @@ def test_connector_secret_is_preserved_and_agent_scopes_are_enforced(tmp_path, m
     from fastapi.testclient import TestClient
 
     with TestClient(app, client=("127.0.0.1", 50001)) as client:
-        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
         first = client.put(
             "/api/v1/admin/connectors/tracememo",
             json={"base_url": "http://127.0.0.1:6131/api/v1", "enabled": True, "token": "secret-token"},
@@ -86,7 +102,7 @@ def test_tracememo_groups_keep_distinct_trace_memo_ids_and_names(tmp_path, monke
         ],
     )
     with TestClient(app, client=("127.0.0.1", 50003)) as client:
-        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
         assert client.put("/api/v1/admin/connectors/tracememo", json={"enabled": True}).status_code == 200
         response = client.get("/api/v1/admin/connectors/tracememo/groups")
         assert response.status_code == 200
@@ -115,7 +131,7 @@ def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
     monkeypatch.setattr(main_module, "process_one_batch", lambda limit: None)
     monkeypatch.setattr(main_module, "process_one_enrichment", lambda: None)
     with TestClient(app, client=("127.0.0.1", 50004)) as client:
-        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
         imported = client.post("/api/v1/imports/text", json={"text": "锦浪科技招聘产品研发类岗位"})
         assert imported.status_code == 200
         raw_message_id = imported.json()["raw_message_id"]
@@ -149,7 +165,7 @@ def test_manual_sync_requires_selected_groups(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     with TestClient(app, client=("127.0.0.1", 50005)) as client:
-        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com"}).status_code == 200
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
         assert client.put("/api/v1/admin/connectors/tracememo", json={"enabled": True}).status_code == 200
         response = client.post("/api/v1/admin/sync")
         assert response.status_code == 400

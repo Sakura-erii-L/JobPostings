@@ -1,4 +1,13 @@
-from app.security import hash_value, redact_text
+from app.security import hash_password, hash_value, redact_text, verify_password
+
+
+def test_password_hash_is_salted_and_verifiable():
+    first = hash_password("AdminPass123!")
+    second = hash_password("AdminPass123!")
+    assert first != second
+    assert verify_password("AdminPass123!", first)
+    assert not verify_password("wrong-pass", first)
+    assert not verify_password("AdminPass123!", "invalid")
 
 
 def test_hash_is_stable():
