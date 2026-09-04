@@ -1,10 +1,15 @@
 import app.model_provider as model_provider
-from app.model_provider import OpenAICompatibleProvider, extract_json, estimate_tokens
+from app.model_provider import OpenAICompatibleProvider, _day_start_utc, extract_json, estimate_tokens
 
 
 def test_model_json_extraction():
     assert extract_json("```json\n{\"items\": []}\n```") == {"items": []}
     assert estimate_tokens("abcdef") >= 1
+
+
+def test_day_start_utc_uses_shanghai_timezone():
+    value = _day_start_utc()
+    assert value.endswith("T16:00:00+00:00")
 
 
 def test_openai_compatible_chat_response(monkeypatch):
