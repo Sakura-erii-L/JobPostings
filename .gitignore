@@ -10,6 +10,7 @@ frontend/dist/
 frontend/.vite/
 build/
 dist/
+installer/output/
 *.spec
 .env
 .env.*
