@@ -62,7 +62,7 @@
 | `3b3e4e9` | 优先使用 Codex 进行图片 OCR |
 | `534f97e` | 增加任务专用 Codex prompt |
 | `89cad21` | 重新导入时重置已取消队列消息 |
-| 当前变更（待提交） | 增加聊天 PDF/DOC/DOCX/XLS/XLSX 解析、TraceMemo 媒体候选回退和历史附件修复 |
+| `3853cde` | 增加聊天 PDF/DOC/DOCX/XLS/XLSX 解析、TraceMemo 媒体候选回退和历史附件修复 |
 
 ## 5. 下一步建议
 
