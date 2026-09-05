@@ -18,6 +18,28 @@ _active = 0
 _processes: dict[str, subprocess.Popen[str]] = {}
 
 
+def _image_suffix(source: Path) -> str:
+    suffix = source.suffix.lower()
+    if suffix:
+        return suffix
+    try:
+        with source.open("rb") as stream:
+            header = stream.read(12)
+    except OSError:
+        return ".png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return ".webp"
+    if header.startswith(b"BM"):
+        return ".bmp"
+    return ".png"
+
+
 def _setting(key: str, default: Any) -> Any:
     from .model_provider import get_setting
 
@@ -87,7 +109,7 @@ def run_codex_json(
             for index, value in enumerate(image_paths or []):
                 source = Path(value)
                 if source.exists() and source.is_file():
-                    target = temp_dir / f"input-{index}{source.suffix or '.png'}"
+                    target = temp_dir / f"input-{index}{_image_suffix(source)}"
                     shutil.copy2(source, target)
                     copied_images.append(target)
             prompt = render_prompt_template(task, payload)

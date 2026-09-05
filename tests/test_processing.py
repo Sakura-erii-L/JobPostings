@@ -8,7 +8,7 @@ from app import db
 from app.maintenance import repair_raw_message_times, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from app.model_provider import ModelResult, classify_messages
 from app.catalog import apply_model_item
-from app.processing import _claim_one, _extract_source_text, _fail, import_file, ingest_message, log_processing, process_one_batch
+from app.processing import _claim_one, _codex_extract, _extract_source_text, _fail, import_file, ingest_message, log_processing, process_one_batch
 import app.tracememo as tracememo
 
 
@@ -514,7 +514,7 @@ def test_wechat_browser_rendered_images_are_processed_after_http_challenge(tmp_p
     assert metadata["web_access_status"] == "ok"
     assert metadata["linked_image_urls"] == [image_url]
     assert metadata["qr_values"] == ["https://apply.example.com"]
-    assert artifact_calls == ["linked-image-1.png"]
+    assert artifact_calls == ["linked-image-1.png", "webpage-screenshot.jpg"]
 
 
 def test_browser_screenshot_is_used_when_image_ocr_has_no_text(tmp_path, monkeypatch):
@@ -563,7 +563,52 @@ def test_browser_screenshot_is_used_when_image_ocr_has_no_text(tmp_path, monkeyp
     assert metadata["browser_screenshot_ocr"] is True
     assert metadata["artifact_id"] == "screenshot-artifact"
     assert metadata["qr_values"] == ["https://qr.example.com"]
-    assert artifact_calls == ["webpage-screenshot.png"]
+    assert artifact_calls == ["webpage-screenshot.jpg"]
+
+
+def test_wechat_codex_ocr_uses_only_full_page_jpg_screenshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    url = "https://mp.weixin.qq.com/s/full-page-jpg"
+    raw_id = ingest_message({
+        "id": "wechat-full-page-jpg",
+        "type": "公众号链接",
+        "text": "公众号招聘",
+        "contentData": {"type": "share", "title": "公众号招聘", "url": url},
+    }, "tracememo", "group-1")
+    assert raw_id
+    screenshot = tmp_path / "screenshot-blob"
+    poster = tmp_path / "poster-blob"
+    screenshot.write_bytes(b"jpg-screenshot")
+    poster.write_bytes(b"png-poster")
+    now = db.utc_now()
+    with db.connect() as connection:
+        connection.executemany(
+            "INSERT INTO artifacts(id,raw_message_id,sha256,path,filename,mime_type,byte_size,ocr_text,qr_values_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [
+                ("poster-artifact", raw_id, "poster-sha", str(poster), "linked-image-1.png", "image/png", 10, "", "[]", now),
+                ("screenshot-artifact", raw_id, "screenshot-sha", str(screenshot), "webpage-screenshot.jpg", "image/jpeg", 14, "", "[]", now),
+            ],
+        )
+    captured: dict[str, object] = {}
+
+    def fake_codex(task, payload, schema, *, job_id, image_paths=None, enable_web=False):
+        captured["image_paths"] = list(image_paths or [])
+        captured["payload"] = payload
+        captured["enable_web"] = enable_web
+        return {"text": "长截图 OCR 正文", "source_url": "", "notes": ""}
+
+    monkeypatch.setattr("app.codex_agent.run_codex_json", fake_codex)
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    metadata = {"source_url": url, "url": url, "browser_rendered": True, "browser_screenshot_artifact_id": "screenshot-artifact"}
+
+    assert _codex_extract(job, raw, metadata, "图片是主要来源内容", primary_ocr=True) == "长截图 OCR 正文"
+    assert captured["image_paths"] == [str(screenshot)]
+    assert captured["payload"]["image_count"] == 1
+    assert captured["payload"]["image_order"] == ["webpage-screenshot.jpg"]
+    assert captured["enable_web"] is False
 
 
 def test_wechat_environment_challenge_uses_codex_fallback(tmp_path, monkeypatch):
@@ -688,7 +733,7 @@ def test_image_ocr_uses_local_fallback_only_after_codex_failure(tmp_path, monkey
     job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
     raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
     monkeypatch.setattr("app.processing._codex_extract", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Codex unavailable")))
-    monkeypatch.setattr("app.processing._local_ocr_extract", lambda raw_value: ("RapidOCR 兜底文字", ["local test error"]))
+    monkeypatch.setattr("app.processing._local_ocr_extract", lambda raw_value, metadata=None: ("RapidOCR 兜底文字", ["local test error"]))
     text, metadata = _extract_source_text(job, raw)
 
     assert text == "图片招聘说明\nRapidOCR 兜底文字"
