@@ -336,14 +336,25 @@ def _stage(job_id: str, stage: str, message: str, processor: str | None = None) 
     log_processing(job_id, stage, message)
 
 
-def _codex_extract(job: dict[str, Any], raw: dict[str, Any], metadata: dict[str, Any], reason: str) -> str:
-    from .codex_agent import run_codex_json
-
+def _image_artifact_rows(raw_message_id: str) -> list[dict[str, Any]]:
     image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
-    artifacts = [
-        row for row in _artifact_rows(raw["id"])
+    return [
+        row for row in _artifact_rows(raw_message_id)
         if str(row["mime_type"] or "").startswith("image/") or Path(str(row["filename"] or "")).suffix.lower() in image_suffixes
     ]
+
+
+def _codex_extract(
+    job: dict[str, Any],
+    raw: dict[str, Any],
+    metadata: dict[str, Any],
+    reason: str,
+    *,
+    primary_ocr: bool = False,
+) -> str:
+    from .codex_agent import run_codex_json
+
+    artifacts = _image_artifact_rows(raw["id"])
     images = [row["path"] for row in artifacts if row["path"]]
     artifact = artifacts[-1] if artifacts else None
     payload = {
@@ -360,12 +371,17 @@ def _codex_extract(job: dict[str, Any], raw: dict[str, Any], metadata: dict[str,
         "required": ["text", "source_url", "notes"],
         "additionalProperties": False,
     }
-    _stage(job["id"], "codex_fallback", f"本地提取不足，使用 Codex 兜底：{reason}", "local_codex:gpt-5.6-luna")
+    stage = "codex_ocr" if primary_ocr else "codex_fallback"
+    message = f"发现图片来源，优先使用 Codex 进行图片 OCR：{reason}" if primary_ocr else f"本地提取不足，使用 Codex 兜底：{reason}"
+    _stage(job["id"], stage, message, "local_codex:gpt-5.6-luna")
     result = run_codex_json("source_text_extraction", payload, schema, job_id=job["id"], image_paths=images, enable_web=bool(metadata.get("url")))
     text = str(result.get("text") or "").strip()
     if not text:
         raise RuntimeError("Codex did not extract readable text")
-    metadata["codex_fallback"] = True
+    metadata["codex_ocr"] = bool(primary_ocr or images)
+    metadata["ocr_engine"] = "codex" if images else metadata.get("ocr_engine", "")
+    if not primary_ocr:
+        metadata["codex_fallback"] = True
     metadata["codex_notes"] = result.get("notes")
     with connect() as connection:
         connection.execute(
@@ -377,6 +393,39 @@ def _codex_extract(job: dict[str, Any], raw: dict[str, Any], metadata: dict[str,
 
 def _artifact_rows(raw_message_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in _all_rows("SELECT * FROM artifacts WHERE raw_message_id=? ORDER BY created_at", (raw_message_id,))]
+
+
+def _local_ocr_extract(raw: dict[str, Any]) -> tuple[str, list[str]]:
+    texts: list[str] = []
+    errors: list[str] = []
+    for artifact in _image_artifact_rows(raw["id"]):
+        existing_text = str(artifact.get("ocr_text") or "").strip()
+        if existing_text:
+            texts.append(existing_text)
+            continue
+        path = str(artifact.get("path") or "")
+        if not path:
+            continue
+        try:
+            filename = str(artifact.get("filename") or "image.png")
+            if Path(filename).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}:
+                filename = f"{Path(filename).stem or 'image'}.png"
+            parsed = extract_file(
+                filename,
+                Path(path).read_bytes(),
+                local_ocr=True,
+            )
+            extracted = str(parsed.get("text") or "").strip()
+            if extracted:
+                texts.append(extracted)
+                with connect() as connection:
+                    connection.execute("UPDATE artifacts SET ocr_text=? WHERE id=?", (extracted, artifact["id"]))
+            ocr_error = str((parsed.get("metadata") or {}).get("ocr_error") or "").strip()
+            if ocr_error:
+                errors.append(ocr_error)
+        except Exception as exc:
+            errors.append(str(exc))
+    return _merge_texts(*texts), errors
 
 
 def _is_wechat_public_url(url: str) -> bool:
@@ -609,7 +658,7 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
     if image_urls:
         metadata["linked_image_urls"] = image_urls[:24]
     screenshot_data = parsed.get("screenshot_data")
-    if isinstance(screenshot_data, bytes) and screenshot_data and not _merge_texts(*ocr_texts).strip():
+    if isinstance(screenshot_data, bytes) and screenshot_data and downloaded == 0:
         try:
             artifact = attach_artifact(raw["id"], "webpage-screenshot.png", screenshot_data, "image/png")
             artifact_ids.append(artifact["id"])
@@ -625,7 +674,7 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
         metadata["qr_values"] = list(dict.fromkeys([*(metadata.get("qr_values") or []), *qr_values]))
     if downloaded:
         metadata["linked_images_downloaded"] = downloaded
-        log_processing(job["id"], "extracting", f"已下载并识别 {downloaded} 个网页图片资源", details={"qr_values": list(dict.fromkeys(qr_values))})
+        log_processing(job["id"], "extracting", f"已下载 {downloaded} 个网页图片资源，等待 Codex OCR", details={"qr_values": list(dict.fromkeys(qr_values))})
     return list(dict.fromkeys(qr_values)), _merge_texts(*ocr_texts)
 
 
@@ -704,7 +753,28 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
             raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
         except Exception as exc:
             log_processing(job["id"], "extracting", "后端网页提取失败", "warning", {"error": str(exc)})
-    if not is_text_message(raw["message_type"], metadata):
+    image_artifacts = _image_artifact_rows(raw["id"])
+    if image_artifacts:
+        try:
+            reason = "公众号页面返回微信环境验证页" if metadata.get("web_access_status") == "challenge" else "图片是主要来源内容"
+            text = _codex_extract(job, raw, metadata, reason, primary_ocr=True)
+            raw["text_content"] = text
+            raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+        except Exception as exc:
+            metadata["codex_ocr_error"] = str(exc)
+            _stage(job["id"], "local_ocr_fallback", "Codex OCR 失败，改用本地 OCR 兜底", "rapidocr")
+            log_processing(job["id"], "local_ocr_fallback", "Codex OCR 失败，使用本地 OCR 兜底", "warning", {"error": str(exc)})
+            local_text, local_errors = _local_ocr_extract(raw)
+            text = _merge_texts(text, local_text)
+            metadata["local_ocr_fallback"] = True
+            if local_errors:
+                metadata["local_ocr_errors"] = local_errors[:10]
+            if not text or (metadata.get("web_access_status") == "challenge" and not local_text):
+                raise RuntimeError("Codex OCR failed and local OCR fallback returned no text") from exc
+            _persist_raw_extraction(raw["id"], text, metadata)
+            raw["text_content"] = text
+            raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+    elif not is_text_message(raw["message_type"], metadata):
         if metadata.get("web_access_status") == "challenge":
             text = _codex_extract(job, raw, metadata, "公众号页面返回微信环境验证页")
         elif len(text) < 20:

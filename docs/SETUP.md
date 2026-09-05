@@ -53,6 +53,8 @@ http://127.0.0.1:6131/api/v1
 
 API Key 会使用 Windows DPAPI 保护，不会以明文写入设置展示。脱敏开关默认关闭，可以在设置中启用。
 
+招聘处理器默认是本地 Codex；图片附件会先交给 Codex 进行 OCR，Codex 不可用或未提取到文字时才回退到可选的 RapidOCR。管理台“待审核”的阶段日志会显示实际使用的 OCR 引擎。
+
 ## Cloudflare Tunnel
 
 Tunnel 的 origin 必须指向：

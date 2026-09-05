@@ -4,7 +4,7 @@ import sqlite3
 from app import db
 from app.maintenance import repair_raw_message_times, repair_source_urls, reset_recruitment_data
 from app.model_provider import ModelResult, classify_messages
-from app.processing import _extract_source_text, _fail, ingest_message, log_processing, process_one_batch
+from app.processing import _extract_source_text, _fail, import_file, ingest_message, log_processing, process_one_batch
 
 
 def test_init_db_migrates_legacy_processing_jobs_before_index(tmp_path, monkeypatch):
@@ -396,9 +396,10 @@ def test_wechat_environment_challenge_uses_codex_fallback(tmp_path, monkeypatch)
     })
     captured: dict[str, object] = {}
 
-    def fake_codex(job_value, raw_value, metadata, reason):
+    def fake_codex(job_value, raw_value, metadata, reason, *, primary_ocr=False):
         captured["reason"] = reason
         captured["metadata"] = metadata.copy()
+        captured["primary_ocr"] = primary_ocr
         return "通过 Codex 获取的真实招聘正文"
 
     monkeypatch.setattr("app.processing._codex_extract", fake_codex)
@@ -427,6 +428,49 @@ def test_plain_text_is_sent_directly_even_when_short(tmp_path, monkeypatch):
     monkeypatch.setattr("app.processing._codex_extract", lambda *args: (_ for _ in ()).throw(AssertionError("plain text must not use Codex fallback")))
     text, _ = _extract_source_text(job, raw)
     assert text == "短招聘"
+
+
+def test_image_ocr_prefers_codex_over_local_ocr(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    imported = import_file("poster.png", b"image-bytes", "image/png")
+    raw_id = imported["raw_message_id"]
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    calls: list[dict[str, object]] = []
+
+    def fake_codex(job_value, raw_value, metadata, reason, *, primary_ocr=False):
+        calls.append({"reason": reason, "primary_ocr": primary_ocr})
+        metadata["codex_ocr"] = True
+        return "Codex OCR 招聘正文"
+
+    monkeypatch.setattr("app.processing._codex_extract", fake_codex)
+    monkeypatch.setattr("app.processing._local_ocr_extract", lambda raw_value: (_ for _ in ()).throw(AssertionError("local OCR must wait for Codex")))
+    text, metadata = _extract_source_text(job, raw)
+
+    assert text == "Codex OCR 招聘正文"
+    assert metadata["codex_ocr"] is True
+    assert calls == [{"reason": "图片是主要来源内容", "primary_ocr": True}]
+
+
+def test_image_ocr_uses_local_fallback_only_after_codex_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    imported = import_file("poster.png", b"image-bytes", "image/png")
+    raw_id = imported["raw_message_id"]
+    with db.connect() as connection:
+        connection.execute("UPDATE raw_messages SET text_content=? WHERE id=?", ("图片招聘说明", raw_id))
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    monkeypatch.setattr("app.processing._codex_extract", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Codex unavailable")))
+    monkeypatch.setattr("app.processing._local_ocr_extract", lambda raw_value: ("RapidOCR 兜底文字", ["local test error"]))
+    text, metadata = _extract_source_text(job, raw)
+
+    assert text == "图片招聘说明\nRapidOCR 兜底文字"
+    assert metadata["local_ocr_fallback"] is True
+    assert metadata["local_ocr_errors"] == ["local test error"]
 
 
 def test_failed_job_review_keeps_error_original_message_and_logs(tmp_path, monkeypatch):

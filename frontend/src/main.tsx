@@ -703,7 +703,7 @@ function QueuePage({ onSync, syncing }: { onSync: () => Promise<void>; syncing: 
   const statusLabel: Record<string, string> = { pending: '等待处理', running: '处理中', succeeded: '已完成', needs_review: '需要处理', paused_quota: '额度暂停', failed: '失败', canceled: '已取消' }
   const recognitionLabel: Record<string, string> = { pending: '待识别', running: '识别中', succeeded: '已识别', needs_review: '识别需审核', canceled: '已取消', filtered: '系统消息已过滤' }
   const kindLabel: Record<string, string> = { classify: '来源识别', consolidate_company: '企业内容整理', research_company: '企业公开概览' }
-  const stageLabel: Record<string, string> = { queued: '等待领取', starting: '启动任务', extracting: '提取来源内容', codex_fallback: 'Codex 兜底提取 / OCR', classifying: '招聘识别与结构化', persisting: '写入企业、岗位与时间轴', waiting_for_sources: '等待来源汇总', consolidating: '合并企业资料', research_queued: '等待公开检索', researching: '联网检索企业概览与风险', saving_research: '保存概览、标签与来源', retry_wait: '等待自动重试', review: '等待人工审核', failed: '处理失败', completed: '已完成', canceled: '已取消' }
+  const stageLabel: Record<string, string> = { queued: '等待领取', starting: '启动任务', extracting: '提取来源内容', codex_ocr: 'Codex 图片 OCR', codex_fallback: 'Codex 兜底提取 / OCR', local_ocr_fallback: '本地 OCR 兜底', classifying: '招聘识别与结构化', persisting: '写入企业、岗位与时间轴', waiting_for_sources: '等待来源汇总', consolidating: '合并企业资料', research_queued: '等待公开检索', researching: '联网检索企业概览与风险', saving_research: '保存概览、标签与来源', retry_wait: '等待自动重试', review: '等待人工审核', failed: '处理失败', completed: '已完成', canceled: '已取消' }
 
   const cancellableIds = queue?.items.filter(item => ['pending', 'running', 'needs_review', 'paused_quota', 'failed'].includes(item.status)).map(item => item.id) || []
   const allSelected = cancellableIds.length > 0 && cancellableIds.every(id => selectedIds.includes(id))

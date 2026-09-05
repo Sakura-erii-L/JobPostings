@@ -443,7 +443,7 @@ def _safe_decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def extract_file(filename: str, data: bytes) -> dict[str, Any]:
+def extract_file(filename: str, data: bytes, *, local_ocr: bool = False) -> dict[str, Any]:
     suffix = Path(filename).suffix.lower()
     if suffix in {".txt", ".md", ".log", ".csv", ".tsv"}:
         text = _safe_decode(data)
@@ -491,13 +491,13 @@ def extract_file(filename: str, data: bytes) -> dict[str, Any]:
             return {"text": "\n".join(lines)[:2_000_000], "metadata": {"format": "pdf", "pages": len(document)}}
         except Exception as exc:
             return {"text": "", "metadata": {"format": "pdf", "error": str(exc)}}
-    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-        return process_image(data, suffix[1:])
+    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}:
+        return process_image(data, suffix[1:], local_ocr=local_ocr)
     return {"text": "", "metadata": {"format": suffix.lstrip(".") or "unknown", "unsupported": True}}
 
 
-def process_image(data: bytes, image_format: str) -> dict[str, Any]:
-    """Run optional local OCR and QR decoding without making either mandatory."""
+def process_image(data: bytes, image_format: str, *, local_ocr: bool = False) -> dict[str, Any]:
+    """Decode QR codes and optionally run local OCR as a fallback."""
     try:
         import cv2
         import numpy as np
@@ -518,18 +518,27 @@ def process_image(data: bytes, image_format: str) -> dict[str, Any]:
         except Exception:
             pass
         ocr_lines: list[str] = []
-        try:
-            from rapidocr_onnxruntime import RapidOCR
+        ocr_error = ""
+        if local_ocr:
+            try:
+                from rapidocr_onnxruntime import RapidOCR
 
-            result, _ = RapidOCR()(image)
-            for item in result or []:
-                if len(item) >= 2 and item[1]:
-                    ocr_lines.append(str(item[1]))
-        except Exception:
-            pass
+                result, _ = RapidOCR()(image)
+                for item in result or []:
+                    if len(item) >= 2 and item[1]:
+                        ocr_lines.append(str(item[1]))
+            except Exception as exc:
+                ocr_error = str(exc)
+        metadata: dict[str, Any] = {
+            "format": image_format,
+            "needs_ocr": not bool(ocr_lines),
+            "ocr_engine": "rapidocr" if local_ocr and ocr_lines else "",
+        }
+        if ocr_error:
+            metadata["ocr_error"] = ocr_error
         return {
             "text": "\n".join(ocr_lines)[:2_000_000],
-            "metadata": {"format": image_format, "needs_ocr": False},
+            "metadata": metadata,
             "qr_values": list(dict.fromkeys(qr_values)),
         }
     except Exception as exc:
