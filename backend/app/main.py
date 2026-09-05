@@ -422,6 +422,8 @@ def _sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict
             if message_time < start or message_time > end:
                 ingest_stats["outside_window"] += 1
                 continue
+            if force:
+                continue
             raw_id = ingest_message(message, row["id"], group["id"], ingest_stats)
             if raw_id:
                 _attach_tracememo_media(client, message, raw_id, ingest_stats)
@@ -450,6 +452,7 @@ def _sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict
         "cached_groups": cached_groups,
         "cached_messages": cached_messages,
         "reset": reset_result,
+        "manual_import_pending": force,
         "groups": len(groups),
     }
 

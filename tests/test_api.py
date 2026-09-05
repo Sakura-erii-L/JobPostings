@@ -345,7 +345,9 @@ def test_tracememo_messages_are_cached_until_force_refetch(tmp_path, monkeypatch
     assert second["cache_mode"] == "cache"
     assert second["cached_messages"] == 1
     assert forced["cache_mode"] == "tracememo"
+    assert forced["manual_import_pending"] is True
     assert db.one("SELECT COUNT(*) AS count FROM tracememo_message_cache")["count"] == 1
+    assert db.one("SELECT COUNT(*) AS count FROM raw_messages")["count"] == 0
 
 
 def test_selected_tracememo_messages_can_be_previewed_and_imported(tmp_path, monkeypatch):
