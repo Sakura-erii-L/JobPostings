@@ -111,5 +111,10 @@ button { cursor: pointer; }
 .public-finding p { color: #6f5963; font-size: 12px; line-height: 1.65; margin: 8px 0; white-space: pre-wrap; }
 .public-finding-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; color: #9a8790; font-size: 11px; }
 .public-finding-meta a { color: #596fd1; }
+.shared-recruitment-detail { border-top: 1px solid #f0f2f7; padding: 15px 0 8px; }
+.shared-recruitment-detail:first-of-type { border-top: 0; }
+.shared-detail-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 8px; }
+.shared-detail-head span { color: #8994ab; font-size: 11px; }
+.shared-recruitment-detail .job-details { padding-left: 0; }
 .resolved-source { margin-top: 8px; color: #8994a8; font-size: 11px; }
 .resolved-source code { display: block; margin-top: 5px; white-space: pre-wrap; word-break: break-all; color: #65718d; }

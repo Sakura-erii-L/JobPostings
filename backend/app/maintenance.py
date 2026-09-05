@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -9,9 +10,9 @@ from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 from .config import config
-from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title
+from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, _store_recruitment_shared_details, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title
 from .db import connect, utc_now
-from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, is_major_like_title, is_major_requirement_heading, is_wechat_public_url, normalize_event_datetime, parse_message_time, recover_original_source_url
+from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, extract_recruitment_shared_details, is_major_like_title, is_major_requirement_heading, is_wechat_public_url, normalize_event_datetime, parse_message_time, recover_original_source_url
 
 
 # Imported recruitment content and its derived catalog are reset together so
@@ -24,6 +25,7 @@ _RECRUITMENT_TABLES = (
     "user_follows",
     "recruitment_event_evidences",
     "recruitment_event_versions",
+    "recruitment_shared_details",
     "evidences",
     "job_versions",
     "jobs",
@@ -47,6 +49,18 @@ _RECRUITMENT_TABLES = (
     "llm_calls",
     "notifications",
 )
+
+
+def _batch_from_evidence(connection: Any, company_id: str, excerpt: Any) -> str | None:
+    try:
+        item = json.loads(excerpt or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    batch = item.get("batch") if isinstance(item, dict) else None
+    if not isinstance(batch, dict) or not any(batch.get(key) for key in ("name", "year", "season", "recruitment_type")):
+        return None
+    recruitment_type = str(batch.get("recruitment_type") or "unknown")
+    return _batch_for(connection, company_id, batch, recruitment_type)
 
 
 def _create_safety_backup() -> str:
@@ -437,18 +451,23 @@ def split_existing_job_lists() -> int:
         company_ids = [row["id"] for row in connection.execute("SELECT id FROM companies").fetchall()]
         for company_id in company_ids:
             raw_rows = connection.execute(
-                """SELECT DISTINCT e.raw_message_id,COALESCE(r.sent_at,e.observed_at) AS observed_at
+                """SELECT e.id AS evidence_id,e.raw_message_id,e.excerpt,COALESCE(r.sent_at,e.observed_at) AS observed_at
                    FROM evidences e LEFT JOIN raw_messages r ON r.id=e.raw_message_id
                    WHERE e.company_id=? OR e.job_id IN (SELECT id FROM jobs WHERE company_id=?)""",
                 (company_id, company_id),
             ).fetchall()
+            processed_raw_ids: set[str] = set()
             for raw in raw_rows:
+                if not raw["raw_message_id"] or raw["raw_message_id"] in processed_raw_ids:
+                    continue
+                processed_raw_ids.add(raw["raw_message_id"])
                 catalog = extract_recruitment_catalog(_raw_source_text(connection, raw["raw_message_id"]))
                 titles = catalog.get("job_titles") or []
-                if len(titles) < 2:
+                if not titles:
                     continue
                 current_jobs = [dict(row) for row in connection.execute("SELECT * FROM jobs WHERE company_id=? AND status<>'superseded'", (company_id,)).fetchall()]
                 template = next((job for job in current_jobs if is_aggregate_job_title(job["canonical_title"])), None)
+                batch_id = _batch_from_evidence(connection, company_id, raw["excerpt"])
                 for title in titles:
                     if any(normalize_title(job["canonical_title"]) == normalize_title(title) for job in current_jobs):
                         continue
@@ -457,12 +476,7 @@ def split_existing_job_lists() -> int:
                         "recruitment_type": template["recruitment_type"] if template else "unknown",
                         "employment_type": template["employment_type"] if template else "unknown",
                     }
-                    if template:
-                        try:
-                            job_data["locations"] = json.loads(template["locations_json"] or "[]")
-                        except (TypeError, json.JSONDecodeError):
-                            job_data["locations"] = []
-                    _make_job(connection, company_id, template["batch_id"] if template else None, job_data, raw["observed_at"] or utc_now(), raw["raw_message_id"])
+                    _make_job(connection, company_id, batch_id or (template["batch_id"] if template else None), job_data, raw["observed_at"] or utc_now(), raw["raw_message_id"])
                     current_jobs = [dict(row) for row in connection.execute("SELECT * FROM jobs WHERE company_id=? AND status<>'superseded'", (company_id,)).fetchall()]
                     created += 1
                 if template:
@@ -470,6 +484,76 @@ def split_existing_job_lists() -> int:
                     connection.execute("UPDATE evidences SET company_id=?,job_id=NULL WHERE job_id=?", (company_id, template["id"]))
                     connection.execute("DELETE FROM search_index WHERE entity_type='job' AND entity_id=?", (template["id"],))
     return created
+
+
+def backfill_recruitment_shared_details() -> int:
+    """Backfill source/batch-level salary and locations from stored source text."""
+    updated = 0
+    with connect() as connection:
+        rows = connection.execute(
+            """SELECT e.id AS evidence_id,e.company_id,e.raw_message_id,e.excerpt,
+                      COALESCE(r.sent_at,e.observed_at) AS observed_at
+               FROM evidences e LEFT JOIN raw_messages r ON r.id=e.raw_message_id
+               WHERE e.company_id IS NOT NULL AND e.raw_message_id IS NOT NULL
+               ORDER BY e.observed_at,e.id"""
+        ).fetchall()
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            key = (row["company_id"], row["raw_message_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            details = extract_recruitment_shared_details(_raw_source_text(connection, row["raw_message_id"]))
+            if not details.get("locations") and not details.get("salary"):
+                continue
+            batch_id = _batch_from_evidence(connection, row["company_id"], row["excerpt"])
+            detail_id = _store_recruitment_shared_details(
+                connection,
+                row["company_id"],
+                batch_id,
+                row["evidence_id"],
+                row["raw_message_id"],
+                details,
+                row["observed_at"] or utc_now(),
+            )
+            if detail_id:
+                updated += 1
+    return updated
+
+
+def requeue_missing_job_sources() -> int:
+    """Retry successful recruitment sources that mention jobs but still produced none."""
+    requeued = 0
+    with connect() as connection:
+        rows = connection.execute(
+            """SELECT DISTINCT p.id AS processing_job_id,r.id AS raw_message_id,e.company_id
+               FROM processing_jobs p
+               JOIN raw_messages r ON r.id=p.raw_message_id
+               JOIN evidences e ON e.raw_message_id=r.id AND e.company_id IS NOT NULL
+               WHERE p.kind='classify' AND p.status='succeeded' AND r.is_recruitment=1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM evidences job_evidence
+                     JOIN jobs j ON j.id=job_evidence.job_id AND j.status<>'superseded'
+                     WHERE job_evidence.raw_message_id=r.id
+                 )"""
+        ).fetchall()
+        for row in rows:
+            source_text = _raw_source_text(connection, row["raw_message_id"])
+            if not re.search(r"岗位|职位|职务", source_text):
+                continue
+            connection.execute(
+                """UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,
+                   lease_until=NULL,next_attempt_at=NULL,processor=NULL,result_json=NULL,error=NULL,
+                   started_at=NULL,finished_at=NULL,updated_at=? WHERE id=?""",
+                (utc_now(), row["processing_job_id"]),
+            )
+            connection.execute(
+                """UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL
+                   WHERE id=?""",
+                (row["raw_message_id"],),
+            )
+            requeued += 1
+    return requeued
 
 
 def supersede_duplicate_jobs() -> int:
@@ -544,10 +628,11 @@ def deduplicate_all_jobs() -> int:
 
 def repair_existing_catalog() -> dict[str, Any]:
     """Run the one-time historical repair behind a recoverable database backup."""
-    marker = "historical_catalog_repair_v5"
+    marker = "historical_catalog_repair_v6"
     with connect() as connection:
         if connection.execute("SELECT 1 FROM schema_meta WHERE key=?", (marker,)).fetchone():
-            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "events_reassigned": 0, "jobs_created": 0, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": 0, "major_jobs_migrated": 0, "job_majors_cleared": 0}
+            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "events_reassigned": 0, "jobs_created": 0, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": 0, "major_jobs_migrated": 0, "job_majors_cleared": 0, "shared_details_updated": 0, "jobs_requeued": 0}
+        has_previous_catalog_repair = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v5",)).fetchone())
         has_major_job_migration = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v4",)).fetchone())
         has_previous_repair = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v3",)).fetchone())
         counts = {
@@ -556,8 +641,24 @@ def repair_existing_catalog() -> dict[str, Any]:
             "companies": connection.execute("SELECT COUNT(*) AS count FROM companies").fetchone()["count"],
         }
     backup_path = _create_safety_backup() if any(counts.values()) else None
-    if has_major_job_migration:
+    if has_previous_catalog_repair:
+        jobs_created = split_existing_job_lists()
+        shared_details_updated = backfill_recruitment_shared_details()
         major_requirements_updated = backfill_major_requirements()
+        jobs_requeued = requeue_missing_job_sources()
+        with connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
+        return {
+            "status": "repaired", "backup_path": backup_path, "timeline": {}, "events_reassigned": 0,
+            "jobs_created": jobs_created, "jobs_superseded": 0, "tags_updated": 0,
+            "major_requirements_updated": major_requirements_updated, "major_jobs_migrated": 0,
+            "job_majors_cleared": 0, "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued,
+        }
+    if has_major_job_migration:
+        jobs_created = split_existing_job_lists()
+        shared_details_updated = backfill_recruitment_shared_details()
+        major_requirements_updated = backfill_major_requirements()
+        jobs_requeued = requeue_missing_job_sources()
         with connect() as connection:
             connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
         return {
@@ -565,16 +666,21 @@ def repair_existing_catalog() -> dict[str, Any]:
             "backup_path": backup_path,
             "timeline": {},
             "events_reassigned": 0,
-            "jobs_created": 0,
+            "jobs_created": jobs_created,
             "jobs_superseded": 0,
             "tags_updated": 0,
             "major_requirements_updated": major_requirements_updated,
             "major_jobs_migrated": 0,
             "job_majors_cleared": 0,
+            "shared_details_updated": shared_details_updated,
+            "jobs_requeued": jobs_requeued,
         }
     if has_previous_repair:
+        jobs_created = split_existing_job_lists()
+        shared_details_updated = backfill_recruitment_shared_details()
         major_migration = migrate_major_jobs()
         major_requirements_updated = backfill_major_requirements()
+        jobs_requeued = requeue_missing_job_sources()
         with connect() as connection:
             connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
         return {
@@ -582,20 +688,24 @@ def repair_existing_catalog() -> dict[str, Any]:
             "backup_path": backup_path,
             "timeline": {},
             "events_reassigned": 0,
-            "jobs_created": 0,
+            "jobs_created": jobs_created,
             "jobs_superseded": 0,
             "tags_updated": 0,
             "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"],
             "major_jobs_migrated": major_migration["jobs_migrated"],
             "job_majors_cleared": major_migration["job_majors_cleared"],
+            "shared_details_updated": shared_details_updated,
+            "jobs_requeued": jobs_requeued,
         }
     events_reassigned = repair_event_company_assignments()
     jobs_created = split_existing_job_lists()
+    shared_details_updated = backfill_recruitment_shared_details()
     major_migration = migrate_major_jobs()
     major_requirements_updated = backfill_major_requirements()
     timeline = repair_timeline_events()
     jobs_superseded = supersede_duplicate_jobs()
     tags_updated = backfill_company_tags()
+    jobs_requeued = requeue_missing_job_sources()
     with connect() as connection:
         connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
-    return {"status": "repaired", "backup_path": backup_path, "timeline": timeline, "events_reassigned": events_reassigned, "jobs_created": jobs_created, "jobs_superseded": jobs_superseded, "tags_updated": tags_updated, "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"], "major_jobs_migrated": major_migration["jobs_migrated"], "job_majors_cleared": major_migration["job_majors_cleared"]}
+    return {"status": "repaired", "backup_path": backup_path, "timeline": timeline, "events_reassigned": events_reassigned, "jobs_created": jobs_created, "jobs_superseded": jobs_superseded, "tags_updated": tags_updated, "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"], "major_jobs_migrated": major_migration["jobs_migrated"], "job_majors_cleared": major_migration["job_majors_cleared"], "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued}

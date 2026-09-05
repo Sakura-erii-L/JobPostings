@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from pathlib import Path
 
 from app import db
 from app.maintenance import repair_raw_message_times, repair_source_urls, reset_recruitment_data
@@ -471,6 +472,39 @@ def test_image_ocr_uses_local_fallback_only_after_codex_failure(tmp_path, monkey
     assert text == "图片招聘说明\nRapidOCR 兜底文字"
     assert metadata["local_ocr_fallback"] is True
     assert metadata["local_ocr_errors"] == ["local test error"]
+
+
+def test_multiple_page_images_use_one_ordered_codex_ocr_and_retry_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    raw_id = ingest_message({"id": "multi-image", "type": "普通文本", "text": "多图招聘"}, "manual", None)
+    assert raw_id
+    image_two = tmp_path / "linked-image-2.png"
+    image_one = tmp_path / "linked-image-1.png"
+    image_two.write_bytes(b"second-image")
+    image_one.write_bytes(b"first-image")
+    with db.connect() as connection:
+        now = db.utc_now()
+        connection.execute("INSERT INTO artifacts(id,raw_message_id,sha256,path,filename,mime_type,byte_size,ocr_text,qr_values_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("image-2", raw_id, "sha-2", str(image_two), image_two.name, "image/png", 12, "", "[]", now))
+        connection.execute("INSERT INTO artifacts(id,raw_message_id,sha256,path,filename,mime_type,byte_size,ocr_text,qr_values_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("image-1", raw_id, "sha-1", str(image_one), image_one.name, "image/png", 11, "", "[]", now))
+    calls: list[list[str]] = []
+
+    def fake_codex(task, payload, schema, *, job_id, image_paths=None, enable_web=False):
+        calls.append([Path(path).name for path in image_paths or []])
+        return {"text": "一次性 OCR 完整正文", "source_url": "", "notes": ""}
+
+    monkeypatch.setattr("app.codex_agent.run_codex_json", fake_codex)
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    first_text, first_metadata = _extract_source_text(job, raw)
+    refreshed_raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    second_text, second_metadata = _extract_source_text(job, refreshed_raw)
+
+    assert calls == [["linked-image-1.png", "linked-image-2.png"]]
+    assert first_text == second_text == "一次性 OCR 完整正文"
+    assert first_metadata["codex_ocr_image_count"] == 2
+    assert second_metadata["codex_ocr_complete"] is True
 
 
 def test_failed_job_review_keeps_error_original_message_and_logs(tmp_path, monkeypatch):

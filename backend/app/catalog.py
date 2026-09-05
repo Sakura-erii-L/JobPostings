@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .db import connect, one, utc_now
-from .parsers import extract_recruitment_catalog, is_link_message, is_major_like_title, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
+from .parsers import extract_recruitment_catalog, extract_recruitment_shared_details, is_job_category_title, is_link_message, is_major_like_title, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
 
 
 INDUSTRIES = {
@@ -278,11 +278,22 @@ def _raw_source_text(connection: Any, raw_message_id: str | None) -> str:
         if isinstance(content_data, dict) and content_data.get("title"):
             texts.append(str(content_data["title"]))
         texts.append(str(raw["text_content"] or ""))
-    texts.extend(
-        str(row["ocr_text"] or "")
-        for row in connection.execute("SELECT ocr_text FROM artifacts WHERE raw_message_id=?", (raw_message_id,)).fetchall()
+    artifact_rows = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT id,filename,ocr_text,created_at FROM artifacts WHERE raw_message_id=?",
+            (raw_message_id,),
+        ).fetchall()
         if row["ocr_text"]
-    )
+    ]
+
+    def artifact_order(row: dict[str, Any]) -> tuple[int, int, str, str]:
+        match = re.search(r"(?:linked-image|input)-(\d+)", str(row.get("filename") or ""), re.IGNORECASE)
+        if match:
+            return (0, int(match.group(1)), str(row.get("created_at") or ""), str(row.get("id") or ""))
+        return (1, 0, str(row.get("created_at") or ""), str(row.get("id") or ""))
+
+    texts.extend(str(row["ocr_text"] or "") for row in sorted(artifact_rows, key=artifact_order))
     return "\n".join(text for text in texts if text).strip()
 
 
@@ -329,10 +340,10 @@ def _major_requirements_from_jobs(job_values: Any) -> list[str]:
 def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) -> list[dict[str, Any]]:
     model_jobs: list[dict[str, Any]] = []
     for value in job_values or []:
-        if not isinstance(value, dict) or is_non_job_title(value.get("title")):
+        if not isinstance(value, dict) or (is_non_job_title(value.get("title")) and not is_job_category_title(value.get("title"))):
             continue
         for part in _split_job_title_parts(value.get("title")):
-            if is_non_job_title(part) or is_major_like_title(part):
+            if (is_non_job_title(part) and not is_job_category_title(part)) or (is_major_like_title(part) and not is_job_category_title(part)):
                 continue
             model_jobs.append({**dict(value), "title": part, "majors": []})
     expanded: list[dict[str, Any]] = []
@@ -340,9 +351,10 @@ def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) ->
 
     source_titles = [
         title for title in source_catalog.get("job_titles") or []
-        if not is_non_job_title(title) and not is_major_like_title(title)
+        if (not is_non_job_title(title) or is_job_category_title(title))
+        and (not is_major_like_title(title) or is_job_category_title(title))
     ]
-    if len(source_titles) < 2:
+    if not source_titles or (len(source_titles) < 2 and expanded):
         return expanded
     specific = [job for job in expanded if not is_aggregate_job_title(job.get("title"))]
     template = next((job for job in specific), None)
@@ -361,6 +373,43 @@ def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) ->
         if normalize_title(str(job.get("title") or "")) not in {normalize_title(title) for title in source_titles}:
             result.append(job)
     return result
+
+
+def _store_recruitment_shared_details(
+    connection: Any,
+    company_id: str,
+    batch_id: str | None,
+    evidence_id: str | None,
+    raw_message_id: str | None,
+    details: dict[str, Any],
+    observed_at: str,
+) -> str | None:
+    locations = [str(value).strip() for value in details.get("locations") or [] if str(value).strip()]
+    salary = details.get("salary") if isinstance(details.get("salary"), dict) else {}
+    salary = {key: str(value).strip() for key, value in salary.items() if str(value).strip()}
+    if not locations and not salary:
+        return None
+    existing = connection.execute(
+        """SELECT id FROM recruitment_shared_details
+           WHERE company_id=? AND COALESCE(batch_id,'')=COALESCE(?,'') AND COALESCE(raw_message_id,'')=COALESCE(?,'')""",
+        (company_id, batch_id, raw_message_id),
+    ).fetchone()
+    now = utc_now()
+    if existing:
+        connection.execute(
+            """UPDATE recruitment_shared_details SET evidence_id=COALESCE(?,evidence_id),locations_json=?,salary_json=?,
+               observed_at=?,updated_at=? WHERE id=?""",
+            (evidence_id, json_text(list(dict.fromkeys(locations)), []), json_text(salary, {}), observed_at, now, existing["id"]),
+        )
+        return existing["id"]
+    detail_id = str(uuid4())
+    connection.execute(
+        """INSERT INTO recruitment_shared_details(
+               id,company_id,batch_id,evidence_id,raw_message_id,locations_json,salary_json,observed_at,created_at,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (detail_id, company_id, batch_id, evidence_id, raw_message_id, json_text(list(dict.fromkeys(locations)), []), json_text(salary, {}), observed_at, now, now),
+    )
+    return detail_id
 
 
 def _event_title_company_candidate(title: Any) -> str:
@@ -724,6 +773,13 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         if recruitment_type not in RECRUITMENT_TYPES:
             recruitment_type = "unknown"
         batch_id = _batch_for(connection, company_id, item.get("batch") or {}, recruitment_type)
+        source_shared = extract_recruitment_shared_details(_raw_source_text(connection, raw_message_id))
+        model_shared = item.get("shared_job_info") if isinstance(item.get("shared_job_info"), dict) else {}
+        shared_details = {
+            "locations": model_shared.get("locations") or source_shared.get("locations") or [],
+            "salary": model_shared.get("salary") or source_shared.get("salary") or {},
+        }
+        _store_recruitment_shared_details(connection, company_id, batch_id, evidence_id, raw_message_id, shared_details, observed)
         job_ids = [_make_job(connection, company_id, batch_id, job, observed, raw_message_id) for job in job_items]
         title_to_job = {normalize_title(str(job.get("title") or "")): job_id for job, job_id in zip(job_items, job_ids)}
         event_company_ids: list[str] = []

@@ -48,8 +48,10 @@
 - 不得把招聘流程、资格条件、待遇福利、活动说明、日期、毕业届别、学历、专业、学校、地点、网址或二维码生成岗位。
 - 特别禁止把“网申投递、简历筛选、资格初审、测评、面试、体检、正式录用、校招行程、活动安排、活动时间、活动形式、活动对象、行业大咖分享、安家费、事业编制、博士研究生、硕士研究生、某教学楼/会议室、网址”等作为岗位标题。
 - 正文连续列出多个真实岗位时必须逐项输出，不能合并为“岗位列表”“岗位类别”或“具体岗位见原文”。只有确实没有独立岗位名称时，才可保留正文明确给出的概括性岗位。
+- “推荐岗位、招聘岗位、岗位类别、职位类别”等明确岗位栏目中列出的“硬件开发类、软件算法类、测试类、产品类、供应链类”等岗位类别，也属于可展示岗位，必须逐项输出；但“招聘专业、专业需求、对口专业”栏目中的“电气类、机械类、计算机类”等仍是专业，不得输出为岗位。
 - 只有招聘活动而没有明确岗位时，`jobs` 必须为空。
 - 每个岗位分别关注并填写：`title`、`department`、`locations`、`recruitment_type`、`employment_type`、`headcount`、`education`、`experience_requirement`、`salary`、`responsibilities`、`requirements`、`benefits`、`application_methods`、`contacts`、`deadline`。正文未提供的字段使用空字符串、空数组或空的薪资子字段，不能从相邻岗位复制。
+- 如果薪资或工作地点只在招聘信息中统一出现，无法确认对应某个具体岗位，必须写入 `shared_job_info.salary` 或 `shared_job_info.locations`，不得复制到各个 `jobs`。只有原文明示与某个岗位对应时，才填写该岗位的 `salary` 或 `locations`。
 - `recruitment_type` 只能使用 `campus`、`social`、`internship`、`part_time`、`labor`、`unknown`；`employment_type` 优先使用 `full_time`、`internship`、`part_time`、`labor`、`unknown`。
 - 薪资必须保留原始口径：`currency` 填币种，`minimum`/`maximum` 仅在上下限明确时填写，`period` 填月、年、日或小时等周期，完整原文放入 `description`。面议或范围不明时不要猜数字。
 - `application_methods` 保存网申 URL、邮箱、公众号或投递步骤；`contacts` 保存正文明确给出的联系人、电话、邮箱等。不要把普通企业官网自动当作投递入口。

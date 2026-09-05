@@ -1,6 +1,6 @@
 import pytest
 
-from app.parsers import _major_name_catalog, detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, fetch_public_url, is_access_challenge_page, is_link_message, is_major_like_title, is_major_requirement_heading, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
+from app.parsers import _major_name_catalog, detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, fetch_public_url, is_access_challenge_page, is_link_message, is_major_like_title, is_major_requirement_heading, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
 
 
 def test_html_extraction():
@@ -106,6 +106,27 @@ def test_recruitment_catalog_separates_major_names_from_mixed_job_section():
     assert catalog["job_titles"] == ["机械结构设计", "电气控制设计", "软件开发"]
     assert catalog["major_requirements"] == ["软件工程", "计算机科学与技术", "人工智能"]
     assert is_major_requirement_heading("需求专业/方向")
+
+
+def test_inline_recommended_job_categories_and_shared_details_are_extracted():
+    source = """杭州长川科技2027届校招。【推荐岗位】：硬件开发类/软件算法类/机械能源类/仿真类/AI类/测试类/产品类/研发支持类/应用开发类/销服支持类/供应链类/综合职能类等；【岗位地点】：杭州/苏州/成都/上海/南京等；【对口专业】：电子类、机械类、软件类等专业；【年薪范围】：本科：13-25w；硕士：20-40w；博士：50w+。"""
+
+    catalog = extract_recruitment_catalog(source)
+    shared = extract_recruitment_shared_details(source)
+
+    assert catalog["job_titles"] == [
+        "硬件开发类", "软件算法类", "机械能源类", "仿真类", "AI类", "测试类", "产品类",
+        "研发支持类", "应用开发类", "销服支持类", "供应链类", "综合职能类等",
+    ]
+    assert catalog["major_requirements"] == ["电子类、机械类、软件类等专业"]
+    assert shared["locations"] == ["杭州", "苏州", "成都", "上海", "南京"]
+    assert shared["salary"]["description"] == "本科：13-25w；硕士：20-40w；博士：50w+"
+
+
+def test_inline_single_job_title_is_extracted_without_following_fields():
+    catalog = extract_recruitment_catalog("投递指南 职位：芯片与器件设计工程师 岗位意向：数字芯片设计")
+
+    assert catalog["job_titles"] == ["芯片与器件设计工程师"]
 
 
 def test_major_name_catalog_has_exact_names_without_swallowing_job_roles():

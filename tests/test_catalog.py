@@ -4,7 +4,8 @@ from pathlib import Path
 
 from app import db
 from app.catalog import _make_job, _prepare_job_items, apply_model_item, normalize_name, normalize_title, refresh_expiration
-from app.maintenance import migrate_major_jobs, repair_existing_catalog
+from app.maintenance import migrate_major_jobs, repair_existing_catalog, requeue_missing_job_sources
+from app.main import company_detail
 from app.parsers import extract_recruitment_catalog
 from app.processing import ingest_message
 
@@ -62,6 +63,59 @@ def test_catalog_evidence_uses_original_source_url(tmp_path, monkeypatch):
     assert db.one("SELECT source_type FROM evidences WHERE raw_message_id=?", (raw_id,))["source_type"] == "wechat_official_account"
     assert db.one("SELECT source_url FROM company_claims WHERE company_id=(SELECT company_id FROM evidences WHERE raw_message_id=? LIMIT 1)", (raw_id,))["source_url"] == original_url
     assert db.one("SELECT source_type FROM company_claims WHERE company_id=(SELECT company_id FROM evidences WHERE raw_message_id=? LIMIT 1)", (raw_id,))["source_type"] == "wechat_official_account"
+
+
+def test_shared_salary_and_locations_are_stored_separately_from_jobs(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    source = "测试科技招聘。【推荐岗位】：算法类/测试类；【工作地点】：南京/上海；【年薪范围】：20-40w。"
+    raw_id = ingest_message({"id": "shared-details", "type": "普通文本", "text": source}, "manual", None)
+    assert raw_id
+
+    ids = apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "测试科技"},
+            "batch": {"name": "2027 校招", "recruitment_type": "campus"},
+            "shared_job_info": {"locations": ["南京", "上海"], "salary": {"description": "20-40w"}},
+            "jobs": [],
+        },
+        raw_id,
+        "2026-09-05T00:00:00+00:00",
+    )
+
+    assert [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs ORDER BY canonical_title")] == ["测试类", "算法类"]
+    assert all(json.loads(row["locations_json"]) == [] for row in db.all_rows("SELECT locations_json FROM jobs"))
+    detail = db.one("SELECT locations_json,salary_json FROM recruitment_shared_details")
+    assert json.loads(detail["locations_json"]) == ["南京", "上海"]
+    assert json.loads(detail["salary_json"])["description"] == "20-40w"
+    company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("测试科技",))["id"]
+    payload = company_detail(company_id, {})
+    assert payload["recruitment_shared_details"][0]["locations"] == ["南京", "上海"]
+    assert payload["recruitment_shared_details"][0]["salary"]["description"] == "20-40w"
+
+
+def test_successful_source_with_job_clues_and_no_jobs_is_requeued(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    raw_id = ingest_message({"id": "missing-jobs", "type": "普通文本", "text": "测试科技校招，共有十大岗位，详情见招聘图片"}, "manual", None)
+    assert raw_id
+    apply_model_item(
+        {"is_recruitment": True, "company": {"display_name": "测试科技"}, "jobs": []},
+        raw_id,
+        "2026-09-05T00:00:00+00:00",
+    )
+    with db.connect() as connection:
+        connection.execute("UPDATE raw_messages SET is_recruitment=1,recognition_status='succeeded' WHERE id=?", (raw_id,))
+        connection.execute("UPDATE processing_jobs SET status='succeeded',stage='completed' WHERE raw_message_id=? AND kind='classify'", (raw_id,))
+
+    assert requeue_missing_job_sources() == 1
+    assert db.one("SELECT status FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))["status"] == "pending"
+    assert db.one("SELECT recognition_status FROM raw_messages WHERE id=?", (raw_id,))["recognition_status"] == "pending"
 
 
 def test_explicit_job_and_major_sections_are_saved_separately(tmp_path, monkeypatch):
@@ -247,7 +301,7 @@ def test_repair_existing_catalog_upgrades_v3_marker(tmp_path, monkeypatch):
     assert result["status"] == "repaired"
     assert result["jobs_created"] == 0
     assert result["major_jobs_migrated"] == 0
-    assert db.one("SELECT value FROM schema_meta WHERE key=?", ("historical_catalog_repair_v5",))["value"]
+    assert db.one("SELECT value FROM schema_meta WHERE key=?", ("historical_catalog_repair_v6",))["value"]
 
 
 def test_event_summary_does_not_create_venue_company_and_keeps_time(tmp_path, monkeypatch):

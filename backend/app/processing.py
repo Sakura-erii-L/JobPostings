@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -338,10 +339,18 @@ def _stage(job_id: str, stage: str, message: str, processor: str | None = None) 
 
 def _image_artifact_rows(raw_message_id: str) -> list[dict[str, Any]]:
     image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
-    return [
+    rows = [
         row for row in _artifact_rows(raw_message_id)
         if str(row["mime_type"] or "").startswith("image/") or Path(str(row["filename"] or "")).suffix.lower() in image_suffixes
     ]
+
+    def page_order(row: dict[str, Any]) -> tuple[int, int, str, str]:
+        match = re.search(r"(?:linked-image|input)-(\d+)", str(row.get("filename") or ""), re.IGNORECASE)
+        if match:
+            return (0, int(match.group(1)), str(row.get("created_at") or ""), str(row.get("id") or ""))
+        return (1, 0, str(row.get("created_at") or ""), str(row.get("id") or ""))
+
+    return sorted(rows, key=page_order)
 
 
 def _codex_extract(
@@ -356,6 +365,7 @@ def _codex_extract(
 
     artifacts = _image_artifact_rows(raw["id"])
     images = [row["path"] for row in artifacts if row["path"]]
+    artifact_ids = [row["id"] for row in artifacts if row.get("path")]
     artifact = artifacts[-1] if artifacts else None
     payload = {
         "reason": reason,
@@ -363,6 +373,8 @@ def _codex_extract(
         "web_access_status": metadata.get("web_access_status"),
         "url": metadata.get("url"),
         "filename": artifact["filename"] if artifact else metadata.get("filename"),
+        "image_count": len(images),
+        "image_order": [row.get("filename") for row in artifacts if row.get("path")],
         "existing_text": raw.get("text_content") or "",
     }
     schema = {
@@ -380,6 +392,10 @@ def _codex_extract(
         raise RuntimeError("Codex did not extract readable text")
     metadata["codex_ocr"] = bool(primary_ocr or images)
     metadata["ocr_engine"] = "codex" if images else metadata.get("ocr_engine", "")
+    if images:
+        metadata["codex_ocr_complete"] = True
+        metadata["codex_ocr_artifact_ids"] = artifact_ids
+        metadata["codex_ocr_image_count"] = len(images)
     if not primary_ocr:
         metadata["codex_fallback"] = True
     metadata["codex_notes"] = result.get("notes")
@@ -755,25 +771,30 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
             log_processing(job["id"], "extracting", "后端网页提取失败", "warning", {"error": str(exc)})
     image_artifacts = _image_artifact_rows(raw["id"])
     if image_artifacts:
-        try:
-            reason = "公众号页面返回微信环境验证页" if metadata.get("web_access_status") == "challenge" else "图片是主要来源内容"
-            text = _codex_extract(job, raw, metadata, reason, primary_ocr=True)
-            raw["text_content"] = text
-            raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
-        except Exception as exc:
-            metadata["codex_ocr_error"] = str(exc)
-            _stage(job["id"], "local_ocr_fallback", "Codex OCR 失败，改用本地 OCR 兜底", "rapidocr")
-            log_processing(job["id"], "local_ocr_fallback", "Codex OCR 失败，使用本地 OCR 兜底", "warning", {"error": str(exc)})
-            local_text, local_errors = _local_ocr_extract(raw)
-            text = _merge_texts(text, local_text)
-            metadata["local_ocr_fallback"] = True
-            if local_errors:
-                metadata["local_ocr_errors"] = local_errors[:10]
-            if not text or (metadata.get("web_access_status") == "challenge" and not local_text):
-                raise RuntimeError("Codex OCR failed and local OCR fallback returned no text") from exc
-            _persist_raw_extraction(raw["id"], text, metadata)
-            raw["text_content"] = text
-            raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+        current_artifact_ids = [row["id"] for row in image_artifacts if row.get("path")]
+        cached_artifact_ids = metadata.get("codex_ocr_artifact_ids") or []
+        if text and metadata.get("codex_ocr_complete") and cached_artifact_ids == current_artifact_ids:
+            log_processing(job["id"], "codex_ocr_cached", f"复用同页 {len(current_artifact_ids)} 张图片的一次性 OCR 结果")
+        else:
+            try:
+                reason = "公众号页面返回微信环境验证页" if metadata.get("web_access_status") == "challenge" else "图片是主要来源内容"
+                text = _codex_extract(job, raw, metadata, reason, primary_ocr=True)
+                raw["text_content"] = text
+                raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+            except Exception as exc:
+                metadata["codex_ocr_error"] = str(exc)
+                _stage(job["id"], "local_ocr_fallback", "Codex OCR 失败，改用本地 OCR 兜底", "rapidocr")
+                log_processing(job["id"], "local_ocr_fallback", "Codex OCR 失败，使用本地 OCR 兜底", "warning", {"error": str(exc)})
+                local_text, local_errors = _local_ocr_extract(raw)
+                text = _merge_texts(text, local_text)
+                metadata["local_ocr_fallback"] = True
+                if local_errors:
+                    metadata["local_ocr_errors"] = local_errors[:10]
+                if not text or (metadata.get("web_access_status") == "challenge" and not local_text):
+                    raise RuntimeError("Codex OCR failed and local OCR fallback returned no text") from exc
+                _persist_raw_extraction(raw["id"], text, metadata)
+                raw["text_content"] = text
+                raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
     elif not is_text_message(raw["message_type"], metadata):
         if metadata.get("web_access_status") == "challenge":
             text = _codex_extract(job, raw, metadata, "公众号页面返回微信环境验证页")

@@ -221,6 +221,10 @@ _SALARY_SCHEMA = _strict_object({
     "period": _STRING,
     "description": _STRING,
 })
+_SHARED_JOB_INFO_SCHEMA = _strict_object({
+    "locations": _STRING_LIST,
+    "salary": _SALARY_SCHEMA,
+})
 _JOB_SCHEMA = _strict_object({
     "title": _STRING,
     "department": _STRING,
@@ -265,6 +269,7 @@ MODEL_OUTPUT_SCHEMA: dict[str, Any] = _strict_object({
             "decision_reason": _STRING,
             "company": _COMPANY_SCHEMA,
             "batch": _BATCH_SCHEMA,
+            "shared_job_info": _SHARED_JOB_INFO_SCHEMA,
             "jobs": {"type": "array", "items": _JOB_SCHEMA},
             "events": {"type": "array", "items": _EVENT_SCHEMA},
         }),
@@ -418,6 +423,7 @@ def classify_messages(messages: list[dict[str, Any]], job_id: str = "") -> Model
                     "relationship": {"type": "", "related_company_name": ""},
                 },
                 "batch": {"name": "", "year": 0, "season": "", "recruitment_type": "unknown"},
+                "shared_job_info": {"locations": [], "salary": {"currency": "", "minimum": "", "maximum": "", "period": "", "description": ""}},
                 "jobs": [{"title": "", "department": "", "locations": [], "recruitment_type": "unknown", "employment_type": "unknown", "headcount": "", "education": [], "majors": [], "experience_requirement": "", "salary": {"currency": "", "minimum": "", "maximum": "", "period": "", "description": ""}, "responsibilities": "", "requirements": "", "benefits": [], "application_methods": [], "contacts": [], "deadline": ""}],
                 "events": [{"title": "", "company_name": "", "event_type": "presentation", "start_at": "", "end_at": "", "timezone": "Asia/Shanghai", "format": "offline", "city": "", "campus": "", "location": "", "application_url": "", "audience": "", "notes": "", "job_titles": []}]
             }]

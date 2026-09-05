@@ -279,6 +279,18 @@ CREATE TABLE IF NOT EXISTS recruitment_batches (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recruitment_shared_details (
+  id TEXT PRIMARY KEY,
+  company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+  batch_id TEXT REFERENCES recruitment_batches(id) ON DELETE SET NULL,
+  evidence_id TEXT REFERENCES evidences(id) ON DELETE SET NULL,
+  raw_message_id TEXT REFERENCES raw_messages(id) ON DELETE SET NULL,
+  locations_json TEXT NOT NULL DEFAULT '[]',
+  salary_json TEXT NOT NULL DEFAULT '{}',
+  observed_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -467,6 +479,7 @@ CREATE INDEX IF NOT EXISTS idx_tracememo_cache_external_id ON tracememo_message_
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_status ON processing_jobs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_processing_logs_job ON processing_logs(processing_job_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company_id);
+CREATE INDEX IF NOT EXISTS idx_shared_details_company ON recruitment_shared_details(company_id, observed_at);
 CREATE INDEX IF NOT EXISTS idx_claims_company ON company_claims(company_id);
 CREATE INDEX IF NOT EXISTS idx_public_findings_company ON company_public_findings(company_id, retrieved_at);
 CREATE INDEX IF NOT EXISTS idx_recruitment_events_time ON recruitment_events(start_at, company_id);

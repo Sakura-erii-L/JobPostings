@@ -1202,6 +1202,18 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
         ORDER BY CASE WHEN source_type='wechat_group' OR lower(COALESCE(source_url,'')) LIKE '%weixin%' THEN 0 ELSE 1 END,
                  observed_at DESC""", (company_id, company_id))]
     public_findings = [dict(row) for row in all_rows("SELECT id,finding_type,title,summary,source_title,source_url,resolved_url,published_at,severity,retrieved_at FROM company_public_findings WHERE company_id=? ORDER BY retrieved_at DESC", (company_id,))]
+    shared_details = [dict(row) for row in all_rows(
+        """SELECT d.*,b.name AS batch_name,b.year AS batch_year,b.season AS batch_season,
+                  b.recruitment_type,e.source_type,e.source_url
+           FROM recruitment_shared_details d
+           LEFT JOIN recruitment_batches b ON b.id=d.batch_id
+           LEFT JOIN evidences e ON e.id=d.evidence_id
+           WHERE d.company_id=? ORDER BY d.observed_at DESC,d.id""",
+        (company_id,),
+    )]
+    for detail in shared_details:
+        detail["locations"] = json.loads(detail.pop("locations_json") or "[]")
+        detail["salary"] = json.loads(detail.pop("salary_json") or "{}")
     result = dict(company)
     result.pop("manual_overrides_json", None)
     result["aliases"] = json.loads(result.pop("aliases_json"))
@@ -1213,6 +1225,7 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
     result["jobs"] = jobs
     result["evidences"] = evidences
     result["public_findings"] = public_findings
+    result["recruitment_shared_details"] = shared_details
     result["events"] = recruitment_events(company_id=company_id, _=_)
     return result
 
