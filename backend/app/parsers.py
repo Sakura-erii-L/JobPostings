@@ -11,6 +11,7 @@ import re
 import socket
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -20,6 +21,7 @@ import httpx
 
 
 SOURCE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+MAJOR_NAME_CATALOG_PATH = Path(__file__).with_name("data") / "major_names.csv"
 MESSAGE_TIME_FIELDS = (
     "datetime",
     "dateTime",
@@ -360,6 +362,31 @@ _JOB_TITLE_ROLE_SUFFIXES = (
 )
 
 
+def _normalize_major_catalog_name(value: Any) -> str:
+    """Normalize a catalog name without deleting meaningful qualifiers."""
+    text = re.sub(r"\s+", "", str(value or "").strip())
+    text = text.replace("（", "(").replace("）", ")").replace("／", "/")
+    return text.rstrip("*。；;，,").casefold()
+
+
+@lru_cache(maxsize=1)
+def _major_name_catalog() -> frozenset[str]:
+    """Load the user-provided major-name collection once per process."""
+    try:
+        with MAJOR_NAME_CATALOG_PATH.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if "专业名称" not in (reader.fieldnames or []):
+                return frozenset()
+            return frozenset(
+                normalized
+                for row in reader
+                for normalized in [_normalize_major_catalog_name(row.get("专业名称"))]
+                if normalized
+            )
+    except (OSError, UnicodeError, csv.Error):
+        return frozenset()
+
+
 def is_major_like_title(value: Any) -> bool:
     """Return whether a short title looks like an academic major, not a job role."""
     title = re.sub(r"\s+", "", str(value or "").strip("。；;，,"))
@@ -369,6 +396,8 @@ def is_major_like_title(value: Any) -> bool:
         return False
     if title.endswith(_JOB_TITLE_ROLE_SUFFIXES):
         return False
+    if _normalize_major_catalog_name(title) in _major_name_catalog():
+        return True
     return bool(_MAJOR_TITLE_SUFFIX.search(title))
 
 

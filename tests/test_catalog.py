@@ -120,6 +120,7 @@ def test_process_benefits_and_eligibility_are_not_jobs(tmp_path, monkeypatch):
                 {"title": "简历筛选"},
                 {"title": "安家费30-50万元"},
                 {"title": "2027届博士"},
+                {"title": "逻辑学"},
                 {"title": "软件工程师", "majors": ["计算机科学与技术"]},
             ],
         },
@@ -129,7 +130,7 @@ def test_process_benefits_and_eligibility_are_not_jobs(tmp_path, monkeypatch):
     assert len(ids) == 1
     assert [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs")] == ["软件工程师"]
     company = db.one("SELECT major_requirements_json FROM companies WHERE display_name=?", ("字段隔离科技",))
-    assert json.loads(company["major_requirements_json"]) == ["计算机科学与技术"]
+    assert json.loads(company["major_requirements_json"]) == ["计算机科学与技术", "逻辑学"]
     assert json.loads(db.one("SELECT majors_json FROM jobs")["majors_json"]) == []
 
 
@@ -177,16 +178,18 @@ def test_job_details_do_not_expand_valid_model_jobs():
 
 
 def test_major_titles_from_model_jobs_are_kept_out_of_job_catalog():
-    source_catalog = extract_recruitment_catalog("岗位需求\n软件开发、软件工程、计算机科学与技术\n")
+    source_catalog = extract_recruitment_catalog("岗位需求\n软件开发、软件工程、计算机科学与技术、逻辑学\n")
     model_jobs = [
         {"title": "软件开发", "recruitment_type": "campus", "employment_type": "full_time"},
         {"title": "软件工程", "recruitment_type": "campus", "employment_type": "full_time"},
         {"title": "计算机科学与技术", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "逻辑学", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "逻辑学研究员", "recruitment_type": "campus", "employment_type": "full_time"},
     ]
 
     jobs = _prepare_job_items(model_jobs, source_catalog)
 
-    assert [job["title"] for job in jobs] == ["软件开发"]
+    assert [job["title"] for job in jobs] == ["软件开发", "逻辑学研究员"]
 
 
 def test_migrate_legacy_major_jobs_to_company_requirements(tmp_path, monkeypatch):
