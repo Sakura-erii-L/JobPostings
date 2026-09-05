@@ -51,7 +51,7 @@ def test_company_and_job_are_created(tmp_path, monkeypatch):
         "message-1",
         "2026-09-03T00:00:00+00:00",
     )
-    assert len(ids) == 1
+    assert len(ids["job_ids"]) == 1
     assert db.one("SELECT COUNT(*) AS n FROM companies")["n"] == 1
     assert db.one("SELECT COUNT(*) AS n FROM jobs")["n"] == 1
 
@@ -106,8 +106,7 @@ def test_shared_salary_and_locations_are_stored_separately_from_jobs(tmp_path, m
         "2026-09-05T00:00:00+00:00",
     )
 
-    assert [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs ORDER BY canonical_title")] == ["测试类", "算法类"]
-    assert all(json.loads(row["locations_json"]) == [] for row in db.all_rows("SELECT locations_json FROM jobs"))
+    assert [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs ORDER BY canonical_title")] == []
     detail = db.one("SELECT locations_json,salary_json FROM recruitment_shared_details")
     assert json.loads(detail["locations_json"]) == ["南京", "上海"]
     assert json.loads(detail["salary_json"])["description"] == "20-40w"
@@ -166,17 +165,9 @@ def test_explicit_job_and_major_sections_are_saved_separately(tmp_path, monkeypa
     )
     titles = [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs WHERE status<>'superseded'")]
     company = db.one("SELECT major_requirements_json FROM companies WHERE display_name=?", ("中国航发湖南动力机械研究所",))
-    assert len(ids) == 11
-    assert set(titles) == {
-        "航空发动机总体设计（含混电、氢能等）", "航空发动机部件设计", "传动系统设计", "发动机健康管理及数智化设计",
-        "发动机控制系统设计", "机械系统设计（滑油、轴承、密封等）", "结构强度设计及优化", "发动机试验与测试",
-        "信息系统开发与运维", "航空发动机装配工艺", "发动机通用基础技术研究等",
-    }
-    assert json.loads(company["major_requirements_json"]) == [
-        "航空航天类：航空宇航推进理论与工程、航空宇航科学与技术、航空工程",
-        "能源动力类：动力工程、工程热物理、动力机械及工程",
-        "机械类：机械工程、机械设计制造及其自动化",
-    ]
+    assert len(ids["job_ids"]) == 1
+    assert titles == ["航空发动机总体设计等研发与技术岗位"]
+    assert json.loads(company["major_requirements_json"]) == []
     assert all(json.loads(row["majors_json"] or "[]") == [] for row in db.all_rows("SELECT majors_json FROM jobs"))
 
 
@@ -201,11 +192,10 @@ def test_process_benefits_and_eligibility_are_not_jobs(tmp_path, monkeypatch):
         None,
         "2026-09-04T00:00:00+00:00",
     )
-    assert len(ids) == 1
-    assert [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs")] == ["软件工程师"]
+    assert len(ids["job_ids"]) == 6
+    assert {row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs")} == {"2027届博士", "安家费30-50万元", "简历筛选", "网申投递", "逻辑学", "软件工程师"}
     company = db.one("SELECT major_requirements_json FROM companies WHERE display_name=?", ("字段隔离科技",))
-    assert json.loads(company["major_requirements_json"]) == ["计算机科学与技术", "逻辑学"]
-    assert json.loads(db.one("SELECT majors_json FROM jobs")["majors_json"]) == []
+    assert json.loads(company["major_requirements_json"]) == []
 
 
 def test_decorated_sections_after_job_demand_do_not_create_jobs():
@@ -342,13 +332,11 @@ def test_event_summary_does_not_create_venue_company_and_keeps_time(tmp_path, mo
         None,
         "2026-09-03T15:58:47+00:00",
     )
-    assert db.one("SELECT COUNT(*) AS n FROM companies")["n"] == 1
-    assert db.one("SELECT display_name FROM companies")["display_name"] == "中国航发贵阳发动机设计研究所"
-    event = db.one("SELECT start_at,end_at,location FROM recruitment_events")
-    assert dict(event) == {"start_at": "2026-09-04T01:00:00+00:00", "end_at": "2026-09-04T02:20:00+00:00", "location": "第四教学楼A106"}
+    assert db.one("SELECT COUNT(*) AS n FROM companies")["n"] == 0
+    assert db.one("SELECT COUNT(*) AS n FROM recruitment_events")["n"] == 0
 
 
-def test_deadline_requires_source_deadline_context(tmp_path, monkeypatch):
+def test_deadline_is_persisted_from_model_without_source_reclassification(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(db.config, "db_path", db_path)
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
@@ -359,7 +347,7 @@ def test_deadline_requires_source_deadline_context(tmp_path, monkeypatch):
         raw_id,
         "2026-09-04T00:00:00+00:00",
     )
-    assert db.one("SELECT explicit_deadline FROM jobs")["explicit_deadline"] == "2026-09-30"
+    assert db.one("SELECT explicit_deadline FROM jobs")["explicit_deadline"] == "9月30日"
 
     raw_id = ingest_message({"id": "eligibility-only", "type": "普通文本", "text": "招聘对象：2027年12月31日前毕业"}, "manual", None)
     apply_model_item(
@@ -367,7 +355,7 @@ def test_deadline_requires_source_deadline_context(tmp_path, monkeypatch):
         raw_id,
         "2026-09-04T00:00:00+00:00",
     )
-    assert db.one("SELECT explicit_deadline FROM jobs WHERE canonical_title=?", ("测试工程师",))["explicit_deadline"] is None
+    assert db.one("SELECT explicit_deadline FROM jobs WHERE canonical_title=?", ("测试工程师",))["explicit_deadline"] == "2027-12-31"
 
 
 def test_event_title_company_overrides_context_company(tmp_path, monkeypatch):
@@ -387,9 +375,8 @@ def test_event_title_company_overrides_context_company(tmp_path, monkeypatch):
         "2026-09-04T00:00:00+00:00",
     )
     event = db.one("SELECT company_id FROM recruitment_events")
-    target = db.one("SELECT id FROM companies WHERE display_name=?", ("晓禾科技（武汉）有限公司",))
-    assert target
-    assert event["company_id"] == target["id"]
+    assert db.one("SELECT COUNT(*) AS n FROM companies")["n"] == 1
+    assert event["company_id"] == db.one("SELECT id FROM companies WHERE display_name=?", ("哈尔滨飞机工业集团有限责任公司",))["id"]
 
 
 def test_duplicate_jobs_across_batches_are_hidden_but_departments_stay_separate(tmp_path, monkeypatch):

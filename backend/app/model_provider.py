@@ -217,6 +217,45 @@ def validate_schema_payload(value: Any, schema: dict[str, Any], path: str = "$")
             validate_schema_payload(child_value, schema["items"], f"{path}[{index}]")
 
 
+class RecruitmentPayloadValidationError(ValueError):
+    def __init__(self, message: str, payload: Any, invalid_company_entries: list[dict[str, Any]] | None = None):
+        super().__init__(message)
+        self.payload = payload
+        self.invalid_company_entries = invalid_company_entries or []
+
+
+def validate_recruitment_payload(value: Any) -> None:
+    """Validate non-empty recruitment containers without classifying semantics."""
+    if not isinstance(value, dict):
+        raise RecruitmentPayloadValidationError("Recruitment payload must be an object", value)
+    is_recruitment = value.get("is_recruitment")
+    if not isinstance(is_recruitment, bool):
+        raise RecruitmentPayloadValidationError("Recruitment payload is_recruitment must be a boolean", value)
+    companies = value.get("companies")
+    if not isinstance(companies, list):
+        raise RecruitmentPayloadValidationError("Recruitment payload companies must be an array", value)
+    if not is_recruitment and companies:
+        raise RecruitmentPayloadValidationError("Recruitment payload with is_recruitment=false must have companies=[]", value)
+    if is_recruitment and not companies:
+        raise RecruitmentPayloadValidationError("Recruitment payload with is_recruitment=true must contain at least one company", value)
+    for index, entry in enumerate(companies):
+        company = entry.get("company") if isinstance(entry, dict) else None
+        if not isinstance(company, dict):
+            raise RecruitmentPayloadValidationError(
+                f"Recruitment payload company at $.companies[{index}] is missing",
+                value,
+                [{"index": index, "reason": "company is not an object"}],
+            )
+        display_name = str(company.get("display_name") or "").strip()
+        legal_name = str(company.get("legal_name") or "").strip()
+        if not display_name and not legal_name:
+            raise RecruitmentPayloadValidationError(
+                f"Recruitment payload company at $.companies[{index}] has no display_name or legal_name",
+                value,
+                [{"index": index, "reason": "display_name and legal_name are empty"}],
+            )
+
+
 _STRING = {"type": "string"}
 _STRING_LIST = {"type": "array", "items": _STRING}
 _NULLABLE_STRING = {"type": ["string", "null"]}
@@ -390,12 +429,16 @@ def _call_processing_engine(
     if engine == "generic":
         result = _call_model(messages, task_type)
         validate_schema_payload(result.payload, schema)
+        if task_type == "recruitment_extract" and schema is MODEL_OUTPUT_SCHEMA:
+            validate_recruitment_payload(result.payload)
         return result
     from .codex_agent import run_codex_json
 
     prompt = {"messages": [message for message in messages if message.get("role") != "system"]}
     payload = run_codex_json(task_type, prompt, schema, job_id=job_id)
     validate_schema_payload(payload, schema)
+    if task_type == "recruitment_extract" and schema is MODEL_OUTPUT_SCHEMA:
+        validate_recruitment_payload(payload)
     input_tokens = estimate_tokens(json.dumps(prompt, ensure_ascii=False))
     output_tokens = estimate_tokens(json.dumps(payload, ensure_ascii=False))
     result = ModelResult(payload, input_tokens, output_tokens, True, "local_codex", "gpt-5.6-luna")

@@ -5,8 +5,44 @@ from pathlib import Path
 from app import db
 from app.maintenance import repair_raw_message_times, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from app.model_provider import ModelResult, classify_messages
+from app.catalog import apply_model_item
 from app.processing import _extract_source_text, _fail, import_file, ingest_message, log_processing, process_one_batch
 import app.tracememo as tracememo
+
+
+def _classification_payload(company_name: str | None, jobs: list[dict] | None = None, *, is_recruitment: bool = True) -> dict:
+    if not is_recruitment:
+        return {"is_recruitment": False, "decision_reason": "正文不是招聘信息", "companies": []}
+    company = {"display_name": company_name or "", "legal_name": None, "industry_codes": ["ai_data"]}
+    return {
+        "is_recruitment": True,
+        "decision_reason": "正文明确包含招聘信息",
+        "companies": [{
+            "company": company,
+            "recruitment": {
+                "batch": {"name": "2026 春招", "recruitment_type": "campus"},
+                "shared_details": {"locations": [], "salary": None},
+                "jobs": jobs or [],
+                "events": [],
+            },
+        }],
+    }
+
+
+def _run_classification(tmp_path, monkeypatch, payload: dict, text: str = "招聘信息") -> tuple[dict, str]:
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    raw_id = ingest_message({"id": f"result-{len(text)}", "type": "text", "text": text}, "manual", None)
+    assert raw_id
+
+    def fake_classify(messages, job_id=""):
+        return ModelResult(payload=payload, input_tokens=1, output_tokens=1, estimated=True, provider="fake", model="fake")
+
+    monkeypatch.setattr("app.processing.classify_messages", fake_classify)
+    result = process_one_batch()
+    assert result and result["processed"] == 1
+    return result["results"][0], raw_id
 
 
 def test_init_db_migrates_legacy_processing_jobs_before_index(tmp_path, monkeypatch):
@@ -122,14 +158,17 @@ def test_message_processing_creates_catalog_and_consolidation_job(tmp_path, monk
         assert messages[0]["id"] == raw_id
         return ModelResult(
             payload={
-                "items": [{
-                    "message_id": raw_id,
-                    "is_recruitment": True,
-                    "confidence": 0.95,
-                    "company": {"display_name": "测试科技", "industry_codes": ["ai_data"]},
-                    "batch": {"name": "2026 春招", "recruitment_type": "campus"},
-                    "jobs": [{"title": "算法工程师", "locations": ["南京"], "recruitment_type": "campus", "employment_type": "full_time"}],
-                }]
+                "is_recruitment": True,
+                "decision_reason": "正文明确包含招聘岗位",
+                "companies": [{
+                    "company": {"display_name": "测试科技", "legal_name": None, "industry_codes": ["ai_data"]},
+                    "recruitment": {
+                        "batch": {"name": "2026 春招", "recruitment_type": "campus"},
+                        "shared_details": {"locations": [], "salary": None},
+                        "jobs": [{"title": "算法工程师", "locations": ["南京"], "recruitment_type": "campus", "employment_type": "full_time"}],
+                        "events": [],
+                    },
+                }],
             },
             input_tokens=20,
             output_tokens=10,
@@ -146,6 +185,81 @@ def test_message_processing_creates_catalog_and_consolidation_job(tmp_path, monk
     assert db.one("SELECT canonical_title FROM jobs")['canonical_title'] == "算法工程师"
     assert db.one("SELECT source_type FROM evidences WHERE raw_message_id=?", (raw_id,))["source_type"] == "wechat_group"
     assert db.one("SELECT kind FROM processing_jobs WHERE kind='consolidate_company'")["kind"] == "consolidate_company"
+
+
+def test_recruitment_without_companies_goes_to_review(tmp_path, monkeypatch):
+    result, raw_id = _run_classification(tmp_path, monkeypatch, {
+        "is_recruitment": True,
+        "decision_reason": "招聘信息但企业未知",
+        "companies": [],
+    })
+    assert result["status"] == "needs_review"
+    job = db.one("SELECT status,stage,error,result_json FROM processing_jobs WHERE raw_message_id=?", (raw_id,))
+    assert dict(job)["status"] == "needs_review"
+    assert dict(job)["stage"] == "review"
+    assert dict(job)["error"] == "模型判断为招聘信息，但未产生可持久化企业数据"
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 0
+    review = db.one("SELECT payload_json FROM review_items WHERE entity_type='processing_job'")
+    payload = json.loads(review["payload_json"])
+    assert payload["model_result"]["companies"] == []
+    assert payload["original_message"]["id"] == raw_id
+    assert payload["processing_logs"]
+
+
+def test_recruitment_with_blank_company_name_goes_to_review(tmp_path, monkeypatch):
+    result, raw_id = _run_classification(tmp_path, monkeypatch, _classification_payload(""))
+    assert result["status"] == "needs_review"
+    assert db.one("SELECT status FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["status"] == "needs_review"
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 0
+    queue_result = json.loads(db.one("SELECT result_json FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["result_json"])
+    assert queue_result["invalid_company_count"] == 1
+    assert queue_result["invalid_company_entries"] == [{"index": 0, "reason": "display_name and legal_name are empty"}]
+
+
+def test_valid_company_without_jobs_succeeds(tmp_path, monkeypatch):
+    result, raw_id = _run_classification(tmp_path, monkeypatch, _classification_payload("无岗位科技", []))
+    assert result["status"] == "succeeded"
+    assert result["company_count"] == 1
+    assert result["job_count"] == 0
+    stored = json.loads(db.one("SELECT result_json FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["result_json"])
+    assert stored["company_names"] == ["无岗位科技"]
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 1
+    assert db.one("SELECT COUNT(*) AS count FROM jobs")["count"] == 0
+
+
+def test_valid_company_and_jobs_report_counts(tmp_path, monkeypatch):
+    jobs = [
+        {"title": "算法工程师", "locations": ["南京"], "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "测试工程师", "locations": ["上海"], "recruitment_type": "campus", "employment_type": "full_time"},
+    ]
+    result, _ = _run_classification(tmp_path, monkeypatch, _classification_payload("双岗位科技", jobs))
+    assert result["status"] == "succeeded"
+    assert result["company_count"] == 1
+    assert result["job_count"] == 2
+    assert len(result["company_ids"]) == 1
+    assert len(result["job_ids"]) == 2
+
+
+def test_existing_company_is_updated_not_created(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    seeded = apply_model_item(_classification_payload("已有企业科技", []), None, "2026-09-05T00:00:00+00:00")
+    assert seeded["created_company_count"] == 1
+    result, _ = _run_classification(tmp_path, monkeypatch, _classification_payload("已有企业科技", []), text="第二条招聘信息")
+    assert result["status"] == "succeeded"
+    assert result["created_company_count"] == 0
+    assert result["updated_company_count"] == 1
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 1
+
+
+def test_non_recruitment_succeeds_without_company(tmp_path, monkeypatch):
+    result, raw_id = _run_classification(tmp_path, monkeypatch, _classification_payload(None, is_recruitment=False))
+    assert result == {"status": "succeeded", "is_recruitment": False, "id": result["id"]}
+    stored = json.loads(db.one("SELECT result_json FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["result_json"])
+    assert stored["is_recruitment"] is False
+    assert stored["decision_reason"] == "正文不是招聘信息"
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 0
 
 
 def test_ingest_message_updates_external_id_and_requeues_changed_content(tmp_path, monkeypatch):
@@ -362,6 +476,7 @@ def test_wechat_browser_rendered_images_are_processed_after_http_challenge(tmp_p
         return {"id": f"artifact-{len(artifact_calls)}", "text": "图片 OCR 招聘正文", "qr_values": ["https://apply.example.com"]}
 
     monkeypatch.setattr("app.processing.attach_artifact", fake_attach)
+    monkeypatch.setattr("app.processing._codex_extract", lambda *args, **kwargs: "图片 OCR 招聘正文")
     text, metadata = _extract_source_text(job, raw)
     assert "图片 OCR 招聘正文" in text
     assert metadata["browser_attempted"] is True

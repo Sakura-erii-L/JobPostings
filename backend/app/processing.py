@@ -15,7 +15,7 @@ from .browser import fetch_public_browser
 from .catalog import INDUSTRIES, apply_company_overrides, apply_model_item, company_overrides, deduplicate_company_jobs, normalize_company_tags
 from .company_research import execute_company_research
 from .db import connect, one, utc_now
-from .model_provider import classify_messages, consolidate_company_profile, get_setting
+from .model_provider import RecruitmentPayloadValidationError, classify_messages, consolidate_company_profile, get_setting, validate_recruitment_payload
 from .parsers import (
     extract_file,
     fetch_public_http,
@@ -834,6 +834,65 @@ def _finish(job_id: str, result: dict[str, Any]) -> None:
     log_processing(job_id, "completed", "任务处理完成", details=result)
 
 
+def _mark_classification_needs_review(
+    job: dict[str, Any],
+    model_result: dict[str, Any],
+    persistence_result: dict[str, Any],
+    error: str = "模型判断为招聘信息，但未产生可持久化企业数据",
+) -> dict[str, Any]:
+    """Record a model/persistence mismatch without marking the task succeeded."""
+    finished_at = utc_now()
+    queue_result = {
+        "is_recruitment": model_result.get("is_recruitment") is True,
+        "company_count": len(persistence_result.get("company_ids") or []),
+        "company_ids": persistence_result.get("company_ids") or [],
+        "company_names": persistence_result.get("company_names") or [],
+        "job_count": len(persistence_result.get("job_ids") or []),
+        "job_ids": persistence_result.get("job_ids") or [],
+        "created_company_count": persistence_result.get("created_company_count", 0),
+        "updated_company_count": persistence_result.get("updated_company_count", 0),
+        "invalid_company_count": persistence_result.get("invalid_company_count", 0),
+        "error": error,
+    }
+    if persistence_result.get("invalid_company_entries"):
+        queue_result["invalid_company_entries"] = persistence_result["invalid_company_entries"]
+    if persistence_result.get("validation_error"):
+        queue_result["validation_error"] = persistence_result["validation_error"]
+    with connect() as connection:
+        connection.execute(
+            """UPDATE processing_jobs
+               SET status='needs_review',stage='review',lease_until=NULL,error=?,result_json=?,finished_at=?,updated_at=?
+               WHERE id=?""",
+            (error, json.dumps(queue_result, ensure_ascii=False), finished_at, finished_at, job["id"]),
+        )
+    _set_recognition_status(job.get("raw_message_id"), "needs_review", error)
+    log_processing(
+        job["id"],
+        "review",
+        error,
+        "error",
+        {"persistence_result": persistence_result},
+    )
+    review_payload = _review_context(job["id"], job.get("raw_message_id"), job.get("company_id"))
+    review_payload.update({
+        "error": {"type": "persistence_error", "message": error},
+        "model_result": model_result,
+        "persistence_result": persistence_result,
+    })
+    with connect() as connection:
+        connection.execute(
+            "INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+            (str(uuid4()), "processing_failed", "processing_job", job["id"], json.dumps(review_payload, ensure_ascii=False), finished_at),
+        )
+    return {
+        "status": "needs_review",
+        "is_recruitment": model_result.get("is_recruitment") is True,
+        "error": error,
+        "persistence": persistence_result,
+        "id": job["id"],
+    }
+
+
 def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
     error = str(exc)
     current = one("SELECT status,cancel_requested,attempts FROM processing_jobs WHERE id=?", (job["id"],))
@@ -987,6 +1046,7 @@ def _classify_source(job: dict[str, Any], message: dict[str, Any]) -> dict[str, 
             result = classify_messages([part])
         if not isinstance(result.payload, dict) or "companies" not in result.payload:
             raise ValueError(f"Model response did not contain the required Schema for chunk {index}")
+        validate_recruitment_payload(result.payload)
         extracted.append(result.payload)
     return _merge_extracted_items(extracted)
 
@@ -1004,7 +1064,7 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
     if is_system_message(raw["message_type"], raw.get("text_content") or "", raw_metadata):
         with connect() as connection:
             connection.execute("UPDATE raw_messages SET is_recruitment=0 WHERE id=?", (raw["id"],))
-        _finish(job["id"], {"is_recruitment": False, "reason": "system_message_filtered"})
+        _finish(job["id"], {"is_recruitment": False, "decision_reason": "system_message_filtered"})
         job_status = one("SELECT status FROM processing_jobs WHERE id=?", (job["id"],))
         if job_status and job_status["status"] == "succeeded":
             _set_recognition_status(raw["id"], "filtered")
@@ -1017,19 +1077,69 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
     processor = "local_codex:gpt-5.6-luna" if engine == "codex" else "generic_llm"
     _stage(job["id"], "classifying", "开始判断招聘信息并提取统一结构", processor)
     message = {"id": raw["id"], "sent_at": raw["sent_at"], "message_type": raw["message_type"], "text": text, "metadata": metadata}
-    item = _classify_source(job, message)
+    try:
+        item = _classify_source(job, message)
+    except RecruitmentPayloadValidationError as exc:
+        with connect() as connection:
+            connection.execute(
+                "UPDATE raw_messages SET is_recruitment=? WHERE id=?",
+                (1 if isinstance(exc.payload, dict) and exc.payload.get("is_recruitment") else 0, raw["id"]),
+            )
+        return _mark_classification_needs_review(
+            job,
+            exc.payload if isinstance(exc.payload, dict) else {},
+            {
+                "company_ids": [],
+                "job_ids": [],
+                "company_names": [],
+                "created_company_count": 0,
+                "updated_company_count": 0,
+                "invalid_company_entries": list(exc.invalid_company_entries),
+                "invalid_company_count": len(exc.invalid_company_entries),
+                "validation_error": str(exc),
+            },
+            error=(
+                "模型判断为招聘信息，但未产生可持久化企业数据"
+                if isinstance(exc.payload, dict) and exc.payload.get("is_recruitment") is True
+                else f"模型结果结构一致性校验失败：{exc}"
+            ),
+        )
     if not _still_active(job["id"]):
         _set_recognition_status(raw["id"], "canceled")
         return {"status": "canceled", "id": job["id"]}
     with connect() as connection:
         connection.execute("UPDATE raw_messages SET is_recruitment=? WHERE id=?", (1 if item.get("is_recruitment") else 0, raw["id"]))
     if not item.get("is_recruitment"):
-        _finish(job["id"], {"is_recruitment": False, "reason": item.get("decision_reason", "")})
+        _finish(job["id"], {"is_recruitment": False, "decision_reason": item.get("decision_reason", "")})
         return {"status": "succeeded", "is_recruitment": False, "id": job["id"]}
     _stage(job["id"], "persisting", "写入企业、岗位、时间轴与来源证据")
-    job_ids = apply_model_item(item, raw["id"], raw["sent_at"])
-    _finish(job["id"], {"is_recruitment": True, "jobs": job_ids, "processor": processor})
-    return {"status": "succeeded", "is_recruitment": True, "jobs": len(job_ids), "id": job["id"]}
+    persistence_result = apply_model_item(item, raw["id"], raw["sent_at"])
+    if persistence_result.get("invalid_company_entries"):
+        log_processing(
+            job["id"],
+            "persisting",
+            "部分企业结果无效，未写入这些企业",
+            "warning",
+            {"invalid_company_entries": persistence_result["invalid_company_entries"]},
+        )
+    if not persistence_result.get("company_ids"):
+        return _mark_classification_needs_review(job, item, persistence_result)
+    result = {
+        "is_recruitment": True,
+        "company_count": len(persistence_result["company_ids"]),
+        "company_ids": persistence_result["company_ids"],
+        "company_names": persistence_result["company_names"],
+        "job_count": len(persistence_result["job_ids"]),
+        "job_ids": persistence_result["job_ids"],
+        "created_company_count": persistence_result.get("created_company_count", 0),
+        "updated_company_count": persistence_result.get("updated_company_count", 0),
+        "invalid_company_count": persistence_result.get("invalid_company_count", 0),
+        "processor": processor,
+    }
+    if persistence_result.get("invalid_company_entries"):
+        result["invalid_company_entries"] = persistence_result["invalid_company_entries"]
+    _finish(job["id"], result)
+    return {"status": "succeeded", **result, "id": job["id"]}
 
 
 def _process_company_consolidation(job: dict[str, Any]) -> dict[str, Any]:

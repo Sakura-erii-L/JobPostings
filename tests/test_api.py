@@ -152,14 +152,16 @@ def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
         assert job
         with db.connect() as connection:
             connection.execute(
-                "UPDATE processing_jobs SET status='needs_review',error='test failure',updated_at=? WHERE id=?",
-                ("2026-09-04T00:00:00+00:00", job["id"]),
+                "UPDATE processing_jobs SET status='needs_review',error='test failure',result_json=?,updated_at=? WHERE id=?",
+                (json.dumps({"is_recruitment": True, "company_count": 0, "job_count": 0}), "2026-09-04T00:00:00+00:00", job["id"]),
             )
 
         queue = client.get("/api/v1/admin/processing-queue?status=needs_review")
         assert queue.status_code == 200
         assert queue.json()["items"][0]["raw_message_id"] == raw_message_id
         assert queue.json()["items"][0]["text_preview"].startswith("锦浪科技")
+        assert queue.json()["items"][0]["result_json"] == '{"is_recruitment": true, "company_count": 0, "job_count": 0}'
+        assert queue.json()["items"][0]["result"] == {"is_recruitment": True, "company_count": 0, "job_count": 0}
 
         canceled = client.post("/api/v1/admin/processing-queue/cancel", json={"ids": [job["id"]]})
         assert canceled.status_code == 200

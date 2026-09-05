@@ -647,9 +647,18 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
     return job_id
 
 
-def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_at: str | None) -> list[str]:
+def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_at: str | None) -> dict[str, Any]:
+    persistence: dict[str, Any] = {
+        "company_ids": [],
+        "job_ids": [],
+        "company_names": [],
+        "created_company_count": 0,
+        "updated_company_count": 0,
+        "invalid_company_entries": [],
+        "invalid_company_count": 0,
+    }
     if not item.get("is_recruitment"):
-        return []
+        return persistence
     # Mechanical compatibility for explicitly supplied legacy callers.  This
     # does not inspect source text or classify any value; normal model output
     # always arrives through the strict ``companies`` schema.
@@ -676,9 +685,11 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
     observed = observed_at or utc_now()
     company_items = item.get("companies") if isinstance(item.get("companies"), list) else []
     if not company_items:
-        return []
+        return persistence
     all_job_ids: list[str] = []
     persisted_company_ids: list[str] = []
+    created_company_ids: set[str] = set()
+    updated_company_ids: set[str] = set()
     with connect() as connection:
         raw_row = connection.execute("SELECT connector_id,message_type,metadata_json FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone() if raw_message_id else None
         metadata: dict[str, Any] = {}
@@ -692,20 +703,35 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             source_type = source_type_for_url(recover_original_source_url(metadata.get("source_url") or metadata.get("url")) or "")
         source_url = recover_original_source_url(metadata.get("source_url") or metadata.get("url"))
         artifact_id = metadata.get("artifact_id")
-        for company_entry in company_items:
+        initial_company_ids = {row["id"] for row in connection.execute("SELECT id FROM companies").fetchall()}
+        for index, company_entry in enumerate(company_items):
             if not isinstance(company_entry, dict):
+                persistence["invalid_company_entries"].append({"index": index, "reason": "company entry is not an object"})
                 continue
-            company = dict(company_entry.get("company") or {})
-            recruitment = dict(company_entry.get("recruitment") or {})
+            raw_company = company_entry.get("company")
+            if not isinstance(raw_company, dict):
+                persistence["invalid_company_entries"].append({"index": index, "reason": "company is not an object"})
+                continue
+            company = dict(raw_company)
+            raw_recruitment = company_entry.get("recruitment")
+            if raw_recruitment is not None and not isinstance(raw_recruitment, dict):
+                persistence["invalid_company_entries"].append({"index": index, "reason": "recruitment is not an object"})
+                continue
+            recruitment = dict(raw_recruitment or {})
             company_name = str(company.get("display_name") or company.get("legal_name") or "").strip()
             if not company_name:
+                persistence["invalid_company_entries"].append({"index": index, "reason": "display_name and legal_name are empty"})
                 continue
             industry_codes = list(dict.fromkeys([
-                value for value in [company.get("primary_industry"), *(company.get("secondary_industries") or [])]
+                value for value in [*(company.get("industry_codes") or []), company.get("primary_industry"), *(company.get("secondary_industries") or [])]
                 if isinstance(value, str) and value.strip()
             ]))
             company["industry_codes"] = industry_codes
             company_id = _company_for(connection, company)
+            if company_id in initial_company_ids:
+                updated_company_ids.add(company_id)
+            else:
+                created_company_ids.add(company_id)
             persisted_company_ids.append(company_id)
             _record_company_relationship(connection, company_id, company.get("relationship") or {})
             evidence_id = str(uuid4())
@@ -753,7 +779,18 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             from .company_research import queue_company_research_in_connection
             queue_company_research_in_connection(connection, company_id)
             deduplicate_company_jobs(connection, company_id)
-    return all_job_ids
+    persistence["company_ids"] = list(dict.fromkeys(persisted_company_ids))
+    persistence["job_ids"] = list(dict.fromkeys(all_job_ids))
+    persistence["created_company_count"] = len(created_company_ids)
+    persistence["updated_company_count"] = len(updated_company_ids)
+    persistence["company_names"] = list(dict.fromkeys(
+        str((entry.get("company") or {}).get("display_name") or (entry.get("company") or {}).get("legal_name") or "").strip()
+        for entry in company_items
+        if isinstance(entry, dict) and isinstance(entry.get("company"), dict)
+        and str((entry.get("company") or {}).get("display_name") or (entry.get("company") or {}).get("legal_name") or "").strip()
+    ))
+    persistence["invalid_company_count"] = len(persistence["invalid_company_entries"])
+    return persistence
 
 
 def _merge_event(

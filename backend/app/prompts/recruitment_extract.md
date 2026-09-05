@@ -30,6 +30,7 @@
 
 - `recruitment.batch` 只填写正文明确的招聘批次。
 - `shared_details` 保存无法明确归属于单个岗位的企业级信息，包括工作地点、统一薪资、目标毕业年份、学历要求、专业要求、投递地址、截止日期、流程和福利。
+- `shared_details.application_url` 只填写正文明确给出的统一投递地址；岗位或活动专属地址分别写入对应字段。
 - 例如“工作地点：南京、上海、苏州”只能写入 `shared_details.locations`，不能复制到岗位标题或岗位字段。
 
 ## 岗位识别
@@ -39,6 +40,7 @@
 - “算法工程师、测试工程师”是岗位；“研发、营销、产品与设计”等只有在正文明确作为职位类别/岗位类别列出时才可作为岗位类别保留。
 - “南京、上海、苏州”只能写入 `locations`；“南京研发中心”默认不是岗位；“软件工程”只能写入 `major_requirements`；“简历筛选、面试、体检”只能写入 `shared_details.process`。
 - 每个岗位只填写能够明确归属于该岗位的信息。不能确认属于某岗位的内容必须留在 `shared_details` 或留空。
+- 岗位的 `employment_type`、`recruitment_type`、`deadline` 等字段只填写正文明确归属该岗位的值。
 - 一个来源列出多个真实岗位时必须全部保留；没有明确岗位时 `jobs=[]`，不得创建占位岗位。
 - `responsibilities`、`requirements`、`education_requirements`、`major_requirements` 都是列表，逐项保留原文含义，不要把专业改写成岗位。
 

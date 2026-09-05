@@ -996,7 +996,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     rows = all_rows(
         f"""
         SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
-               p.cancel_requested,p.processor,p.error,p.created_at,p.updated_at,p.started_at,p.finished_at,
+               p.cancel_requested,p.processor,p.error,p.result_json,p.created_at,p.updated_at,p.started_at,p.finished_at,
                r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,r.recognition_status,r.recognized_at,r.recognition_error,
                substr(COALESCE(r.text_content,''),1,240) AS text_preview,
                sg.name AS source_group_name
@@ -1014,7 +1014,19 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         stats[row["status"]] = row["count"]
     control = one("SELECT state,updated_at FROM queue_control WHERE id=1")
     total_row = one(f"SELECT COUNT(*) AS count FROM processing_jobs p {where}", tuple(query_params))
-    return {"state": control["state"] if control else "paused", "state_updated_at": control["updated_at"] if control else None, "stats": stats, "items": [dict(row) for row in rows], "total": total_row["count"] if total_row else 0}
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        raw_result = item.get("result_json")
+        if raw_result:
+            try:
+                item["result"] = json.loads(raw_result)
+            except (TypeError, json.JSONDecodeError):
+                item["result"] = None
+        else:
+            item["result"] = None
+        items.append(item)
+    return {"state": control["state"] if control else "paused", "state_updated_at": control["updated_at"] if control else None, "stats": stats, "items": items, "total": total_row["count"] if total_row else 0}
 
 
 @app.post("/api/v1/admin/processing-queue/control")

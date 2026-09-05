@@ -15,8 +15,8 @@ EXPECTED_TASKS = {
 }
 REQUIRED_GUIDANCE = {
     "recruitment_extract": (
-        "message_id", "decision_reason", "matched_company_id", "major_requirements",
-        "employment_type", "batch.year", "deadline", "start_at", "application_url",
+        "decision_reason", "companies", "shared_details", "major_requirements",
+        "employment_type", "batch", "deadline", "application_url", "display_name",
     ),
     "company_consolidation": (
         "decision=normal", "decision=abnormal", "conflicts", "unsupported_claims", "summary",
