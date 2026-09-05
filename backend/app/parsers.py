@@ -283,10 +283,35 @@ def extract_event_datetime_candidates(text: str, timezone_name: str = "Asia/Shan
     return candidates
 
 
+_CATALOG_SECTION_BOUNDARIES = {
+    "我们是谁", "公司简介", "公司介绍", "企业简介", "企业介绍", "公司概况", "企业概况",
+    "主营业务", "公司业务", "企业业务", "工作地点", "办公地点", "岗位地点", "招聘地点",
+    "企业福利", "公司福利", "薪酬福利", "福利待遇", "招聘流程", "应聘流程", "招聘行程",
+    "投递方式", "报名方式", "申请方式", "网申链接", "联系方式", "工作内容", "职位描述",
+    "岗位职责", "职位职责", "任职要求", "岗位要求", "职位要求", "需求背景", "专业需求",
+    "需求专业", "专业要求", "招聘专业", "专业类别", "面向专业", "关于我们", "岗位需求",
+    "职位需求", "招收岗位", "招聘方向", "需求学科", "所需专业", "专业方向", "岗位专业",
+}
+
+
+def _is_catalog_section_boundary(line: str) -> bool:
+    value = line.strip()
+    if not value:
+        return False
+    numbered = re.match(r"^(?:[一二三四五六七八九十百]+|\d+)[、.．:：]\s*(\S.*)$", value)
+    if numbered:
+        label = numbered.group(1).strip()
+        return bool(re.match(r"(?:招聘|岗位|职位|专业|需求|企业|公司|工作|地点|福利|流程|报名|投递|申请|联系方式|关于|说明|要求|待遇|网申)", label))
+    value = re.sub(r"^[^\w\u4e00-\u9fff【\[]+", "", value).strip()
+    if value.startswith(("【", "[")) and value.endswith(("】", "]")):
+        value = value[1:-1].strip()
+    label = re.split(r"[:：]", value, maxsplit=1)[0].strip().strip("【】[]")
+    return label in _CATALOG_SECTION_BOUNDARIES or label.startswith("关于")
+
+
 def _catalog_section(text: str, heading_pattern: str) -> str:
     lines = text.replace("\r", "").split("\n")
     heading = re.compile(heading_pattern, re.IGNORECASE)
-    numbered_heading = re.compile(r"^\s*(?:[一二三四五六七八九十百]+|\d+)[、.．:：]\s*\S+")
     start = None
     for index, line in enumerate(lines):
         if heading.search(line.strip()):
@@ -296,7 +321,7 @@ def _catalog_section(text: str, heading_pattern: str) -> str:
         return ""
     end = len(lines)
     for index in range(start, len(lines)):
-        if numbered_heading.match(lines[index].strip()):
+        if _is_catalog_section_boundary(lines[index]):
             end = index
             break
     return "\n".join(lines[start:end]).strip()
@@ -324,6 +349,43 @@ def _split_top_level(text: str, separators: str) -> list[str]:
     return values
 
 
+_MAJOR_TITLE_SUFFIX = re.compile(
+    r"(?:类|类别|专业|方向|科学与技术|工程热物理|工程及其自动化|及其自动化|"
+    r"工程|数学|物理学?|化学|生物学?|力学|自动化|人工智能|计算机|通信|"
+    r"电子信息|仪器|兵器|航空航天|航空宇航|材料|能源动力|信息技术|信息系统|科学)$"
+)
+_JOB_TITLE_ROLE_SUFFIXES = (
+    "工程师", "设计师", "开发工程师", "研发工程师", "测试工程师", "技术员", "研究员",
+    "经理", "主管", "专员", "助理", "顾问", "开发", "研发", "测试", "运维",
+)
+
+
+def is_major_like_title(value: Any) -> bool:
+    """Return whether a short title looks like an academic major, not a job role."""
+    title = re.sub(r"\s+", "", str(value or "").strip("。；;，,"))
+    if len(title) < 2 or len(title) > 80:
+        return False
+    if re.search(r"20\d{2}届|应届|博士|硕士|本科|招聘|岗位|职位", title):
+        return False
+    if title.endswith(_JOB_TITLE_ROLE_SUFFIXES):
+        return False
+    return bool(_MAJOR_TITLE_SUFFIX.search(title))
+
+
+def is_major_requirement_heading(value: Any) -> bool:
+    """Return whether a value is a section label rather than a major name."""
+    title = re.sub(r"\s+", "", str(value or "").strip("。；;，,"))
+    if not title:
+        return True
+    if title in {"专业需求", "需求学科", "所需专业", "面向专业", "专业方向", "岗位专业"}:
+        return True
+    if title.replace("｜", "|") in {"专业类别|专业名称", "专业类别|专业方向"}:
+        return True
+    return bool(re.fullmatch(r"(?:(?:需求|招聘|岗位)?)专业(?:类别|名称|方向)?(?:[/|｜](?:类别|名称|方向)?)?[:：]?", title)) or bool(
+        re.fullmatch(r"(?:专业类别|专业名称|需求专业|专业要求)[:：]?", title)
+    )
+
+
 def extract_recruitment_catalog(text: str) -> dict[str, list[str]]:
     """Extract explicit job and major lists from a recruitment source."""
     if not text:
@@ -331,21 +393,30 @@ def extract_recruitment_catalog(text: str) -> dict[str, list[str]]:
     job_section = _catalog_section(text, r"(?:招聘岗位|招聘职位|岗位需求|职位需求|招收岗位|招聘方向)")
     major_section = _catalog_section(text, r"(?:需求专业|专业需求|专业要求|招聘专业|专业类别|需求学科|所需专业|面向专业|专业方向|岗位专业)")
     job_titles: list[str] = []
+    inferred_major_requirements: list[str] = []
     for line in job_section.splitlines():
         clean = re.sub(r"^\s*(?:[•·●▪■\-—]|\d+[.)、])\s*", "", line).strip()
         if not clean:
             continue
-        job_titles.extend(_split_top_level(clean, "、；;•·，"))
-    job_titles = list(dict.fromkeys(value for value in job_titles if 2 <= len(value) <= 120))
+        for value in _split_top_level(clean, "、；;•·，"):
+            if is_major_requirement_heading(value):
+                continue
+            if is_major_like_title(value):
+                inferred_major_requirements.append(value.rstrip("。；;"))
+            else:
+                job_titles.append(value)
+    job_titles = list(dict.fromkeys(value for value in job_titles if 2 <= len(value) <= 120 and not re.search(r"20\d{2}届|应届|博士|硕士|本科", value)))
 
     major_requirements: list[str] = []
     for line in major_section.splitlines():
         clean = re.sub(r"^\s*(?:[•·●▪■\-—]|\d+[.)、])\s*", "", line).strip()
-        if not clean or clean.replace("｜", "|") in {"专业类别|专业名称", "专业类别|专业方向"}:
-            continue
-        if re.fullmatch(r"(?:专业类别|专业名称|需求专业|专业要求)[:：]?", clean):
+        if is_major_requirement_heading(clean):
             continue
         major_requirements.append(clean.rstrip("。；;"))
+    major_requirements = list(dict.fromkeys([
+        *major_requirements,
+        *inferred_major_requirements,
+    ]))
     major_requirements = list(dict.fromkeys(value for value in major_requirements if 2 <= len(value) <= 500))
     return {"job_titles": job_titles, "major_requirements": major_requirements}
 

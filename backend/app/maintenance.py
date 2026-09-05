@@ -11,7 +11,7 @@ from uuid import uuid4
 from .config import config
 from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title
 from .db import connect, utc_now
-from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, is_wechat_public_url, normalize_event_datetime, parse_message_time, recover_original_source_url
+from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, is_major_like_title, is_major_requirement_heading, is_wechat_public_url, normalize_event_datetime, parse_message_time, recover_original_source_url
 
 
 # Imported recruitment content and its derived catalog are reset together so
@@ -360,6 +360,9 @@ def backfill_major_requirements() -> int:
                 existing = json.loads(company["major_requirements_json"] or "[]")
             except (TypeError, json.JSONDecodeError):
                 existing = []
+            if not isinstance(existing, list):
+                existing = []
+            existing = [str(value).strip() for value in existing if not is_major_requirement_heading(value)]
             raw_ids = connection.execute(
                 """SELECT DISTINCT e.raw_message_id FROM evidences e
                    WHERE e.company_id=? OR e.job_id IN (SELECT id FROM jobs WHERE company_id=?)""",
@@ -369,12 +372,62 @@ def backfill_major_requirements() -> int:
             for raw in raw_ids:
                 catalog = extract_recruitment_catalog(_raw_source_text(connection, raw["raw_message_id"]))
                 discovered.extend(catalog.get("major_requirements") or [])
-            merged = list(dict.fromkeys([*existing, *discovered]))
+            merged = list(dict.fromkeys([
+                *existing,
+                *(value for value in discovered if not is_major_requirement_heading(value)),
+            ]))
             encoded = json.dumps(merged, ensure_ascii=False)
             if encoded != company["major_requirements_json"]:
                 connection.execute("UPDATE companies SET major_requirements_json=?,updated_at=? WHERE id=?", (encoded, utc_now(), company["id"]))
                 updated += 1
     return updated
+
+
+def migrate_major_jobs() -> dict[str, int]:
+    """Move legacy academic-major rows out of the active job catalog."""
+    result = {"jobs_migrated": 0, "job_majors_cleared": 0, "major_requirements_updated": 0}
+    with connect() as connection:
+        companies = connection.execute("SELECT id,major_requirements_json FROM companies").fetchall()
+        for company in companies:
+            try:
+                major_requirements = json.loads(company["major_requirements_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                major_requirements = []
+            if not isinstance(major_requirements, list):
+                major_requirements = []
+            original_major_requirements = list(major_requirements)
+            jobs = connection.execute(
+                "SELECT id,canonical_title,majors_json FROM jobs WHERE company_id=? AND status<>'superseded'",
+                (company["id"],),
+            ).fetchall()
+            for job in jobs:
+                try:
+                    job_majors = json.loads(job["majors_json"] or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    job_majors = []
+                if isinstance(job_majors, list):
+                    for major in job_majors:
+                        value = str(major or "").strip()
+                        if value and value not in major_requirements:
+                            major_requirements.append(value)
+                if is_major_like_title(job["canonical_title"]):
+                    title = str(job["canonical_title"] or "").strip()
+                    if title and title not in major_requirements:
+                        major_requirements.append(title)
+                    connection.execute("UPDATE jobs SET status='superseded',updated_at=? WHERE id=?", (utc_now(), job["id"]))
+                    connection.execute("UPDATE evidences SET company_id=?,job_id=NULL WHERE job_id=?", (company["id"], job["id"]))
+                    connection.execute("DELETE FROM search_index WHERE entity_type='job' AND entity_id=?", (job["id"],))
+                    result["jobs_migrated"] += 1
+                elif isinstance(job_majors, list) and job_majors:
+                    connection.execute("UPDATE jobs SET majors_json='[]',updated_at=? WHERE id=?", (utc_now(), job["id"]))
+                    result["job_majors_cleared"] += 1
+            if major_requirements != original_major_requirements:
+                connection.execute(
+                    "UPDATE companies SET major_requirements_json=?,updated_at=? WHERE id=?",
+                    (json.dumps(major_requirements, ensure_ascii=False), utc_now(), company["id"]),
+                )
+                result["major_requirements_updated"] += 1
+    return result
 
 
 def split_existing_job_lists() -> int:
@@ -491,22 +544,58 @@ def deduplicate_all_jobs() -> int:
 
 def repair_existing_catalog() -> dict[str, Any]:
     """Run the one-time historical repair behind a recoverable database backup."""
-    marker = "historical_catalog_repair_v3"
+    marker = "historical_catalog_repair_v5"
     with connect() as connection:
         if connection.execute("SELECT 1 FROM schema_meta WHERE key=?", (marker,)).fetchone():
-            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "events_reassigned": 0, "jobs_created": 0, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": 0}
+            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "events_reassigned": 0, "jobs_created": 0, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": 0, "major_jobs_migrated": 0, "job_majors_cleared": 0}
+        has_major_job_migration = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v4",)).fetchone())
+        has_previous_repair = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v3",)).fetchone())
         counts = {
             "events": connection.execute("SELECT COUNT(*) AS count FROM recruitment_events").fetchone()["count"],
             "jobs": connection.execute("SELECT COUNT(*) AS count FROM jobs").fetchone()["count"],
             "companies": connection.execute("SELECT COUNT(*) AS count FROM companies").fetchone()["count"],
         }
     backup_path = _create_safety_backup() if any(counts.values()) else None
+    if has_major_job_migration:
+        major_requirements_updated = backfill_major_requirements()
+        with connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
+        return {
+            "status": "repaired",
+            "backup_path": backup_path,
+            "timeline": {},
+            "events_reassigned": 0,
+            "jobs_created": 0,
+            "jobs_superseded": 0,
+            "tags_updated": 0,
+            "major_requirements_updated": major_requirements_updated,
+            "major_jobs_migrated": 0,
+            "job_majors_cleared": 0,
+        }
+    if has_previous_repair:
+        major_migration = migrate_major_jobs()
+        major_requirements_updated = backfill_major_requirements()
+        with connect() as connection:
+            connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
+        return {
+            "status": "repaired",
+            "backup_path": backup_path,
+            "timeline": {},
+            "events_reassigned": 0,
+            "jobs_created": 0,
+            "jobs_superseded": 0,
+            "tags_updated": 0,
+            "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"],
+            "major_jobs_migrated": major_migration["jobs_migrated"],
+            "job_majors_cleared": major_migration["job_majors_cleared"],
+        }
     events_reassigned = repair_event_company_assignments()
     jobs_created = split_existing_job_lists()
+    major_migration = migrate_major_jobs()
     major_requirements_updated = backfill_major_requirements()
     timeline = repair_timeline_events()
     jobs_superseded = supersede_duplicate_jobs()
     tags_updated = backfill_company_tags()
     with connect() as connection:
         connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
-    return {"status": "repaired", "backup_path": backup_path, "timeline": timeline, "events_reassigned": events_reassigned, "jobs_created": jobs_created, "jobs_superseded": jobs_superseded, "tags_updated": tags_updated, "major_requirements_updated": major_requirements_updated}
+    return {"status": "repaired", "backup_path": backup_path, "timeline": timeline, "events_reassigned": events_reassigned, "jobs_created": jobs_created, "jobs_superseded": jobs_superseded, "tags_updated": tags_updated, "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"], "major_jobs_migrated": major_migration["jobs_migrated"], "job_majors_cleared": major_migration["job_majors_cleared"]}

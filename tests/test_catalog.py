@@ -3,7 +3,9 @@ import tempfile
 from pathlib import Path
 
 from app import db
-from app.catalog import apply_model_item, normalize_name, normalize_title, refresh_expiration
+from app.catalog import _make_job, _prepare_job_items, apply_model_item, normalize_name, normalize_title, refresh_expiration
+from app.maintenance import migrate_major_jobs, repair_existing_catalog
+from app.parsers import extract_recruitment_catalog
 from app.processing import ingest_message
 
 
@@ -129,6 +131,120 @@ def test_process_benefits_and_eligibility_are_not_jobs(tmp_path, monkeypatch):
     company = db.one("SELECT major_requirements_json FROM companies WHERE display_name=?", ("字段隔离科技",))
     assert json.loads(company["major_requirements_json"]) == ["计算机科学与技术"]
     assert json.loads(db.one("SELECT majors_json FROM jobs")["majors_json"]) == []
+
+
+def test_decorated_sections_after_job_demand_do_not_create_jobs():
+    source = """汇川技术2027届秋季校园招聘
+✅【岗位需求】
+💫2027届国内外应届毕业生💫
+电气类、自动化类、机械类、通信类、计算机类、工业管理类等类别专业
+📍【工作地点】
+苏州、西安、南京、深圳、上海、岳阳、日本等海内外多个城市
+👔【企业福利】
+工作双休，14天超长春节假期；
+食堂价格亲民，班车接送；
+快来加入汇川，推进工业文明，共创美好生活！
+"""
+    source_catalog = extract_recruitment_catalog(source)
+
+    assert _prepare_job_items([], source_catalog) == []
+
+
+def test_job_details_do_not_expand_valid_model_jobs():
+    source = """【新凯来 XKL 2027届秋招内推】
+1. 招聘岗位及要求
+软件开发工程师
+工作内容：
+负责数据分析、仿真建模类产品后端软件交付的全生命周期开发，主导相关产品软件算法设计、功能开发。
+软件测试工程师
+岗位职责
+1、测试和维护半导体设备平台软件。
+算法技术工程师
+需求背景：物理、数学、光学等理工科专业。
+2. 关于新凯来 (XKL)
+行业定位：半导体行业新锐。
+"""
+    model_jobs = [
+        {"title": "软件开发工程师", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "软件测试工程师", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "算法技术工程师", "recruitment_type": "campus", "employment_type": "full_time"},
+    ]
+
+    source_catalog = extract_recruitment_catalog(source)
+    titles = [job["title"] for job in _prepare_job_items(model_jobs, source_catalog)]
+
+    assert titles == ["软件开发工程师", "软件测试工程师", "算法技术工程师"]
+
+
+def test_major_titles_from_model_jobs_are_kept_out_of_job_catalog():
+    source_catalog = extract_recruitment_catalog("岗位需求\n软件开发、软件工程、计算机科学与技术\n")
+    model_jobs = [
+        {"title": "软件开发", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "软件工程", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "计算机科学与技术", "recruitment_type": "campus", "employment_type": "full_time"},
+    ]
+
+    jobs = _prepare_job_items(model_jobs, source_catalog)
+
+    assert [job["title"] for job in jobs] == ["软件开发"]
+
+
+def test_migrate_legacy_major_jobs_to_company_requirements(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "历史目录科技", "industry_codes": ["ai_data"]},
+            "jobs": [{"title": "软件开发", "recruitment_type": "campus", "employment_type": "full_time"}],
+        },
+        None,
+        "2026-09-05T00:00:00+00:00",
+    )
+    company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("历史目录科技",))["id"]
+    with db.connect() as connection:
+        _make_job(
+            connection,
+            company_id,
+            None,
+            {"title": "软件开发", "majors": ["计算机科学与技术"], "recruitment_type": "campus", "employment_type": "full_time"},
+            "2026-09-05T00:00:00+00:00",
+            None,
+        )
+        _make_job(
+            connection,
+            company_id,
+            None,
+            {"title": "软件工程", "recruitment_type": "campus", "employment_type": "full_time"},
+            "2026-09-05T00:00:00+00:00",
+            None,
+        )
+
+    result = migrate_major_jobs()
+
+    assert result == {"jobs_migrated": 1, "job_majors_cleared": 1, "major_requirements_updated": 1}
+    assert [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs WHERE status<>'superseded'")] == ["软件开发"]
+    assert json.loads(db.one("SELECT majors_json FROM jobs WHERE canonical_title='软件开发'")["majors_json"]) == []
+    company = db.one("SELECT major_requirements_json FROM companies WHERE id=?", (company_id,))
+    assert json.loads(company["major_requirements_json"]) == ["计算机科学与技术", "软件工程"]
+
+
+def test_repair_existing_catalog_upgrades_v3_marker(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    with db.connect() as connection:
+        connection.execute("INSERT INTO schema_meta(key,value) VALUES(?,?)", ("historical_catalog_repair_v3", "done"))
+
+    result = repair_existing_catalog()
+
+    assert result["status"] == "repaired"
+    assert result["jobs_created"] == 0
+    assert result["major_jobs_migrated"] == 0
+    assert db.one("SELECT value FROM schema_meta WHERE key=?", ("historical_catalog_repair_v5",))["value"]
 
 
 def test_event_summary_does_not_create_venue_company_and_keeps_time(tmp_path, monkeypatch):

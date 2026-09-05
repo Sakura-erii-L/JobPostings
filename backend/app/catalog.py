@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .db import connect, one, utc_now
-from .parsers import extract_recruitment_catalog, is_link_message, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
+from .parsers import extract_recruitment_catalog, is_link_message, is_major_like_title, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
 
 
 INDUSTRIES = {
@@ -286,40 +286,62 @@ def _raw_source_text(connection: Any, raw_message_id: str | None) -> str:
     return "\n".join(text for text in texts if text).strip()
 
 
-def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) -> list[dict[str, Any]]:
-    model_jobs = [
-        dict(value)
-        for value in job_values or []
-        if isinstance(value, dict) and not is_non_job_title(value.get("title"))
-    ]
-    expanded: list[dict[str, Any]] = []
-    for job in model_jobs:
-        title = str(job.get("title") or "").strip()
-        parts: list[str] = []
-        if title:
-            current: list[str] = []
-            depth = 0
-            for character in title:
-                if character in "（(【[":
-                    depth += 1
-                elif character in "）)】]" and depth:
-                    depth -= 1
-                if character in "、；;•·，" and depth == 0:
-                    value = "".join(current).strip()
-                    if value:
-                        parts.append(value)
-                    current = []
-                else:
-                    current.append(character)
-            value = "".join(current).strip()
-            if value:
-                parts.append(value)
-        for part in parts or [title]:
-            if is_non_job_title(part):
-                continue
-            expanded.append({**job, "title": part, "majors": []})
+def _split_job_title_parts(value: Any) -> list[str]:
+    title = str(value or "").strip()
+    if not title:
+        return []
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for character in title:
+        if character in "（(【[":
+            depth += 1
+        elif character in "）)】]" and depth:
+            depth -= 1
+        if character in "、；;•·，" and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+        else:
+            current.append(character)
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
 
-    source_titles = [title for title in source_catalog.get("job_titles") or [] if not is_non_job_title(title)]
+
+def _major_requirements_from_jobs(job_values: Any) -> list[str]:
+    requirements: list[str] = []
+    for value in job_values or []:
+        if not isinstance(value, dict):
+            continue
+        for major in value.get("majors") or []:
+            text = str(major or "").strip()
+            if text:
+                requirements.append(text)
+        for title in _split_job_title_parts(value.get("title")):
+            if is_major_like_title(title):
+                requirements.append(title.rstrip("。；;"))
+    return list(dict.fromkeys(requirements))
+
+
+def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) -> list[dict[str, Any]]:
+    model_jobs: list[dict[str, Any]] = []
+    for value in job_values or []:
+        if not isinstance(value, dict) or is_non_job_title(value.get("title")):
+            continue
+        for part in _split_job_title_parts(value.get("title")):
+            if is_non_job_title(part) or is_major_like_title(part):
+                continue
+            model_jobs.append({**dict(value), "title": part, "majors": []})
+    expanded: list[dict[str, Any]] = []
+    expanded.extend(model_jobs)
+
+    source_titles = [
+        title for title in source_catalog.get("job_titles") or []
+        if not is_non_job_title(title) and not is_major_like_title(title)
+    ]
     if len(source_titles) < 2:
         return expanded
     specific = [job for job in expanded if not is_aggregate_job_title(job.get("title"))]
@@ -655,7 +677,7 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         company["major_requirements"] = list(dict.fromkeys([
             *(company.get("major_requirements") or []),
             *(source_catalog.get("major_requirements") or []),
-            *(major for job in item.get("jobs") or [] if isinstance(job, dict) for major in (job.get("majors") or [])),
+            *_major_requirements_from_jobs(item.get("jobs") or []),
         ]))
         job_items = _prepare_job_items(item.get("jobs") or [], source_catalog)
         matched_company_id = str(company.get("matched_company_id") or "").strip()

@@ -1,6 +1,6 @@
 import pytest
 
-from app.parsers import detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, fetch_public_url, is_access_challenge_page, is_link_message, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
+from app.parsers import detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, fetch_public_url, is_access_challenge_page, is_link_message, is_major_requirement_heading, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
 
 
 def test_html_extraction():
@@ -93,3 +93,16 @@ def test_month_day_and_recruitment_catalog_are_extracted():
 """)
     assert catalog["job_titles"] == ["航空发动机总体设计", "航空发动机部件设计", "传动系统设计"]
     assert catalog["major_requirements"] == ["航空航天类：航空宇航推进理论与工程、航空宇航科学与技术", "能源动力类：动力工程、工程热物理"]
+
+
+def test_recruitment_catalog_separates_major_names_from_mixed_job_section():
+    catalog = extract_recruitment_catalog("""岗位需求
+机械结构设计、电气控制设计、软件开发
+软件工程、计算机科学与技术、人工智能
+工作地点
+西安
+""")
+
+    assert catalog["job_titles"] == ["机械结构设计", "电气控制设计", "软件开发"]
+    assert catalog["major_requirements"] == ["软件工程", "计算机科学与技术", "人工智能"]
+    assert is_major_requirement_heading("需求专业/方向")
