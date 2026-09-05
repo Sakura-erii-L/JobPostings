@@ -287,6 +287,13 @@ CREATE TABLE IF NOT EXISTS recruitment_shared_details (
   raw_message_id TEXT REFERENCES raw_messages(id) ON DELETE SET NULL,
   locations_json TEXT NOT NULL DEFAULT '[]',
   salary_json TEXT NOT NULL DEFAULT '{}',
+  target_graduation_years_json TEXT NOT NULL DEFAULT '[]',
+  education_requirements_json TEXT NOT NULL DEFAULT '[]',
+  major_requirements_json TEXT NOT NULL DEFAULT '[]',
+  application_url TEXT,
+  deadline TEXT,
+  process_json TEXT NOT NULL DEFAULT '[]',
+  benefits_json TEXT NOT NULL DEFAULT '[]',
   observed_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -540,6 +547,15 @@ def init_db() -> None:
                 "last_consolidated_at": "TEXT",
                 "public_researched_at": "TEXT",
             },
+            "recruitment_shared_details": {
+                "target_graduation_years_json": "TEXT NOT NULL DEFAULT '[]'",
+                "education_requirements_json": "TEXT NOT NULL DEFAULT '[]'",
+                "major_requirements_json": "TEXT NOT NULL DEFAULT '[]'",
+                "application_url": "TEXT",
+                "deadline": "TEXT",
+                "process_json": "TEXT NOT NULL DEFAULT '[]'",
+                "benefits_json": "TEXT NOT NULL DEFAULT '[]'",
+            },
         }
         for table, columns in migrations.items():
             existing_columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
@@ -576,7 +592,7 @@ def init_db() -> None:
             (utc_now(),),
         )
         connection.execute(
-            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '3')"
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '4')"
         )
         connection.execute(
             """INSERT OR IGNORE INTO system_settings(key, value_json, updated_at)

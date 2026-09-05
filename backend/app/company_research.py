@@ -111,7 +111,8 @@ def ensure_company_research_jobs(force: bool = False, company_ids: list[str] | N
                 now = utc_now()
                 connection.execute(
                     """UPDATE processing_jobs SET status='pending',stage='research_queued',attempts=0,
-                       lease_until=NULL,next_attempt_at=NULL,cancel_requested=0,error=NULL,finished_at=NULL,updated_at=? WHERE id=?""",
+                       lease_until=NULL,next_attempt_at=NULL,cancel_requested=0,error=NULL,processor=NULL,
+                       result_json=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE id=?""",
                     (now, stale["id"]),
                 )
                 result["queued"] += 1

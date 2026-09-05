@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 
 from app import db
-from app.catalog import _make_job, _prepare_job_items, apply_model_item, is_location_like_title, normalize_name, normalize_title, refresh_expiration
+from app.catalog import _make_job, _prepare_job_items, apply_model_item, is_location_like_title, normalize_name, normalize_text_value, normalize_title, refresh_expiration
 from app.maintenance import migrate_major_jobs, repair_existing_catalog, requeue_missing_job_sources
 from app.main import company_detail
 from app.parsers import extract_recruitment_catalog
@@ -32,7 +32,7 @@ def test_location_labels_and_location_lists_are_not_jobs():
     ]
 
     jobs = _prepare_job_items(model_jobs)
-    assert [job["title"] for job in jobs] == [item["title"] for item in model_jobs]
+    assert [job["title"] for job in jobs] == [normalize_text_value(item["title"]) for item in model_jobs]
 
 
 def test_company_and_job_are_created(tmp_path, monkeypatch):
@@ -114,6 +114,103 @@ def test_shared_salary_and_locations_are_stored_separately_from_jobs(tmp_path, m
     payload = company_detail(company_id, {})
     assert payload["recruitment_shared_details"][0]["locations"] == ["南京", "上海"]
     assert payload["recruitment_shared_details"][0]["salary"]["description"] == "20-40w"
+
+
+def test_shared_details_all_model_fields_are_persisted_and_returned(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    shared = {
+        "locations": ["南京", "上海"],
+        "salary": {"currency": "CNY", "minimum": "20", "maximum": "40", "period": "年", "description": "20-40w"},
+        "target_graduation_years": [2026, 2027],
+        "education_requirements": ["本科", "硕士"],
+        "major_requirements": ["软件工程", "计算机科学与技术"],
+        "application_url": "https://jobs.example.com/apply",
+        "deadline": "2026-09-30",
+        "process": ["简历筛选", "面试", "体检"],
+        "benefits": ["五险一金", "餐补"],
+    }
+    result = apply_model_item(
+        {
+            "is_recruitment": True,
+            "companies": [{
+                "company": {"display_name": "完整字段科技"},
+                "recruitment": {
+                    "batch": {"name": "2026 校招", "year": 2026, "season": "秋季", "recruitment_type": "campus"},
+                    "shared_details": shared,
+                    "jobs": [],
+                    "events": [],
+                },
+            }],
+        },
+        None,
+        "2026-09-05T00:00:00+00:00",
+    )
+    assert len(result["company_ids"]) == 1
+    row = db.one("SELECT * FROM recruitment_shared_details")
+    assert json.loads(row["locations_json"]) == shared["locations"]
+    assert json.loads(row["salary_json"]) == shared["salary"]
+    assert json.loads(row["target_graduation_years_json"]) == shared["target_graduation_years"]
+    assert json.loads(row["education_requirements_json"]) == shared["education_requirements"]
+    assert json.loads(row["major_requirements_json"]) == shared["major_requirements"]
+    assert row["application_url"] == shared["application_url"]
+    assert row["deadline"] == shared["deadline"]
+    assert json.loads(row["process_json"]) == shared["process"]
+    assert json.loads(row["benefits_json"]) == shared["benefits"]
+    detail = company_detail(result["company_ids"][0], {})["recruitment_shared_details"][0]
+    for field in ("locations", "salary", "target_graduation_years", "education_requirements", "major_requirements", "application_url", "deadline", "process", "benefits"):
+        assert detail[field] == shared[field]
+
+
+def test_structured_fields_are_mechanically_cleaned_without_dropping_subject_terms(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    result = apply_model_item(
+        {
+            "is_recruitment": True,
+            "companies": [{
+                "company": {
+                    "display_name": "  华为　 ",
+                    "legal_name": " 华为技术有限公司 ",
+                    "aliases": [" 华为 ", "华为", "  "] ,
+                },
+                "recruitment": {
+                    "batch": {"name": " 2026 校招 ", "year": 2026, "season": " 秋季 " , "recruitment_type": "campus"},
+                    "shared_details": {
+                        "locations": [" 南京 ", "南京", "上海\t"],
+                        "salary": None,
+                        "target_graduation_years": [],
+                        "education_requirements": [],
+                        "major_requirements": [],
+                        "application_url": " https://jobs.example.com/a?x=1 ",
+                        "deadline": " 9月30日 ",
+                        "process": [" 简历筛选 ", "简历筛选"],
+                        "benefits": [],
+                    },
+                    "jobs": [{"title": " 算法　工程师 ", "locations": [" 南京 ", "南京"]}],
+                    "events": [],
+                },
+            }],
+        },
+        None,
+        "2026-09-05T00:00:00+00:00",
+    )
+    company = db.one("SELECT display_name,legal_name,aliases_json FROM companies WHERE id=?", (result["company_ids"][0],))
+    assert company["display_name"] == "华为"
+    assert company["legal_name"] == "华为技术有限公司"
+    assert json.loads(company["aliases_json"]) == ["华为"]
+    shared = db.one("SELECT locations_json,application_url,deadline,process_json FROM recruitment_shared_details")
+    assert json.loads(shared["locations_json"]) == ["南京", "上海"]
+    assert shared["application_url"] == "https://jobs.example.com/a?x=1"
+    assert shared["deadline"] == "9月30日"
+    assert json.loads(shared["process_json"]) == ["简历筛选"]
+    job = db.one("SELECT canonical_title,locations_json FROM jobs")
+    assert job["canonical_title"] == "算法 工程师"
+    assert json.loads(job["locations_json"]) == ["南京"]
 
 
 def test_successful_source_with_job_clues_and_no_jobs_is_requeued(tmp_path, monkeypatch):
@@ -356,6 +453,31 @@ def test_deadline_is_persisted_from_model_without_source_reclassification(tmp_pa
         "2026-09-04T00:00:00+00:00",
     )
     assert db.one("SELECT explicit_deadline FROM jobs WHERE canonical_title=?", ("测试工程师",))["explicit_deadline"] == "2027-12-31"
+    apply_model_item(
+        {"is_recruitment": True, "company": {"display_name": "ISO过期科技"}, "jobs": [
+            {"title": "过期工程师", "deadline": "2020-01-01"},
+            {"title": "无年份工程师", "deadline": "9月30日"},
+        ]},
+        None,
+        "2026-09-04T00:00:00+00:00",
+    )
+    statuses = {row["canonical_title"]: row["status"] for row in db.all_rows("SELECT canonical_title,status FROM jobs WHERE company_id=(SELECT id FROM companies WHERE display_name='ISO过期科技')")}
+    assert statuses == {"过期工程师": "expired", "无年份工程师": "active"}
+
+
+def test_batch_identity_keeps_year_and_season_distinct_but_reuses_exact_duplicate(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    base = {"is_recruitment": True, "companies": [{"company": {"display_name": "批次测试科技"}, "recruitment": {"shared_details": {"locations": [], "salary": None}, "jobs": [], "events": []}}]}
+    for year, season in ((2026, "春季"), (2026, "秋季"), (2027, "春季"), (2026, "春季")):
+        entry = {**base["companies"][0], "recruitment": {**base["companies"][0]["recruitment"], "batch": {"name": "校园招聘", "year": year, "season": season, "recruitment_type": "campus"}}}
+        apply_model_item({**base, "companies": [entry]}, None, "2026-09-05T00:00:00+00:00")
+    company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("批次测试科技",))["id"]
+    batches = db.all_rows("SELECT name,year,season,recruitment_type FROM recruitment_batches WHERE company_id=? ORDER BY year,season", (company_id,))
+    assert len(batches) == 3
+    assert {(row["year"], row["season"]) for row in batches} == {(2026, "春季"), (2026, "秋季"), (2027, "春季")}
 
 
 def test_event_title_company_overrides_context_company(tmp_path, monkeypatch):

@@ -240,6 +240,30 @@ def test_valid_company_and_jobs_report_counts(tmp_path, monkeypatch):
     assert len(result["job_ids"]) == 2
 
 
+def test_long_text_chunks_merge_anonymous_followup_without_needs_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    first = _classification_payload("长文本分块科技", [])
+    second = _classification_payload("", [{"title": "后续算法工程师"}])
+    payloads = [first, second]
+    calls = []
+
+    def fake_classify(messages, job_id=""):
+        calls.append(messages[0]["text"])
+        return ModelResult(payload=payloads[len(calls) - 1], input_tokens=1, output_tokens=1, estimated=True, provider="fake", model="fake")
+
+    monkeypatch.setattr("app.processing.classify_messages", fake_classify)
+    raw_id = ingest_message({"id": "long-source", "type": "text", "text": "企业介绍\n\n" + ("第一段内容 " * 7_000) + "\n\n岗位说明\n" + ("后续内容 " * 5_000)}, "manual", None)
+    assert raw_id
+    result = process_one_batch()
+    assert result and result["results"][0]["status"] == "succeeded"
+    assert len(calls) == 2
+    assert db.one("SELECT COUNT(*) AS count FROM companies") ["count"] == 1
+    assert db.one("SELECT canonical_title FROM jobs") ["canonical_title"] == "后续算法工程师"
+    assert db.one("SELECT status FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))["status"] == "succeeded"
+
+
 def test_existing_company_is_updated_not_created(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")

@@ -429,16 +429,12 @@ def _call_processing_engine(
     if engine == "generic":
         result = _call_model(messages, task_type)
         validate_schema_payload(result.payload, schema)
-        if task_type == "recruitment_extract" and schema is MODEL_OUTPUT_SCHEMA:
-            validate_recruitment_payload(result.payload)
         return result
     from .codex_agent import run_codex_json
 
     prompt = {"messages": [message for message in messages if message.get("role") != "system"]}
     payload = run_codex_json(task_type, prompt, schema, job_id=job_id)
     validate_schema_payload(payload, schema)
-    if task_type == "recruitment_extract" and schema is MODEL_OUTPUT_SCHEMA:
-        validate_recruitment_payload(payload)
     input_tokens = estimate_tokens(json.dumps(prompt, ensure_ascii=False))
     output_tokens = estimate_tokens(json.dumps(payload, ensure_ascii=False))
     result = ModelResult(payload, input_tokens, output_tokens, True, "local_codex", "gpt-5.6-luna")

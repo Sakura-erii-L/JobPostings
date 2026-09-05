@@ -18,7 +18,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from .auth import authenticate_password, create_session, initial_admin_password_required, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_initial_admin_password, set_user_password, verify_code
 from .backups import WebDAVClient, _backup_credentials, create_backup, list_backups, validate_remote_backup
-from .catalog import COMPANY_OVERRIDE_COLUMNS, INDUSTRIES, apply_company_overrides, company_overrides, refresh_expiration
+from .catalog import COMPANY_OVERRIDE_COLUMNS, INDUSTRIES, _parse_reliable_datetime, apply_company_overrides, company_overrides, refresh_expiration
 from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
@@ -209,15 +209,16 @@ async def notification_loop() -> None:
         try:
             now = datetime.now(timezone.utc)
             rows = all_rows(
-                "SELECT s.user_id,j.id,j.canonical_title,j.explicit_deadline,c.display_name FROM user_job_states s JOIN jobs j ON j.id=s.job_id JOIN companies c ON c.id=j.company_id WHERE s.favorite=1 AND j.explicit_deadline IS NOT NULL AND j.explicit_deadline>=? AND j.explicit_deadline<=?",
-                (now.date().isoformat(), (now + timedelta(days=7)).date().isoformat()),
+                "SELECT s.user_id,j.id,j.canonical_title,j.explicit_deadline,c.display_name FROM user_job_states s JOIN jobs j ON j.id=s.job_id JOIN companies c ON c.id=j.company_id WHERE s.favorite=1 AND j.explicit_deadline IS NOT NULL",
             )
             with connect() as connection:
                 for row in rows:
                     day = str(row["explicit_deadline"])
-                    try:
-                        days_left = (datetime.fromisoformat(day).date() - now.date()).days
-                    except ValueError:
+                    deadline = _parse_reliable_datetime(day)
+                    if deadline is None:
+                        continue
+                    days_left = (deadline.date() - now.date()).days
+                    if days_left < 0 or days_left > 7:
                         continue
                     if days_left not in {7, 3, 1}:
                         continue
@@ -608,7 +609,7 @@ async def lifespan(app: FastAPI):
     SecretVault()
     with connect() as connection:
         connection.execute(
-            "UPDATE processing_jobs SET status='pending',stage='queued',lease_until=NULL,updated_at=? WHERE status='running' AND cancel_requested=0",
+            "UPDATE processing_jobs SET status='pending',stage='queued',lease_until=NULL,processor=NULL,result_json=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE status='running' AND cancel_requested=0",
             (utc_now(),),
         )
         connection.execute(
@@ -1012,6 +1013,20 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     stats = {name: 0 for name in allowed_statuses}
     for row in all_rows("SELECT status,COUNT(*) AS count FROM processing_jobs GROUP BY status"):
         stats[row["status"]] = row["count"]
+    def empty_stats() -> dict[str, int]:
+        return {name: 0 for name in allowed_statuses}
+
+    stats_by_kind: dict[str, dict[str, int]] = {}
+    for row in all_rows("SELECT kind,status,COUNT(*) AS count FROM processing_jobs GROUP BY kind,status"):
+        stats_by_kind.setdefault(row["kind"], empty_stats())[row["status"]] = row["count"]
+    source_recognition = stats_by_kind.get("classify", empty_stats())
+    background_by_kind = {
+        kind: values for kind, values in stats_by_kind.items() if kind != "classify"
+    }
+    background_tasks = empty_stats()
+    for values in background_by_kind.values():
+        for name in allowed_statuses:
+            background_tasks[name] += values.get(name, 0)
     control = one("SELECT state,updated_at FROM queue_control WHERE id=1")
     total_row = one(f"SELECT COUNT(*) AS count FROM processing_jobs p {where}", tuple(query_params))
     items: list[dict[str, Any]] = []
@@ -1026,7 +1041,17 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         else:
             item["result"] = None
         items.append(item)
-    return {"state": control["state"] if control else "paused", "state_updated_at": control["updated_at"] if control else None, "stats": stats, "items": items, "total": total_row["count"] if total_row else 0}
+    return {
+        "state": control["state"] if control else "paused",
+        "state_updated_at": control["updated_at"] if control else None,
+        "stats": stats,
+        "stats_by_kind": stats_by_kind,
+        "source_recognition": source_recognition,
+        "background_tasks": background_tasks,
+        "background_by_kind": background_by_kind,
+        "items": items,
+        "total": total_row["count"] if total_row else 0,
+    }
 
 
 @app.post("/api/v1/admin/processing-queue/control")
@@ -1145,7 +1170,7 @@ def update_processing_text(job_id: str, body: QueueTextRequest, _: dict[str, Any
             "UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL WHERE id=?",
             (job["raw_message_id"],),
         )
-        connection.execute("UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,error=NULL,next_attempt_at=NULL,finished_at=NULL,updated_at=? WHERE id=?", (utc_now(), job_id))
+        connection.execute("UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,error=NULL,next_attempt_at=NULL,lease_until=NULL,processor=NULL,result_json=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE id=?", (utc_now(), job_id))
     return {"id": job_id, "status": "pending"}
 
 
@@ -1158,7 +1183,7 @@ def retry_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin)
         raise HTTPException(409, "Only failed processing jobs can be retried")
     with connect() as connection:
         connection.execute(
-            "UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,lease_until=NULL,next_attempt_at=NULL,error=NULL,finished_at=NULL,updated_at=? WHERE id=?",
+            "UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,lease_until=NULL,next_attempt_at=NULL,processor=NULL,result_json=NULL,started_at=NULL,finished_at=NULL,error=NULL,updated_at=? WHERE id=?",
             (utc_now(), job_id),
         )
         connection.execute(
@@ -1246,8 +1271,21 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
         (company_id,),
     )]
     for detail in shared_details:
-        detail["locations"] = json.loads(detail.pop("locations_json") or "[]")
-        detail["salary"] = json.loads(detail.pop("salary_json") or "{}")
+        json_fields = {
+            "locations_json": ("locations", []),
+            "salary_json": ("salary", {}),
+            "target_graduation_years_json": ("target_graduation_years", []),
+            "education_requirements_json": ("education_requirements", []),
+            "major_requirements_json": ("major_requirements", []),
+            "process_json": ("process", []),
+            "benefits_json": ("benefits", []),
+        }
+        for column, (field, default) in json_fields.items():
+            raw_value = detail.pop(column, None)
+            try:
+                detail[field] = json.loads(raw_value or json.dumps(default, ensure_ascii=False))
+            except (TypeError, json.JSONDecodeError):
+                detail[field] = default
     result = dict(company)
     result.pop("manual_overrides_json", None)
     result["aliases"] = json.loads(result.pop("aliases_json"))

@@ -152,7 +152,7 @@ def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
         assert job
         with db.connect() as connection:
             connection.execute(
-                "UPDATE processing_jobs SET status='needs_review',error='test failure',result_json=?,updated_at=? WHERE id=?",
+                "UPDATE processing_jobs SET status='needs_review',error='test failure',result_json=?,processor='old',started_at='old-start',finished_at='old-finish',lease_until='old-lease',updated_at=? WHERE id=?",
                 (json.dumps({"is_recruitment": True, "company_count": 0, "job_count": 0}), "2026-09-04T00:00:00+00:00", job["id"]),
             )
 
@@ -180,6 +180,8 @@ def test_processing_queue_lists_and_retries_failed_jobs(tmp_path, monkeypatch):
         assert retried.status_code == 200
         assert retried.json() == {"id": job["id"], "status": "pending"}
         assert db.one("SELECT recognition_status FROM raw_messages WHERE id=?", (raw_message_id,))["recognition_status"] == "pending"
+        cleared = db.one("SELECT result_json,processor,started_at,finished_at,lease_until FROM processing_jobs WHERE id=?", (job["id"],))
+        assert all(cleared[field] is None for field in ("result_json", "processor", "started_at", "finished_at", "lease_until"))
 
 
 def test_manual_sync_requires_selected_groups(tmp_path, monkeypatch):

@@ -12,7 +12,7 @@ from uuid import uuid4
 from urllib.parse import urlparse
 
 from .browser import fetch_public_browser
-from .catalog import INDUSTRIES, apply_company_overrides, apply_model_item, company_overrides, deduplicate_company_jobs, normalize_company_tags
+from .catalog import INDUSTRIES, apply_company_overrides, apply_model_item, company_overrides, deduplicate_company_jobs, normalize_company_tags, normalize_recruitment_payload, normalize_text_value
 from .company_research import execute_company_research
 from .db import connect, one, utc_now
 from .model_provider import RecruitmentPayloadValidationError, classify_messages, consolidate_company_profile, get_setting, validate_recruitment_payload
@@ -906,7 +906,7 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
         if attempts < 3:
             retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delays[attempts - 1])).isoformat(timespec="seconds")
             connection.execute(
-                "UPDATE processing_jobs SET status='pending',stage='retry_wait',next_attempt_at=?,lease_until=NULL,error=?,updated_at=? WHERE id=?",
+                "UPDATE processing_jobs SET status='pending',stage='retry_wait',next_attempt_at=?,lease_until=NULL,processor=NULL,result_json=NULL,started_at=NULL,finished_at=NULL,error=?,updated_at=? WHERE id=?",
                 (retry_at, error, utc_now(), job["id"]),
             )
         else:
@@ -931,10 +931,22 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
     return {"status": status, "id": job["id"], "error": error}
 
 
-def _split_text(text: str, limit: int = 50_000, overlap: int = 1_000) -> list[str]:
+def _split_text(text: str, limit: int = 50_000) -> list[str]:
     if len(text) <= limit:
         return [text]
-    units = [part for part in re.split(r"(?<=\n)\s*\n+|(?<=\n)", text) if part]
+    paragraph_parts = re.split(r"(\n\s*\n+)", text)
+    units: list[str] = []
+    for index in range(0, len(paragraph_parts), 2):
+        paragraph = paragraph_parts[index]
+        separator = paragraph_parts[index + 1] if index + 1 < len(paragraph_parts) else ""
+        segment = paragraph + separator
+        if not segment:
+            continue
+        if len(segment) <= limit:
+            units.append(segment)
+            continue
+        lines = segment.splitlines(keepends=True)
+        units.extend(lines if lines else [segment])
     chunks: list[str] = []
     current = ""
     for unit in units:
@@ -987,20 +999,64 @@ def _merge_json_list(old_value: Any, new_value: Any) -> list[Any]:
 def _merge_extracted_items(items: list[dict[str, Any]]) -> dict[str, Any]:
     """Merge chunk results without interpreting source text."""
     recruitment = [item for item in items if item.get("is_recruitment")]
+    invalid_non_recruitment_entries = [
+        entry
+        for item in items
+        if not item.get("is_recruitment")
+        for entry in item.get("companies") or []
+        if isinstance(entry, dict)
+    ]
+    if invalid_non_recruitment_entries:
+        return {
+            "is_recruitment": False,
+            "decision_reason": "；".join(dict.fromkeys(
+                str(item.get("decision_reason") or "").strip()
+                for item in items
+                if str(item.get("decision_reason") or "").strip()
+            )),
+            "companies": invalid_non_recruitment_entries,
+        }
     if not recruitment:
         return {"is_recruitment": False, "decision_reason": "；".join(dict.fromkeys(
             str(item.get("decision_reason") or "").strip() for item in items if str(item.get("decision_reason") or "").strip()
         )), "companies": []}
     companies: list[dict[str, Any]] = []
     by_name: dict[str, dict[str, Any]] = {}
+    anonymous_entries: list[dict[str, Any]] = []
+
+    def merge_entry(target: dict[str, Any], entry: dict[str, Any]) -> None:
+        company = entry.get("company") if isinstance(entry.get("company"), dict) else {}
+        for field, value in company.items():
+            if isinstance(value, list):
+                target["company"][field] = list(dict.fromkeys([*(target["company"].get(field) or []), *value]))
+            elif value not in (None, "", {}, []) and target["company"].get(field) in (None, "", {}, []):
+                target["company"][field] = value
+        incoming_recruitment = entry.get("recruitment") if isinstance(entry.get("recruitment"), dict) else {}
+        for section in ("batch", "shared_details"):
+            target_section = target["recruitment"].setdefault(section, {})
+            for field, value in (incoming_recruitment.get(section) or {}).items():
+                if isinstance(value, list):
+                    target_section[field] = list(dict.fromkeys([*(target_section.get(field) or []), *value]))
+                elif value not in (None, "", {}, []) and target_section.get(field) in (None, "", {}, []):
+                    target_section[field] = value
+        target["recruitment"]["jobs"] = _unique_dicts([
+            *(target["recruitment"].get("jobs") or []), *(incoming_recruitment.get("jobs") or []),
+        ])
+        target["recruitment"]["events"] = _unique_dicts([
+            *(target["recruitment"].get("events") or []), *(incoming_recruitment.get("events") or []),
+        ])
+
     for item in recruitment:
         for entry in item.get("companies") or []:
             if not isinstance(entry, dict):
                 continue
             company = dict(entry.get("company") or {})
-            key = str(company.get("display_name") or company.get("legal_name") or "").strip().casefold()
+            key = (normalize_text_value(company.get("display_name") or company.get("legal_name")) or "").casefold()
             target = by_name.get(key) if key else None
             if target is None:
+                if not key:
+                    anonymous_entries.append(entry)
+                    continue
                 target = {"company": company, "recruitment": dict(entry.get("recruitment") or {})}
                 target["recruitment"].setdefault("batch", {})
                 target["recruitment"].setdefault("shared_details", {})
@@ -1010,21 +1066,16 @@ def _merge_extracted_items(items: list[dict[str, Any]]) -> dict[str, Any]:
                 if key:
                     by_name[key] = target
                 continue
-            for field, value in company.items():
-                if isinstance(value, list):
-                    target["company"][field] = list(dict.fromkeys([*(target["company"].get(field) or []), *value]))
-                elif value not in (None, "", {}, []) and target["company"].get(field) in (None, "", {}, []):
-                    target["company"][field] = value
-            incoming_recruitment = entry.get("recruitment") or {}
-            for section in ("batch", "shared_details"):
-                target_section = target["recruitment"].setdefault(section, {})
-                for field, value in (incoming_recruitment.get(section) or {}).items():
-                    if isinstance(value, list):
-                        target_section[field] = list(dict.fromkeys([*(target_section.get(field) or []), *value]))
-                    elif value not in (None, "", {}, []) and target_section.get(field) in (None, "", {}, []):
-                        target_section[field] = value
-            target["recruitment"]["jobs"] = _unique_dicts([*(target["recruitment"].get("jobs") or []), *(incoming_recruitment.get("jobs") or [])])
-            target["recruitment"]["events"] = _unique_dicts([*(target["recruitment"].get("events") or []), *(incoming_recruitment.get("events") or [])])
+            merge_entry(target, entry)
+    if anonymous_entries:
+        if len(companies) == 1:
+            for entry in anonymous_entries:
+                merge_entry(companies[0], entry)
+        else:
+            companies.extend(
+                {"company": dict(entry.get("company") or {}), "recruitment": dict(entry.get("recruitment") or {})}
+                for entry in anonymous_entries
+            )
     reasons = [str(item.get("decision_reason") or "").strip() for item in recruitment]
     return {"is_recruitment": True, "decision_reason": "；".join(dict.fromkeys(value for value in reasons if value)), "companies": companies}
 
@@ -1046,9 +1097,10 @@ def _classify_source(job: dict[str, Any], message: dict[str, Any]) -> dict[str, 
             result = classify_messages([part])
         if not isinstance(result.payload, dict) or "companies" not in result.payload:
             raise ValueError(f"Model response did not contain the required Schema for chunk {index}")
-        validate_recruitment_payload(result.payload)
         extracted.append(result.payload)
-    return _merge_extracted_items(extracted)
+    merged = normalize_recruitment_payload(_merge_extracted_items(extracted))
+    validate_recruitment_payload(merged)
+    return merged
 
 
 def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
@@ -1110,7 +1162,12 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
     with connect() as connection:
         connection.execute("UPDATE raw_messages SET is_recruitment=? WHERE id=?", (1 if item.get("is_recruitment") else 0, raw["id"]))
     if not item.get("is_recruitment"):
-        _finish(job["id"], {"is_recruitment": False, "decision_reason": item.get("decision_reason", "")})
+        result = {
+            "is_recruitment": False,
+            "decision_reason": item.get("decision_reason", ""),
+            "processor": processor,
+        }
+        _finish(job["id"], result)
         return {"status": "succeeded", "is_recruitment": False, "id": job["id"]}
     _stage(job["id"], "persisting", "写入企业、岗位、时间轴与来源证据")
     persistence_result = apply_model_item(item, raw["id"], raw["sent_at"])

@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timedelta, timezone
+import unicodedata
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -73,6 +74,233 @@ def normalize_name(value: str) -> str:
 def normalize_title(value: str) -> str:
     value = value.lower().strip()
     return re.sub(r"[（）()【】\[\]，,。·•\s]", "", value)
+
+
+def normalize_text_value(value: Any, *, preserve_newlines: bool = False) -> str | None:
+    """Apply mechanical Unicode/whitespace cleanup without semantic inference."""
+    if value is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(value))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if preserve_newlines:
+        lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        text = "\n".join(lines)
+    else:
+        text = re.sub(r"[ \t]+", " ", text).strip()
+    return text or None
+
+
+def normalize_url_value(value: Any) -> str | None:
+    """URLs are only trimmed; their protocol, path and query stay untouched."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def normalize_url_or_text_list(value: Any) -> list[str]:
+    values = value if isinstance(value, (list, tuple)) else ([value] if value is not None else [])
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        raw = str(item) if item is not None else ""
+        cleaned = normalize_url_value(item) if re.match(r"https?://", raw.strip(), re.IGNORECASE) else normalize_text_value(item)
+        if cleaned is None or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+    return result
+
+
+def normalize_text_list(value: Any, *, preserve_newlines: bool = False) -> list[str]:
+    """Clean a string list, removing empty values and preserving first order."""
+    values = value if isinstance(value, (list, tuple)) else ([value] if value is not None else [])
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        cleaned = normalize_text_value(item, preserve_newlines=preserve_newlines)
+        if cleaned is None or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+    return result
+
+
+def _normalize_int_list(value: Any) -> list[int]:
+    values = value if isinstance(value, (list, tuple)) else ([value] if value is not None else [])
+    result: list[int] = []
+    seen: set[int] = set()
+    for item in values:
+        if isinstance(item, bool):
+            continue
+        try:
+            number = int(item)
+        except (TypeError, ValueError):
+            continue
+        if number not in seen:
+            seen.add(number)
+            result.append(number)
+    return result
+
+
+def _normalize_salary_payload(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        cleaned_key = normalize_text_value(key)
+        if cleaned_key is None:
+            continue
+        cleaned_value = normalize_text_value(item, preserve_newlines=True)
+        if cleaned_value is not None:
+            result[cleaned_key] = cleaned_value
+    return result or None
+
+
+def normalize_company_payload(value: Any) -> dict[str, Any]:
+    """Mechanically clean model company fields; matching uses normalize_name separately."""
+    source = value if isinstance(value, dict) else {}
+    result = dict(source)
+    scalar_fields = {
+        "display_name", "legal_name", "company_nature", "primary_industry", "headquarters",
+        "founded_at", "company_size",
+    }
+    list_fields = {
+        "aliases", "secondary_industries", "industry_codes", "businesses", "highlights",
+        "official_channels", "major_requirements",
+    }
+    for field in scalar_fields:
+        result[field] = normalize_text_value(source.get(field), preserve_newlines=field in {"headquarters", "company_size"})
+    result["website"] = normalize_url_value(source.get("website"))
+    for field in list_fields:
+        result[field] = normalize_url_or_text_list(source.get(field)) if field == "official_channels" else normalize_text_list(source.get(field))
+    if isinstance(source.get("tags"), list):
+        tags: list[dict[str, Any]] = []
+        for tag in source["tags"]:
+            if not isinstance(tag, dict):
+                continue
+            cleaned = dict(tag)
+            for field in ("category", "code", "label"):
+                cleaned[field] = normalize_text_value(tag.get(field))
+            if not cleaned.get("category") or not cleaned.get("code") or not cleaned.get("label"):
+                continue
+            tags.append(cleaned)
+        result["tags"] = tags
+    if isinstance(source.get("relationship"), dict):
+        relationship = dict(source["relationship"])
+        relationship["type"] = normalize_text_value(relationship.get("type"))
+        relationship["related_company_name"] = normalize_text_value(relationship.get("related_company_name"))
+        result["relationship"] = relationship
+    return result
+
+
+def _normalize_job_payload(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    result = dict(source)
+    for field in ("title", "department", "recruitment_type", "employment_type", "headcount", "experience_requirement", "deadline"):
+        result[field] = normalize_text_value(source.get(field), preserve_newlines=field in {"experience_requirement", "headcount"})
+    for field in ("locations", "education_requirements", "major_requirements", "benefits", "application_methods", "contacts", "industry_codes", "job_function_codes"):
+        result[field] = normalize_text_list(source.get(field))
+    for field in ("responsibilities", "requirements"):
+        raw = source.get(field)
+        if isinstance(raw, list):
+            result[field] = normalize_text_list(raw, preserve_newlines=True)
+        else:
+            result[field] = normalize_text_value(raw, preserve_newlines=True)
+    result["education"] = list(result.get("education_requirements") or normalize_text_list(source.get("education")))
+    result["majors"] = list(result.get("major_requirements") or normalize_text_list(source.get("majors")))
+    result["salary"] = _normalize_salary_payload(source.get("salary"))
+    return result
+
+
+def _normalize_event_payload(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    result = dict(source)
+    for field in ("title", "event_type", "timezone", "format", "city", "campus", "location", "application_url", "audience"):
+        result[field] = normalize_url_value(source.get(field)) if field == "application_url" else normalize_text_value(source.get(field))
+    for field in ("start_at", "end_at", "date", "end_date"):
+        result[field] = normalize_text_value(source.get(field))
+    result["notes"] = normalize_text_value(source.get("notes"), preserve_newlines=True)
+    result["job_titles"] = normalize_text_list(source.get("job_titles"))
+    return result
+
+
+def normalize_recruitment_payload(value: Any) -> dict[str, Any]:
+    """Clean only known structured fields before validation/persistence."""
+    source = value if isinstance(value, dict) else {}
+    result = dict(source)
+    result["is_recruitment"] = source.get("is_recruitment")
+    result["decision_reason"] = normalize_text_value(source.get("decision_reason"), preserve_newlines=True) or ""
+    companies: list[dict[str, Any]] = []
+    for entry in source.get("companies") if isinstance(source.get("companies"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        company_entry = dict(entry)
+        company_entry["company"] = normalize_company_payload(entry.get("company"))
+        recruitment = dict(entry.get("recruitment") or {}) if isinstance(entry.get("recruitment"), dict) else {}
+        batch = dict(recruitment.get("batch") or {}) if isinstance(recruitment.get("batch"), dict) else {}
+        batch["name"] = normalize_text_value(batch.get("name"))
+        batch["season"] = normalize_text_value(batch.get("season"))
+        batch["recruitment_type"] = normalize_text_value(batch.get("recruitment_type"))
+        if batch.get("year") is not None and not isinstance(batch.get("year"), bool):
+            try:
+                batch["year"] = int(batch["year"])
+            except (TypeError, ValueError):
+                batch["year"] = None
+        else:
+            batch["year"] = None
+        shared = dict(recruitment.get("shared_details") or {}) if isinstance(recruitment.get("shared_details"), dict) else {}
+        shared["locations"] = normalize_text_list(shared.get("locations"))
+        shared["salary"] = _normalize_salary_payload(shared.get("salary"))
+        shared["target_graduation_years"] = _normalize_int_list(shared.get("target_graduation_years"))
+        for field in ("education_requirements", "major_requirements", "process", "benefits"):
+            shared[field] = normalize_text_list(shared.get(field), preserve_newlines=field in {"process", "benefits"})
+        shared["application_url"] = normalize_url_value(shared.get("application_url"))
+        shared["deadline"] = normalize_text_value(shared.get("deadline"))
+        recruitment["batch"] = batch
+        recruitment["shared_details"] = shared
+        recruitment["jobs"] = [_normalize_job_payload(job) for job in recruitment.get("jobs") or [] if isinstance(job, dict)]
+        recruitment["events"] = [_normalize_event_payload(event) for event in recruitment.get("events") or [] if isinstance(event, dict)]
+        company_entry["recruitment"] = recruitment
+        companies.append(company_entry)
+    result["companies"] = companies
+    return result
+
+
+def _parse_reliable_datetime(value: Any) -> datetime | None:
+    """Parse only complete ISO date/datetime values for status comparisons."""
+    text = normalize_text_value(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.combine(date.fromisoformat(text), datetime.min.time())
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _choose_temporal_text(values: list[Any], *, latest: bool) -> str | None:
+    candidates = [normalize_text_value(value) for value in values]
+    candidates = [value for value in candidates if value]
+    if not candidates:
+        return None
+    parsed = [(value, _parse_reliable_datetime(value)) for value in candidates]
+    reliable = [(value, moment) for value, moment in parsed if moment is not None]
+    if not reliable:
+        return candidates[0]
+    chosen = (max if latest else min)(reliable, key=lambda pair: pair[1])
+    return chosen[0]
 
 
 NON_JOB_TITLE_PATTERNS = (
@@ -325,19 +553,27 @@ def _raw_source_text(connection: Any, raw_message_id: str | None) -> str:
 def _prepare_job_items(job_values: Any) -> list[dict[str, Any]]:
     """Normalize only the structure returned by Codex."""
     prepared: list[dict[str, Any]] = []
-    for value in job_values or []:
+    for value in job_values if isinstance(job_values, list) else []:
         if not isinstance(value, dict):
             continue
-        title = str(value.get("title") or "").strip()
+        job = _normalize_job_payload(value)
+        title = job.get("title")
         if not title:
             continue
-        job = dict(value)
         job["title"] = title
-        job["education"] = list(job.get("education_requirements") or job.get("education") or [])
-        job["majors"] = list(job.get("major_requirements") or job.get("majors") or [])
+        job["locations"] = normalize_text_list(job.get("locations"))
+        job["education"] = normalize_text_list(job.get("education") or job.get("education_requirements"))
+        job["majors"] = normalize_text_list(job.get("majors") or job.get("major_requirements"))
         for key in ("responsibilities", "requirements"):
             values = job.get(key) or []
-            job[key] = "\n".join(str(item).strip() for item in values if str(item).strip()) if isinstance(values, list) else str(values)
+            if isinstance(values, list):
+                job[key] = "\n".join(normalize_text_list(values, preserve_newlines=True)) or None
+            else:
+                job[key] = normalize_text_value(values, preserve_newlines=True)
+        job["benefits"] = normalize_text_list(job.get("benefits"), preserve_newlines=True)
+        job["application_methods"] = normalize_text_list(job.get("application_methods"))
+        job["contacts"] = normalize_text_list(job.get("contacts"), preserve_newlines=True)
+        job["salary"] = _normalize_salary_payload(job.get("salary"))
         prepared.append(job)
     return prepared
 
@@ -351,30 +587,68 @@ def _store_recruitment_shared_details(
     details: dict[str, Any],
     observed_at: str,
 ) -> str | None:
-    locations = [str(value).strip() for value in details.get("locations") or [] if str(value).strip()]
-    salary = details.get("salary") if isinstance(details.get("salary"), dict) else {}
-    salary = {key: str(value).strip() for key, value in salary.items() if str(value).strip()}
-    if not locations and not salary:
+    normalized = {
+        "locations": normalize_text_list(details.get("locations")),
+        "salary": _normalize_salary_payload(details.get("salary")),
+        "target_graduation_years": _normalize_int_list(details.get("target_graduation_years")),
+        "education_requirements": normalize_text_list(details.get("education_requirements")),
+        "major_requirements": normalize_text_list(details.get("major_requirements")),
+        "application_url": normalize_url_value(details.get("application_url")),
+        "deadline": normalize_text_value(details.get("deadline")),
+        "process": normalize_text_list(details.get("process"), preserve_newlines=True),
+        "benefits": normalize_text_list(details.get("benefits"), preserve_newlines=True),
+    }
+    if not any((normalized["locations"], normalized["salary"], normalized["target_graduation_years"], normalized["education_requirements"], normalized["major_requirements"], normalized["application_url"], normalized["deadline"], normalized["process"], normalized["benefits"])):
         return None
     existing = connection.execute(
-        """SELECT id FROM recruitment_shared_details
+        """SELECT * FROM recruitment_shared_details
            WHERE company_id=? AND COALESCE(batch_id,'')=COALESCE(?,'') AND COALESCE(raw_message_id,'')=COALESCE(?,'')""",
         (company_id, batch_id, raw_message_id),
     ).fetchone()
     now = utc_now()
     if existing:
+        def existing_json_list(column: str) -> list[Any]:
+            try:
+                value = json.loads(existing[column] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                value = []
+            return value if isinstance(value, list) else []
+
+        merged_locations = list(dict.fromkeys([*existing_json_list("locations_json"), *normalized["locations"]]))
+        merged_target_years = list(dict.fromkeys([*existing_json_list("target_graduation_years_json"), *normalized["target_graduation_years"]]))
+        merged_education = list(dict.fromkeys([*existing_json_list("education_requirements_json"), *normalized["education_requirements"]]))
+        merged_majors = list(dict.fromkeys([*existing_json_list("major_requirements_json"), *normalized["major_requirements"]]))
+        merged_process = list(dict.fromkeys([*existing_json_list("process_json"), *normalized["process"]]))
+        merged_benefits = list(dict.fromkeys([*existing_json_list("benefits_json"), *normalized["benefits"]]))
+        try:
+            old_salary = json.loads(existing["salary_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            old_salary = {}
+        old_salary = old_salary if isinstance(old_salary, dict) else {}
+        merged_salary = {**old_salary, **(normalized["salary"] or {})}
         connection.execute(
-            """UPDATE recruitment_shared_details SET evidence_id=COALESCE(?,evidence_id),locations_json=?,salary_json=?,
-               observed_at=?,updated_at=? WHERE id=?""",
-            (evidence_id, json_text(list(dict.fromkeys(locations)), []), json_text(salary, {}), observed_at, now, existing["id"]),
+            """UPDATE recruitment_shared_details SET evidence_id=COALESCE(?,evidence_id),locations_json=?,salary_json=?
+               ,target_graduation_years_json=?,education_requirements_json=?,major_requirements_json=?,application_url=?,deadline=?
+               ,process_json=?,benefits_json=?,observed_at=?,updated_at=? WHERE id=?""",
+            (evidence_id, json_text(merged_locations, []), json_text(merged_salary, {}),
+             json_text(merged_target_years, []), json_text(merged_education, []),
+             json_text(merged_majors, []), normalized["application_url"] or existing["application_url"],
+             normalized["deadline"] or existing["deadline"], json_text(merged_process, []),
+             json_text(merged_benefits, []), observed_at, now, existing["id"]),
         )
         return existing["id"]
     detail_id = str(uuid4())
     connection.execute(
         """INSERT INTO recruitment_shared_details(
-               id,company_id,batch_id,evidence_id,raw_message_id,locations_json,salary_json,observed_at,created_at,updated_at
-           ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-        (detail_id, company_id, batch_id, evidence_id, raw_message_id, json_text(list(dict.fromkeys(locations)), []), json_text(salary, {}), observed_at, now, now),
+               id,company_id,batch_id,evidence_id,raw_message_id,locations_json,salary_json,target_graduation_years_json,
+               education_requirements_json,major_requirements_json,application_url,deadline,process_json,benefits_json,
+               observed_at,created_at,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (detail_id, company_id, batch_id, evidence_id, raw_message_id, json_text(normalized["locations"], []),
+         json_text(normalized["salary"], {}), json_text(normalized["target_graduation_years"], []),
+         json_text(normalized["education_requirements"], []), json_text(normalized["major_requirements"], []),
+         normalized["application_url"], normalized["deadline"], json_text(normalized["process"], []),
+         json_text(normalized["benefits"], []), observed_at, now, now),
     )
     return detail_id
 
@@ -429,8 +703,9 @@ def event_company_for_title(connection: Any, fallback_company_id: str | None, ev
 
 
 def _company_for(connection, company_data: dict[str, Any]) -> str:
-    display_name = str(company_data.get("display_name") or "").strip()
-    legal_name = str(company_data.get("legal_name") or "").strip() or None
+    company_data = normalize_company_payload(company_data)
+    display_name = company_data.get("display_name") or ""
+    legal_name = company_data.get("legal_name") or None
     aliases = company_data.get("aliases") or []
     if not display_name:
         display_name = legal_name or f"未识别企业-{uuid4().hex[:8]}"
@@ -496,11 +771,20 @@ def _company_for(connection, company_data: dict[str, Any]) -> str:
 
 
 def _batch_for(connection, company_id: str, batch: dict[str, Any], recruitment_type: str) -> str | None:
-    name = str(batch.get("name") or "未命名批次").strip()
+    name = normalize_text_value(batch.get("name")) or "未命名批次"
     year = batch.get("year")
+    if isinstance(year, bool):
+        year = None
+    elif year is not None:
+        try:
+            year = int(year)
+        except (TypeError, ValueError):
+            year = None
+    season = normalize_text_value(batch.get("season"))
     existing = connection.execute(
-        "SELECT id FROM recruitment_batches WHERE company_id=? AND name=? AND recruitment_type=?",
-        (company_id, name, recruitment_type),
+        """SELECT id FROM recruitment_batches
+           WHERE company_id=? AND name=? AND recruitment_type=? AND year IS ? AND season IS ?""",
+        (company_id, name, recruitment_type, year, season),
     ).fetchone()
     if existing:
         return existing["id"]
@@ -508,7 +792,7 @@ def _batch_for(connection, company_id: str, batch: dict[str, Any], recruitment_t
     now = utc_now()
     connection.execute(
         "INSERT INTO recruitment_batches(id,company_id,name,year,season,recruitment_type,confidence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        (batch_id, company_id, name, year, batch.get("season"), recruitment_type, float(batch.get("confidence", 0)), now, now),
+        (batch_id, company_id, name, year, season, recruitment_type, float(batch.get("confidence", 0)), now, now),
     )
     return batch_id
 
@@ -550,13 +834,14 @@ def _job_identity_matches(row: Any, normalized_title: str, recruitment_type: str
 
 
 def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[str, Any], observed_at: str, raw_message_id: str | None) -> str:
-    title = str(job_data.get("title") or "未命名岗位").strip()
+    job_data = _normalize_job_payload(job_data)
+    title = job_data.get("title") or "未命名岗位"
     normalized = normalize_title(title)
     recruitment_type = str(job_data.get("recruitment_type") or "unknown")
     if recruitment_type not in RECRUITMENT_TYPES:
         recruitment_type = "unknown"
     employment_type = normalize_employment_type(job_data.get("employment_type"))
-    locations = job_data.get("locations") or []
+    locations = normalize_text_list(job_data.get("locations"))
     row = next(
         (
             candidate
@@ -569,18 +854,16 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         None,
     )
     now = utc_now()
-    explicit_deadline = str(job_data.get("deadline") or job_data.get("explicit_deadline") or "").strip() or None
+    explicit_deadline = normalize_text_value(job_data.get("deadline") or job_data.get("explicit_deadline"))
     payload = {**job_data, "deadline": explicit_deadline or ""}
     content_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     if row:
         job_id = row["id"]
         last = observed_at or now
         status = row["status"]
-        if explicit_deadline:
-            try:
-                status = "expired" if datetime.fromisoformat(str(explicit_deadline)).date() < datetime.now().date() else "active"
-            except ValueError:
-                pass
+        parsed_deadline = _parse_reliable_datetime(explicit_deadline)
+        if parsed_deadline is not None:
+            status = "expired" if parsed_deadline < datetime.now(timezone.utc) else "active"
         merged_locations = _merge_list(row["locations_json"], locations)
         merged_education = _merge_list(row["education_json"], job_data.get("education"))
         merged_majors = _merge_list(row["majors_json"], job_data.get("majors"))
@@ -605,7 +888,8 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         )
     else:
         job_id = str(uuid4())
-        status = "active" if explicit_deadline is None or str(explicit_deadline) >= now[:10] else "expired"
+        parsed_deadline = _parse_reliable_datetime(explicit_deadline)
+        status = "expired" if parsed_deadline is not None and parsed_deadline < datetime.now(timezone.utc) else "active"
         connection.execute(
             "INSERT INTO jobs(id,company_id,batch_id,canonical_title,normalized_title,department,locations_json,recruitment_type,employment_type,headcount,education_json,majors_json,experience_requirement,salary_json,responsibilities,requirements,benefits_json,application_methods_json,contacts_json,explicit_deadline,effective_posted_at,last_effective_posted_at,status,industry_codes_json,job_function_codes_json,confidence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (job_id, company_id, batch_id, title, normalized, job_data.get("department"), json_text(locations, []), recruitment_type, employment_type, job_data.get("headcount"), json_text(job_data.get("education"), []), json_text(job_data.get("majors"), []), job_data.get("experience_requirement"), json_text(job_data.get("salary"), {}), job_data.get("responsibilities"), job_data.get("requirements"), json_text(job_data.get("benefits"), []), json_text(job_data.get("application_methods"), []), json_text(job_data.get("contacts"), []), explicit_deadline, observed_at, observed_at, status, json_text(job_data.get("industry_codes"), []), json_text([x for x in job_data.get("job_function_codes", []) if x in JOB_FUNCTIONS], []), float(job_data.get("confidence", 0)), now, now),
@@ -682,6 +966,7 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
                 },
             }],
         }
+    item = normalize_recruitment_payload(item)
     observed = observed_at or utc_now()
     company_items = item.get("companies") if isinstance(item.get("companies"), list) else []
     if not company_items:
@@ -712,13 +997,13 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             if not isinstance(raw_company, dict):
                 persistence["invalid_company_entries"].append({"index": index, "reason": "company is not an object"})
                 continue
-            company = dict(raw_company)
+            company = normalize_company_payload(raw_company)
             raw_recruitment = company_entry.get("recruitment")
             if raw_recruitment is not None and not isinstance(raw_recruitment, dict):
                 persistence["invalid_company_entries"].append({"index": index, "reason": "recruitment is not an object"})
                 continue
             recruitment = dict(raw_recruitment or {})
-            company_name = str(company.get("display_name") or company.get("legal_name") or "").strip()
+            company_name = company.get("display_name") or company.get("legal_name") or ""
             if not company_name:
                 persistence["invalid_company_entries"].append({"index": index, "reason": "display_name and legal_name are empty"})
                 continue
@@ -752,10 +1037,7 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
                 recruitment_type = "unknown"
             batch_id = _batch_for(connection, company_id, batch, recruitment_type)
             shared = recruitment.get("shared_details") if isinstance(recruitment.get("shared_details"), dict) else {}
-            _store_recruitment_shared_details(connection, company_id, batch_id, evidence_id, raw_message_id, {
-                "locations": shared.get("locations") or [],
-                "salary": shared.get("salary") or {},
-            }, observed)
+            _store_recruitment_shared_details(connection, company_id, batch_id, evidence_id, raw_message_id, shared, observed)
             job_items = _prepare_job_items(recruitment.get("jobs") or [])
             job_ids = [_make_job(connection, company_id, batch_id, job, observed, raw_message_id) for job in job_items]
             all_job_ids.extend(job_ids)
@@ -784,10 +1066,10 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
     persistence["created_company_count"] = len(created_company_ids)
     persistence["updated_company_count"] = len(updated_company_ids)
     persistence["company_names"] = list(dict.fromkeys(
-        str((entry.get("company") or {}).get("display_name") or (entry.get("company") or {}).get("legal_name") or "").strip()
+        normalize_text_value((entry.get("company") or {}).get("display_name") or (entry.get("company") or {}).get("legal_name")) or ""
         for entry in company_items
         if isinstance(entry, dict) and isinstance(entry.get("company"), dict)
-        and str((entry.get("company") or {}).get("display_name") or (entry.get("company") or {}).get("legal_name") or "").strip()
+        and normalize_text_value((entry.get("company") or {}).get("display_name") or (entry.get("company") or {}).get("legal_name"))
     ))
     persistence["invalid_company_count"] = len(persistence["invalid_company_entries"])
     return persistence
@@ -802,15 +1084,16 @@ def _merge_event(
     evidence_id: str,
     observed_at: str,
 ) -> str:
-    event_type = str(event.get("event_type") or "other")
-    timezone_name = str(event.get("timezone") or "Asia/Shanghai")
+    event = _normalize_event_payload(event)
+    event_type = event.get("event_type") or "other"
+    timezone_name = event.get("timezone") or "Asia/Shanghai"
     start_value = event.get("start_at") or event.get("date")
     end_value = event.get("end_at") or event.get("end_date")
     start_at = normalize_event_datetime(start_value, timezone_name, observed_at)
     end_at = normalize_event_datetime(end_value, timezone_name, observed_at)
     normalized_event = {**event, "start_at": start_at or "", "end_at": end_at or "", "timezone": timezone_name}
-    location = str(event.get("location") or "").strip()
-    title = str(event.get("title") or event_type).strip()
+    location = event.get("location") or ""
+    title = event.get("title") or event_type
     existing = connection.execute(
         "SELECT * FROM recruitment_events WHERE company_id=? AND COALESCE(batch_id,'')=COALESCE(?,'') AND event_type=? AND lower(title)=lower(?) AND COALESCE(start_at,'')=COALESCE(?,'') AND COALESCE(location,'')=COALESCE(?,'') LIMIT 1",
         (company_id, batch_id, event_type, title, start_at, location),
@@ -830,7 +1113,8 @@ def _merge_event(
         )
     else:
         event_id = str(uuid4())
-        status = "historical" if start_at and str(start_at) < now else "upcoming"
+        parsed_start = _parse_reliable_datetime(start_at)
+        status = "historical" if parsed_start is not None and parsed_start < _parse_reliable_datetime(now) else "upcoming"
         connection.execute(
             """INSERT INTO recruitment_events(id,company_id,batch_id,title,event_type,start_at,end_at,timezone,format,city,campus,location,
                application_url,audience,notes,job_ids_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -898,19 +1182,16 @@ def _merge_job_into(connection: Any, keep: Any, duplicate: Any) -> None:
         "application_methods_json", "contacts_json", "industry_codes_json", "job_function_codes_json",
     }
     merged_lists = {field: json_text(_merge_list(keep[field], json.loads(duplicate[field] or "[]")), []) for field in list_fields}
-    explicit_deadlines = [value for value in (keep["explicit_deadline"], duplicate["explicit_deadline"]) if value]
-    latest_deadline = max(explicit_deadlines) if explicit_deadlines else None
-    posted_values = [value for value in (keep["effective_posted_at"], duplicate["effective_posted_at"]) if value]
-    first_posted = min(posted_values) if posted_values else None
-    last_values = [value for value in (keep["last_effective_posted_at"], duplicate["last_effective_posted_at"]) if value]
-    last_posted = max(last_values) if last_values else None
+    latest_deadline = _choose_temporal_text([keep["explicit_deadline"], duplicate["explicit_deadline"]], latest=True)
+    first_posted = _choose_temporal_text([keep["effective_posted_at"], duplicate["effective_posted_at"]], latest=False)
+    last_posted = _choose_temporal_text([keep["last_effective_posted_at"], duplicate["last_effective_posted_at"]], latest=True)
     employment_type = normalize_employment_type(keep["employment_type"])
     duplicate_employment_type = normalize_employment_type(duplicate["employment_type"])
     if employment_type == "unknown":
         employment_type = duplicate_employment_type
     elif duplicate_employment_type not in {"unknown", employment_type}:
         employment_type = "unknown"
-    updated_at = max(str(keep["updated_at"] or ""), str(duplicate["updated_at"] or "")) or utc_now()
+    updated_at = _choose_temporal_text([keep["updated_at"], duplicate["updated_at"]], latest=True) or utc_now()
     connection.execute(
         """UPDATE jobs SET department=?,employment_type=?,locations_json=?,headcount=?,education_json=?,majors_json=?,experience_requirement=?,
            salary_json=?,responsibilities=?,requirements=?,benefits_json=?,application_methods_json=?,contacts_json=?,
@@ -946,7 +1227,7 @@ def _merge_job_into(connection: Any, keep: Any, duplicate: Any) -> None:
             state = row["state"] if state_priority.get(row["state"], 0) > state_priority.get(existing["state"], 0) else existing["state"]
             connection.execute(
                 "UPDATE user_job_states SET state=?,favorite=?,updated_at=? WHERE user_id=? AND job_id=?",
-                (state, int(bool(row["favorite"] or existing["favorite"])), max(row["updated_at"], existing["updated_at"]), row["user_id"], keep["id"]),
+                (state, int(bool(row["favorite"] or existing["favorite"])), _choose_temporal_text([row["updated_at"], existing["updated_at"]], latest=True) or utc_now(), row["user_id"], keep["id"]),
             )
             connection.execute("DELETE FROM user_job_states WHERE user_id=? AND job_id=?", (row["user_id"], duplicate["id"]))
         else:
@@ -1014,10 +1295,17 @@ def refresh_expiration() -> int:
             days = int(json.loads(row["value_json"]))
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    updated_at = utc_now()
+    updated = 0
     with connect() as connection:
-        cursor = connection.execute(
-            "UPDATE jobs SET status='possibly_expired', updated_at=? WHERE status='active' AND explicit_deadline IS NULL AND last_effective_posted_at<?",
-            (utc_now(), cutoff),
-        )
-        return cursor.rowcount
+        rows = connection.execute(
+            "SELECT id,last_effective_posted_at FROM jobs WHERE status='active' AND explicit_deadline IS NULL"
+        ).fetchall()
+        for row in rows:
+            posted_at = _parse_reliable_datetime(row["last_effective_posted_at"])
+            if posted_at is None or posted_at >= cutoff:
+                continue
+            connection.execute("UPDATE jobs SET status='possibly_expired',updated_at=? WHERE id=?", (updated_at, row["id"]))
+            updated += 1
+    return updated
