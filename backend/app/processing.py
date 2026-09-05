@@ -306,15 +306,25 @@ def queue_is_running() -> bool:
     return bool(row and row["state"] == "running")
 
 
-def _claim_one() -> dict[str, Any] | None:
+def _claim_one(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
     now = utc_now()
+    priority = (
+        "CASE kind WHEN 'consolidate_company' THEN 0 WHEN 'research_company' THEN 1 ELSE 2 END"
+        if prefer_enrichment
+        else "CASE kind WHEN 'classify' THEN 0 ELSE 1 END"
+    )
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
-            """SELECT * FROM processing_jobs
+            f"""SELECT * FROM processing_jobs
                WHERE status='pending' AND cancel_requested=0
                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-               ORDER BY CASE kind WHEN 'classify' THEN 0 ELSE 1 END, created_at LIMIT 1""",
+                 AND (
+                   kind NOT IN ('consolidate_company', 'research_company')
+                   OR (SELECT COUNT(*) FROM processing_jobs active
+                       WHERE active.kind=processing_jobs.kind AND active.status='running') < 1
+                 )
+               ORDER BY {priority}, created_at LIMIT 1""",
             (now,),
         ).fetchone()
         if not row:
@@ -794,6 +804,8 @@ def _extract_source_text(job: dict[str, Any], raw: dict[str, Any]) -> tuple[str,
                 raw["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
             except Exception as exc:
                 metadata["codex_ocr_error"] = str(exc)
+                if not bool(get_setting("local_ocr_fallback_enabled", False)):
+                    raise RuntimeError("Codex OCR failed and local OCR fallback is disabled") from exc
                 _stage(job["id"], "local_ocr_fallback", "Codex OCR 失败，改用本地 OCR 兜底", "rapidocr")
                 log_processing(job["id"], "local_ocr_fallback", "Codex OCR 失败，使用本地 OCR 兜底", "warning", {"error": str(exc)})
                 local_text, local_errors = _local_ocr_extract(raw)
@@ -1305,8 +1317,8 @@ def _process_company_research(job: dict[str, Any]) -> dict[str, Any]:
     return {**result, "id": job["id"]}
 
 
-def process_one_job() -> dict[str, Any] | None:
-    job = _claim_one()
+def process_one_job(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
+    job = _claim_one(prefer_enrichment=prefer_enrichment)
     if not job:
         return None
     log_processing(job["id"], "starting", "任务已开始", details={"kind": job["kind"], "attempt": job["attempts"]})
@@ -1322,10 +1334,10 @@ def process_one_job() -> dict[str, Any] | None:
         return _fail(job, exc)
 
 
-def process_one_batch(limit: int = 1) -> dict[str, Any] | None:
+def process_one_batch(limit: int = 1, *, prefer_enrichment: bool = False) -> dict[str, Any] | None:
     results = []
     for _ in range(max(1, limit)):
-        result = process_one_job()
+        result = process_one_job(prefer_enrichment=prefer_enrichment)
         if result is None:
             break
         results.append(result)

@@ -175,7 +175,7 @@ async def worker_loop() -> None:
                 limit_key = "codex_concurrency" if engine == "codex" else "model_concurrency"
                 maximum = max(1, min(4 if engine == "codex" else 8, int(_setting_value(limit_key, 1))))
                 while len(running) < maximum:
-                    running.add(asyncio.create_task(asyncio.to_thread(process_one_batch, 1)))
+                    running.add(asyncio.create_task(asyncio.to_thread(process_one_batch, 1, prefer_enrichment=True)))
             if not running:
                 await asyncio.to_thread(refresh_expiration)
         except Exception as exc:
@@ -775,7 +775,7 @@ def get_settings(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
 @app.put("/api/v1/admin/settings")
 def update_settings(body: SettingsUpdate, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     allowed = {
-        "sync_interval_minutes", "initial_import_days", "import_days", "redaction_enabled", "llm_input_budget",
+        "sync_interval_minutes", "initial_import_days", "import_days", "redaction_enabled", "local_ocr_fallback_enabled", "llm_input_budget",
         "llm_output_budget", "llm_budget_warning_percent", "ordinary_retention_days",
         "possibly_expired_days", "smtp", "llm_provider", "search", "backup", "agent_api_enabled",
         "processing_engine", "model_concurrency", "codex_concurrency", "extract_concurrency",

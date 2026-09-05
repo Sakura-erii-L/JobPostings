@@ -2,11 +2,13 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from app import db
 from app.maintenance import repair_raw_message_times, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from app.model_provider import ModelResult, classify_messages
 from app.catalog import apply_model_item
-from app.processing import _extract_source_text, _fail, import_file, ingest_message, log_processing, process_one_batch
+from app.processing import _claim_one, _extract_source_text, _fail, import_file, ingest_message, log_processing, process_one_batch
 import app.tracememo as tracememo
 
 
@@ -656,6 +658,21 @@ def test_image_ocr_prefers_codex_over_local_ocr(tmp_path, monkeypatch):
     assert calls == [{"reason": "图片是主要来源内容", "primary_ocr": True}]
 
 
+def test_image_ocr_local_fallback_is_disabled_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    imported = import_file("poster.png", b"image-bytes", "image/png")
+    raw_id = imported["raw_message_id"]
+    job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
+    raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
+    monkeypatch.setattr("app.processing._codex_extract", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Codex unavailable")))
+    monkeypatch.setattr("app.processing._local_ocr_extract", lambda raw_value: (_ for _ in ()).throw(AssertionError("local OCR fallback must be disabled by default")))
+
+    with pytest.raises(RuntimeError, match="local OCR fallback is disabled"):
+        _extract_source_text(job, raw)
+
+
 def test_image_ocr_uses_local_fallback_only_after_codex_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
@@ -664,6 +681,10 @@ def test_image_ocr_uses_local_fallback_only_after_codex_failure(tmp_path, monkey
     raw_id = imported["raw_message_id"]
     with db.connect() as connection:
         connection.execute("UPDATE raw_messages SET text_content=? WHERE id=?", ("图片招聘说明", raw_id))
+        connection.execute(
+            "UPDATE system_settings SET value_json=? WHERE key='local_ocr_fallback_enabled'",
+            ("true",),
+        )
     job = dict(db.one("SELECT * FROM processing_jobs WHERE raw_message_id=?", (raw_id,)))
     raw = dict(db.one("SELECT * FROM raw_messages WHERE id=?", (raw_id,)))
     monkeypatch.setattr("app.processing._codex_extract", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Codex unavailable")))
@@ -673,6 +694,45 @@ def test_image_ocr_uses_local_fallback_only_after_codex_failure(tmp_path, monkey
     assert text == "图片招聘说明\nRapidOCR 兜底文字"
     assert metadata["local_ocr_fallback"] is True
     assert metadata["local_ocr_errors"] == ["local test error"]
+
+
+def test_timeout_failure_uses_existing_retry_mechanism(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    raw_id = ingest_message({"id": "timeout-1", "type": "普通文本", "text": "招聘信息"}, "manual", None)
+    job = _claim_one()
+    assert job and job["raw_message_id"] == raw_id
+
+    result = _fail(job, TimeoutError("Local Codex timed out after 600 seconds"))
+
+    assert result["status"] == "retry_wait"
+    assert db.one("SELECT status,stage,error FROM processing_jobs WHERE id=?", (job["id"],))["status"] == "pending"
+    assert db.one("SELECT stage,error FROM processing_jobs WHERE id=?", (job["id"],))["stage"] == "retry_wait"
+
+
+def test_enrichment_jobs_are_limited_to_one_running_job_per_kind(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    now = db.utc_now()
+    with db.connect() as connection:
+        connection.executemany(
+            "INSERT INTO processing_jobs(id,kind,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+            [
+                ("consolidate-1", "consolidate_company", "pending", now, now),
+                ("consolidate-2", "consolidate_company", "pending", now, now),
+                ("research-1", "research_company", "pending", now, now),
+                ("classify-1", "classify", "pending", now, now),
+            ],
+        )
+
+    claimed = [_claim_one(prefer_enrichment=True) for _ in range(4)]
+
+    assert [job["kind"] for job in claimed if job] == ["consolidate_company", "research_company", "classify"]
+    with db.connect() as connection:
+        connection.execute("UPDATE processing_jobs SET status='succeeded' WHERE id='consolidate-1'")
+    assert _claim_one(prefer_enrichment=True)["kind"] == "consolidate_company"
 
 
 def test_multiple_page_images_use_one_ordered_codex_ocr_and_retry_cache(tmp_path, monkeypatch):

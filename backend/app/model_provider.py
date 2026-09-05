@@ -641,7 +641,7 @@ def research_company_overview(company: dict[str, Any], sources: list[dict[str, A
         COMPANY_RESEARCH_SCHEMA,
         job_id=job_id,
         enable_web=True,
-        timeout_seconds=300,
+        timeout_seconds=600,
     )
     result = ModelResult(
         payload,

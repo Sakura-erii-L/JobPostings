@@ -56,7 +56,7 @@ def run_codex_json(
     job_id: str,
     image_paths: list[str] | None = None,
     enable_web: bool = False,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 600,
 ) -> dict[str, Any]:
     """Run an ephemeral, read-only Codex task and return its schema-constrained JSON."""
     executable = os.getenv("CODEX_CLI_PATH") or shutil.which("codex")

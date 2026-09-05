@@ -92,6 +92,11 @@ def test_connector_secret_is_preserved_and_agent_scopes_are_enforced(tmp_path, m
         assert second.status_code == 200
         assert db.one("SELECT config_json FROM connectors WHERE kind='tracememo'")["config_json"] == original_token
 
+        assert client.get("/api/v1/admin/settings").json()["local_ocr_fallback_enabled"] is False
+        updated_settings = client.put("/api/v1/admin/settings", json={"values": {"local_ocr_fallback_enabled": True}})
+        assert updated_settings.status_code == 200
+        assert updated_settings.json()["local_ocr_fallback_enabled"] is True
+
         assert client.put("/api/v1/admin/settings", json={"values": {"agent_api_enabled": True}}).status_code == 200
         created = client.post("/api/v1/api-tokens", json={"name": "catalog", "scopes": ["catalog:read"]})
         assert created.status_code == 200

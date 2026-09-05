@@ -605,6 +605,7 @@ def init_db() -> None:
             "initial_import_days": 30,
             "import_days": 30,
             "redaction_enabled": False,
+            "local_ocr_fallback_enabled": False,
             "llm_input_budget": 1_000_000,
             "llm_output_budget": 200_000,
             "llm_budget_warning_percent": 80,
