@@ -16,6 +16,8 @@ type Notification = { id: string; title: string; body: string; read_at?: string 
 type Invitation = { id: string; email: string; role: string; expires_at: string; used_at?: string | null; created_at: string }
 type ReviewItem = { id: string; kind: string; entity_type?: string; entity_id?: string; created_at?: string; payload: Record<string, any> }
 type TraceMemoGroup = { id: string; external_id: string; name: string; avatar?: string | null; selected: boolean; enabled?: boolean }
+type TraceMemoMessage = { id: string; external_message_id?: string | null; source_group_id: string; group_name: string; sent_at?: string | null; sender?: string; message_type: string; text_preview: string; imported: boolean }
+type TraceMemoMessagesResponse = { days: number; groups: number; total: number; items: TraceMemoMessage[] }
 type ProcessingLog = { id: string; stage: string; level: string; message: string; details: Record<string, any>; created_at: string }
 type ProcessingQueueItem = { id: string; kind: string; raw_message_id?: string | null; company_id?: string | null; status: string; stage: string; attempts: number; lease_until?: string | null; next_attempt_at?: string | null; processor?: string | null; error?: string | null; created_at: string; updated_at: string; connector_id?: string | null; source_group_id?: string | null; source_group_name?: string | null; message_type?: string | null; sender?: string | null; sent_at?: string | null; recognition_status?: string | null; recognized_at?: string | null; recognition_error?: string | null; text_preview?: string | null }
 type ProcessingQueue = { state: 'running' | 'paused'; stats: Record<string, number>; items: ProcessingQueueItem[]; total: number }
@@ -24,6 +26,7 @@ type LocalStorageSnapshot = { database: { path: string; size: number }; backups:
 
 const INDUSTRY_OPTIONS = ['internet_software', 'ai_data', 'electronics_semiconductor', 'telecommunications', 'manufacturing_automation', 'automotive_transport_equipment', 'energy_chemical_materials', 'construction_real_estate', 'finance', 'consumer_retail_ecommerce', 'healthcare_biopharma', 'education_research', 'media_culture_entertainment', 'logistics_transportation', 'professional_services', 'government_public_nonprofit', 'agriculture', 'military_defense', 'other']
 const TAG_LABELS: Record<string, string> = { private: '民营企业', state_owned: '国有企业', foreign_owned: '外资/外企', joint_venture: '合资企业', public_company: '上市公司', government: '政府/事业单位', unknown: '企业类型待确认', internet_software: '互联网/软件', ai_data: '人工智能/数据', electronics_semiconductor: '电子/半导体', telecommunications: '通信', manufacturing_automation: '制造/自动化', automotive_transport_equipment: '汽车/交通装备', energy_chemical_materials: '能源/化工/材料', construction_real_estate: '建筑/房地产', finance: '金融', consumer_retail_ecommerce: '消费/零售/电商', healthcare_biopharma: '医疗/生物医药', education_research: '教育/科研', media_culture_entertainment: '媒体/文化/娱乐', logistics_transportation: '物流/交通运输', professional_services: '专业服务', government_public_nonprofit: '政府/事业单位/公益组织', agriculture: '农业', military_defense: '军工/国防', other: '其他行业' }
+const SOURCE_TYPE_LABELS: Record<string, string> = { wechat_group: '微信群聊', wechat_official_account: '微信公众号', public_web: '公开网页', manual_import: '手动导入', public_negative_news: '公开负面信息' }
 const ADMIN_ONLY_PAGES = new Set(['import', 'admin', 'queue', 'settings', 'review'])
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -396,7 +399,7 @@ function EvidenceCard({ evidence }: { evidence: Evidence }) {
     }
   }
   const value = detail || evidence
-  return <div className={`evidence${open ? ' open' : ''}`}><span className="evidence-dot" /><div><button className="evidence-toggle" onClick={toggle}><strong>{evidence.source_type}</strong><span>{open ? '收起' : '展开全文'}</span></button><p>{evidence.excerpt || '已保存来源证据'}</p>{open && <div className="evidence-full">{error && <div className="form-error">{error}</div>}<div className="evidence-meta">{value.source_group_name && <span>来源群：{value.source_group_name}</span>}{value.sender && <span>发送者：{value.sender}</span>}{value.sent_at && <span>消息时间：{formatDate(value.sent_at)}</span>}{value.observed_at && <span>处理时间：{formatDate(value.observed_at)}</span>}</div>{value.artifact_id && value.mime_type?.startsWith('image/') && <img src={`/api/v1/artifacts/${value.artifact_id}`} alt={value.filename || '来源图片'} />}{value.qr_values?.length ? <><h4>二维码链接</h4><div className="qr-list">{value.qr_values.map((qr, index) => /^https?:\/\//i.test(qr) ? <a href={qr} target="_blank" rel="noreferrer" key={`${qr}-${index}`}>{qr}</a> : <span key={`${qr}-${index}`}>{qr}</span>)}</div></> : null}{value.raw_text && <><h4>原始/提取正文</h4><pre>{value.raw_text}</pre></>}{value.ocr_text && value.ocr_text !== value.raw_text && <><h4>OCR 全文</h4><pre>{value.ocr_text}</pre></>}{value.excerpt && <><h4>结构化结果</h4><pre>{value.excerpt}</pre></>}</div>}{evidence.source_url && <a href={evidence.source_url} target="_blank" rel="noreferrer">打开原始来源 ↗</a>}</div></div>
+  return <div className={`evidence${open ? ' open' : ''}`}><span className="evidence-dot" /><div><button className="evidence-toggle" onClick={toggle}><strong>{SOURCE_TYPE_LABELS[evidence.source_type] || evidence.source_type}</strong><span>{open ? '收起' : '展开全文'}</span></button><p>{evidence.excerpt || '已保存来源证据'}</p>{open && <div className="evidence-full">{error && <div className="form-error">{error}</div>}<div className="evidence-meta">{value.source_group_name && <span>来源群：{value.source_group_name}</span>}{value.sender && <span>发送者：{value.sender}</span>}{value.sent_at && <span>消息时间：{formatDate(value.sent_at)}</span>}{value.observed_at && <span>处理时间：{formatDate(value.observed_at)}</span>}</div>{value.artifact_id && value.mime_type?.startsWith('image/') && <img src={`/api/v1/artifacts/${value.artifact_id}`} alt={value.filename || '来源图片'} />}{value.qr_values?.length ? <><h4>二维码链接</h4><div className="qr-list">{value.qr_values.map((qr, index) => /^https?:\/\//i.test(qr) ? <a href={qr} target="_blank" rel="noreferrer" key={`${qr}-${index}`}>{qr}</a> : <span key={`${qr}-${index}`}>{qr}</span>)}</div></> : null}{value.raw_text && <><h4>原始/提取正文</h4><pre>{value.raw_text}</pre></>}{value.ocr_text && value.ocr_text !== value.raw_text && <><h4>OCR 全文</h4><pre>{value.ocr_text}</pre></>}{value.excerpt && <><h4>结构化结果</h4><pre>{value.excerpt}</pre></>}</div>}{evidence.source_url && <a href={evidence.source_url} target="_blank" rel="noreferrer">打开原始来源 ↗</a>}</div></div>
 }
 
 const WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
@@ -566,7 +569,71 @@ function ReviewPage({ onResolved }: { onResolved: () => Promise<void> }) {
   return <><PageHeader eyebrow="管理员" title="待审核" description="低置信度识别、字段冲突和处理失败会在这里保留完整错误、原始消息与阶段日志。"><button className="secondary" onClick={load}>↻ 刷新</button></PageHeader>{message && <div className="setting-help">{message}</div>}{items.length ? <div className="review-list">{items.map(item => { const payload = item.payload || {}; const original = payload.original_message || payload.original_messages; const task = payload.job || payload.processing_job; const decision = Object.fromEntries(Object.entries(payload).filter(([key]) => !['error', 'original_message', 'original_messages', 'job', 'processing_job', 'processing_logs'].includes(key))); return <div className="detail-card review-card" key={item.id}><div className="review-head"><div><strong>{item.kind}</strong><span>{item.entity_type || 'unknown'} / {item.entity_id || '—'}{item.created_at ? ` · ${formatDate(item.created_at)}` : ''}</span></div><div><button className="secondary" onClick={() => resolve(item.id, 'rejected')}>保留待查</button><button className="primary" onClick={() => resolve(item.id, 'resolved')}>标记已处理</button></div></div><div className="review-sections"><details className="review-section" open={Boolean(payload.error)}><summary>错误信息</summary><pre>{pretty(payload.error || payload.reason || '未提供错误信息')}</pre></details><details className="review-section" open={Boolean(original)}><summary>原始消息（完整内容）</summary><pre>{pretty(original || '未找到关联原始消息')}</pre></details><details className="review-section"><summary>处理任务</summary><pre>{pretty(task || '未找到关联处理任务')}</pre></details><details className="review-section"><summary>处理日志（{Array.isArray(payload.processing_logs) ? payload.processing_logs.length : 0} 条）</summary><pre>{pretty(payload.processing_logs || [])}</pre></details><details className="review-section"><summary>模型/审核结果</summary><pre>{pretty(decision)}</pre></details><details className="review-section"><summary>完整审核载荷</summary><pre>{pretty(payload)}</pre></details></div></div> })}</div> : <div className="empty-state compact"><div className="empty-icon">✓</div><h3>当前没有待审核项</h3><p>自动识别产生低置信度结果或字段冲突后，会在这里显示。</p></div>}</>
 }
 
-function ImportPage({ onImported }: { onImported: () => Promise<void> }) { const [text, setText] = useState(''); const [url, setUrl] = useState(''); const [busy, setBusy] = useState(false); const submitText = async () => { if (!text.trim()) return; setBusy(true); try { await api('/imports/text', { method: 'POST', body: JSON.stringify({ text }) }); setText(''); await onImported() } catch (e) { alert((e as Error).message) } finally { setBusy(false) } }; const submitUrl = async () => { if (!url.trim()) return; setBusy(true); try { await api('/imports/url', { method: 'POST', body: JSON.stringify({ url }) }); setUrl(''); await onImported() } catch (e) { alert((e as Error).message) } finally { setBusy(false) } }; const submitFile = async (file: File) => { setBusy(true); try { const form = new FormData(); form.append('file', file); await api('/imports/files', { method: 'POST', body: form }); await onImported() } catch (e) { alert((e as Error).message) } finally { setBusy(false) } }; return <><PageHeader eyebrow="数据入口" title="导入招聘信息" description="先把信息放进来，系统会自动解析、分类、去重并保留来源。" /><div className="import-grid"><div className="detail-card import-card"><div className="import-icon blue">✎</div><h2>粘贴群聊文字</h2><p>适合复制微信群中的招聘消息、合并转发和招聘说明。</p><textarea value={text} onChange={e => setText(e.target.value)} rows={10} placeholder="粘贴招聘群消息……" /><button className="primary" disabled={busy || !text.trim()} onClick={submitText}>{busy ? '提交中…' : '加入处理队列 →'}</button></div><div className="detail-card import-card"><div className="import-icon violet">↗</div><h2>公开链接与文件</h2><p>公众号文章、企业官网、招聘平台和其他公开页面均可。</p><input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://example.com/recruitment" /><div className="dropzone">将网页 URL 粘贴到上方<br /><span>验证码、登录页和小程序请手工补录</span></div><button className="secondary" disabled={busy || !url.trim()} onClick={submitUrl}>抓取并加入队列 →</button><label className="file-input">选择 PDF、DOCX、XLSX、CSV、TXT 或图片<input type="file" accept=".pdf,.docx,.xlsx,.csv,.txt,.png,.jpg,.jpeg,.webp" onChange={e => e.target.files?.[0] && submitFile(e.target.files[0])} /></label></div></div></> }
+function ImportPage({ onImported }: { onImported: () => Promise<void> }) {
+  const [text, setText] = useState('')
+  const [url, setUrl] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [loadingMessages, setLoadingMessages] = useState(false)
+  const [messages, setMessages] = useState<TraceMemoMessage[]>([])
+  const [selectedMessageIds, setSelectedMessageIds] = useState<string[]>([])
+  const [messageQuery, setMessageQuery] = useState('')
+  const [messageNotice, setMessageNotice] = useState('')
+
+  const loadMessages = async () => {
+    setLoadingMessages(true)
+    try {
+      const result = await api<TraceMemoMessagesResponse>(`/admin/tracememo/messages?limit=200${messageQuery.trim() ? `&query=${encodeURIComponent(messageQuery.trim())}` : ''}`)
+      setMessages(result.items)
+      setSelectedMessageIds(current => current.filter(id => result.items.some(item => item.id === id && !item.imported)))
+      setMessageNotice(`已读取 ${result.groups} 个已勾选群聊中的 ${result.total} 条记录（最近 ${result.days} 天）`)
+    } catch (e) {
+      setMessages([])
+      setSelectedMessageIds([])
+      setMessageNotice((e as Error).message)
+    } finally {
+      setLoadingMessages(false)
+    }
+  }
+
+  useEffect(() => { void loadMessages() }, [])
+
+  const submitText = async () => {
+    if (!text.trim()) return
+    setBusy(true)
+    try { await api('/imports/text', { method: 'POST', body: JSON.stringify({ text }) }); setText(''); await onImported() }
+    catch (e) { alert((e as Error).message) }
+    finally { setBusy(false) }
+  }
+  const submitUrl = async () => {
+    if (!url.trim()) return
+    setBusy(true)
+    try { await api('/imports/url', { method: 'POST', body: JSON.stringify({ url }) }); setUrl(''); await onImported() }
+    catch (e) { alert((e as Error).message) }
+    finally { setBusy(false) }
+  }
+  const submitFile = async (file: File) => {
+    setBusy(true)
+    try { const form = new FormData(); form.append('file', file); await api('/imports/files', { method: 'POST', body: form }); await onImported() }
+    catch (e) { alert((e as Error).message) }
+    finally { setBusy(false) }
+  }
+  const selectableMessages = messages.filter(item => !item.imported)
+  const allSelected = selectableMessages.length > 0 && selectableMessages.every(item => selectedMessageIds.includes(item.id))
+  const toggleMessage = (id: string, selected: boolean) => setSelectedMessageIds(current => selected ? [...current, id].filter((value, index, values) => values.indexOf(value) === index) : current.filter(value => value !== id))
+  const submitSelectedMessages = async () => {
+    if (!selectedMessageIds.length) return
+    setBusy(true)
+    try {
+      const result = await api<{ requested: number; created: number; updated: number; duplicates: number; recognized_skipped: number }>('/admin/tracememo/messages/import', { method: 'POST', body: JSON.stringify({ message_ids: selectedMessageIds }) })
+      setMessageNotice(`已提交 ${result.requested} 条记录：新建 ${result.created} 条，更新 ${result.updated} 条，重复/已识别 ${result.duplicates + result.recognized_skipped} 条`)
+      setSelectedMessageIds([])
+      await onImported()
+    } catch (e) { setMessageNotice((e as Error).message) }
+    finally { setBusy(false) }
+  }
+
+  return <><PageHeader eyebrow="数据入口" title="导入招聘信息" description="先把信息放进来，系统会自动解析、分类、去重并保留来源。" /><div className="import-grid"><div className="detail-card import-card"><div className="import-icon blue">✎</div><h2>粘贴群聊文字</h2><p>适合复制微信群中的招聘消息、合并转发和招聘说明。</p><textarea value={text} onChange={e => setText(e.target.value)} rows={10} placeholder="粘贴招聘群消息……" /><button className="primary" disabled={busy || !text.trim()} onClick={submitText}>{busy ? '提交中…' : '加入处理队列 →'}</button></div><div className="detail-card import-card"><div className="import-icon violet">↗</div><h2>公开链接与文件</h2><p>公众号文章、企业官网、招聘平台和其他公开页面均可。</p><input value={url} onChange={e => setUrl(e.target.value)} placeholder="https://example.com/recruitment" /><div className="dropzone">将网页 URL 粘贴到上方<br /><span>验证码、登录页和小程序请手工补录</span></div><button className="secondary" disabled={busy || !url.trim()} onClick={submitUrl}>抓取并加入队列 →</button><label className="file-input">选择 PDF、DOCX、XLSX、CSV、TXT 或图片<input type="file" accept=".pdf,.docx,.xlsx,.csv,.txt,.png,.jpg,.jpeg,.webp" onChange={e => e.target.files?.[0] && submitFile(e.target.files[0])} /></label></div><section className="detail-card import-card import-messages-card"><div className="import-icon green">☷</div><h2>选择群聊记录导入</h2><p>只显示系统设置中当前勾选的招聘群。可先筛选记录，再手动选择需要进入处理队列的消息。</p><div className="import-message-toolbar"><input className="message-search" value={messageQuery} onChange={e => setMessageQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && void loadMessages()} placeholder="搜索消息内容、发送人或群名" /><button className="secondary" disabled={loadingMessages || busy} onClick={() => void loadMessages()}>{loadingMessages ? '读取中…' : '读取记录'}</button><label className="check"><input type="checkbox" checked={allSelected} onChange={() => setSelectedMessageIds(allSelected ? [] : selectableMessages.map(item => item.id))} />全选未导入</label></div>{messageNotice && <p className="setting-help admin-message">{messageNotice}</p>}{messages.length ? <div className="import-message-list">{messages.map(item => <label className={`import-message${item.imported ? ' imported' : ''}`} key={item.id}><input type="checkbox" disabled={busy || item.imported} checked={selectedMessageIds.includes(item.id)} onChange={event => toggleMessage(item.id, event.target.checked)} /><span className="import-message-copy"><strong>{item.group_name} · {item.sent_at ? formatDate(item.sent_at) : '时间未知'}</strong><span>{item.sender || '未知发送人'} · {item.message_type}</span><p>{item.text_preview || '（图片、文件或无文本消息）'}</p></span><span className={`status ${item.imported ? 'expired' : 'active'}`}>{item.imported ? '已导入' : '待导入'}</span></label>)}</div> : <div className="empty-inline">暂无可选记录。请先在系统设置中勾选招聘群，并点击“读取记录”。</div>}<button className="primary" disabled={busy || !selectedMessageIds.length} onClick={submitSelectedMessages}>{busy ? '导入中…' : `导入选中的 ${selectedMessageIds.length} 条记录 →`}</button></section></div></>
+}
 
 function QueuePage({ onSync, syncing }: { onSync: () => Promise<void>; syncing: boolean }) {
   const [queue, setQueue] = useState<ProcessingQueue | null>(null)

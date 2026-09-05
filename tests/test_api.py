@@ -348,6 +348,55 @@ def test_tracememo_messages_are_cached_until_force_refetch(tmp_path, monkeypatch
     assert db.one("SELECT COUNT(*) AS count FROM tracememo_message_cache")["count"] == 1
 
 
+def test_selected_tracememo_messages_can_be_previewed_and_imported(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    from app.tracememo_cache import store_messages
+    from fastapi.testclient import TestClient
+
+    now = datetime.now(timezone.utc)
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+            ("trace", "tracememo", "http://trace", 1, "{}", db.utc_now()),
+        )
+        connection.execute(
+            "INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            ("group", "trace", "room", "招聘群", 1, 1, db.utc_now(), db.utc_now()),
+        )
+    store_messages(
+        "trace",
+        "group",
+        [{"id": "selected-message", "type": "普通文本", "sender": "张三", "text": "测试科技招聘算法工程师", "datetime": now.isoformat()}],
+        now - timedelta(days=1),
+        now,
+    )
+
+    with TestClient(app, client=("127.0.0.1", 50011)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        listed = client.get("/api/v1/admin/tracememo/messages")
+        assert listed.status_code == 200
+        item = listed.json()["items"][0]
+        assert item["group_name"] == "招聘群"
+        assert item["imported"] is False
+
+        imported = client.post("/api/v1/admin/tracememo/messages/import", json={"message_ids": [item["id"]]})
+        assert imported.status_code == 200
+        assert imported.json()["created"] == 1
+        assert db.one("SELECT COUNT(*) AS count FROM raw_messages")["count"] == 1
+
+        repeated = client.post("/api/v1/admin/tracememo/messages/import", json={"message_ids": [item["id"]]})
+        assert repeated.status_code == 200
+        assert repeated.json()["duplicates"] == 1
+        assert db.one("SELECT COUNT(*) AS count FROM raw_messages")["count"] == 1
+
+        with db.connect() as connection:
+            connection.execute("UPDATE source_groups SET selected=0 WHERE id='group'")
+        rejected = client.post("/api/v1/admin/tracememo/messages/import", json={"message_ids": [item["id"]]})
+        assert rejected.status_code == 400
+
+
 def test_tracememo_auto_sync_fetches_from_group_cursor_and_skips_recognized_messages(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")

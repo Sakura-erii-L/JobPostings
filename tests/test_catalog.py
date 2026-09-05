@@ -57,7 +57,9 @@ def test_catalog_evidence_uses_original_source_url(tmp_path, monkeypatch):
         "2026-09-04T00:00:00+00:00",
     )
     assert db.one("SELECT source_url FROM evidences WHERE raw_message_id=?", (raw_id,))["source_url"] == original_url
+    assert db.one("SELECT source_type FROM evidences WHERE raw_message_id=?", (raw_id,))["source_type"] == "wechat_official_account"
     assert db.one("SELECT source_url FROM company_claims WHERE company_id=(SELECT company_id FROM evidences WHERE raw_message_id=? LIMIT 1)", (raw_id,))["source_url"] == original_url
+    assert db.one("SELECT source_type FROM company_claims WHERE company_id=(SELECT company_id FROM evidences WHERE raw_message_id=? LIMIT 1)", (raw_id,))["source_type"] == "wechat_official_account"
 
 
 def test_explicit_job_and_major_sections_are_saved_separately(tmp_path, monkeypatch):

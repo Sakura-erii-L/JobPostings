@@ -152,6 +152,10 @@ class QueueBulkRequest(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=200)
 
 
+class TraceMemoMessageImportRequest(BaseModel):
+    message_ids: list[str] = Field(min_length=1, max_length=200)
+
+
 background_tasks: set[asyncio.Task[Any]] = set()
 _sync_lock = threading.Lock()
 
@@ -289,6 +293,48 @@ def _sync_cursor_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _tracememo_message_text(message: dict[str, Any]) -> str:
+    text = str(message.get("text") or message.get("content") or "").strip()
+    if text:
+        return text
+    content_data = message.get("contentData")
+    if isinstance(content_data, dict):
+        return str(content_data.get("title") or content_data.get("description") or "").strip()
+    return ""
+
+
+def _tracememo_media_id(message: dict[str, Any]) -> str:
+    message_type = str(message.get("type") or message.get("msgType") or "").lower()
+    media_info = message.get("media") if isinstance(message.get("media"), dict) else {}
+    media_url = str(media_info.get("url") or "")
+    return str(
+        message.get("media_id")
+        or message.get("mediaId")
+        or message.get("attachment_id")
+        or (media_url.rstrip("/").rsplit("/", 1)[-1] if media_url else "")
+        or (message.get("id") if is_image_message(message_type, message) or is_file_message(message_type, message) else "")
+        or ""
+    )
+
+
+def _attach_tracememo_media(client: TraceMemoClient, message: dict[str, Any], raw_id: str, stats: dict[str, int]) -> None:
+    message_type = str(message.get("type") or message.get("msgType") or "").lower()
+    if not _tracememo_media_id(message) or not (is_image_message(message_type, message) or is_file_message(message_type, message)):
+        return
+    media_id = _tracememo_media_id(message)
+    try:
+        media, suggested_name = client.media(media_id)
+        media_info = message.get("media") if isinstance(message.get("media"), dict) else {}
+        filename = str(message.get("filename") or message.get("fileName") or media_info.get("filename") or suggested_name or f"{media_id}.bin")
+        attach_artifact(raw_id, filename, media, message.get("mime_type") or message.get("mimeType"))
+        stats["media_attached"] = stats.get("media_attached", 0) + 1
+    except Exception as exc:
+        stats["media_failed"] = stats.get("media_failed", 0) + 1
+        processing_job = one("SELECT id FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))
+        if processing_job:
+            log_processing(processing_job["id"], "extracting", "TraceMemo 媒体下载失败，后续将保留原消息并尝试其他提取方式", "warning", {"media_id": media_id, "error": str(exc)})
+
+
 def sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict[str, Any]:
     with _sync_lock:
         return _sync_tracememo_once(force, incremental)
@@ -351,21 +397,7 @@ def _sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict
                 continue
             raw_id = ingest_message(message, row["id"], group["id"], ingest_stats)
             if raw_id:
-                message_type = str(message.get("type") or message.get("msgType") or "").lower()
-                media_info = message.get("media") if isinstance(message.get("media"), dict) else {}
-                media_url = str(media_info.get("url") or "")
-                media_id = str(message.get("media_id") or message.get("mediaId") or message.get("attachment_id") or (media_url.rstrip("/").rsplit("/", 1)[-1] if media_url else "") or (message.get("id") if is_image_message(message_type, message) or is_file_message(message_type, message) else "") or "")
-                if media_id and (is_image_message(message_type, message) or is_file_message(message_type, message)):
-                    try:
-                        media, suggested_name = client.media(media_id)
-                        filename = str(message.get("filename") or message.get("fileName") or suggested_name or f"{media_id}.bin")
-                        attach_artifact(raw_id, filename, media, message.get("mime_type") or message.get("mimeType"))
-                        ingest_stats["media_attached"] += 1
-                    except Exception as exc:
-                        ingest_stats["media_failed"] += 1
-                        processing_job = one("SELECT id FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))
-                        if processing_job:
-                            log_processing(processing_job["id"], "extracting", "TraceMemo 媒体下载失败，后续将保留原消息并尝试其他提取方式", "warning", {"media_id": media_id, "error": str(exc)})
+                _attach_tracememo_media(client, message, raw_id, ingest_stats)
         if not use_cache:
             with connect() as connection:
                 connection.execute("INSERT OR REPLACE INTO sync_cursors(source_group_id,cursor_time,cursor_message_id,updated_at) VALUES(?,?,?,?)", (group["id"], end.isoformat(), None, utc_now()))
@@ -393,6 +425,117 @@ def _sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict
         "reset": reset_result,
         "groups": len(groups),
     }
+
+
+def tracememo_messages(days: int = 0, limit: int = 100, query: str = "", _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    """List recent messages from the currently selected TraceMemo groups without importing them."""
+    connector = one("SELECT * FROM connectors WHERE kind='tracememo'")
+    if not connector:
+        raise HTTPException(400, "TraceMemo is not configured")
+    groups = all_rows(
+        "SELECT id,external_id,name FROM source_groups WHERE connector_id=? AND selected=1 AND enabled=1 ORDER BY name COLLATE NOCASE",
+        (connector["id"],),
+    )
+    if not groups:
+        raise HTTPException(400, "没有已勾选的招聘群，请先在系统设置中保存群聊选择")
+    days = max(1, min(days or _import_days(), 90))
+    limit = max(1, min(limit, 200))
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    state_groups = {
+        row["source_group_id"]
+        for row in all_rows(
+            "SELECT source_group_id FROM tracememo_cache_state WHERE connector_id=?",
+            (connector["id"],),
+        )
+    }
+    if any(group["id"] not in state_groups for group in groups):
+        if not connector["enabled"]:
+            raise HTTPException(400, "TraceMemo 未启用，且当前勾选群聊没有可用缓存")
+        settings = json.loads(connector["config_json"] or "{}")
+        client = TraceMemoClient(connector["base_url"], SecretVault().decrypt(settings["token"]) if settings.get("token") else "")
+        for group in groups:
+            if group["id"] in state_groups:
+                continue
+            messages = client.messages(group["external_id"], start, now)
+            store_messages(connector["id"], group["id"], messages, start, now)
+
+    group_ids = [group["id"] for group in groups]
+    placeholders = ",".join("?" for _ in group_ids)
+    rows = all_rows(
+        f"""SELECT cache.id,cache.source_group_id,cache.external_message_id,cache.source_time,cache.message_json,
+                   groups.name AS group_name,groups.external_id AS group_external_id,
+                   EXISTS(SELECT 1 FROM raw_messages raw
+                          WHERE raw.connector_id=cache.connector_id
+                            AND raw.source_group_id=cache.source_group_id
+                            AND raw.external_message_id=cache.external_message_id) AS imported
+            FROM tracememo_message_cache cache
+            JOIN source_groups groups ON groups.id=cache.source_group_id
+            WHERE cache.connector_id=? AND cache.source_group_id IN ({placeholders})
+              AND (cache.source_time IS NULL OR (cache.source_time>=? AND cache.source_time<=?))
+            ORDER BY CASE WHEN cache.source_time IS NULL THEN 1 ELSE 0 END, cache.source_time DESC, cache.id DESC""",
+        (connector["id"], *group_ids, start.isoformat(), now.isoformat()),
+    )
+    needle = query.strip().casefold()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            message = json.loads(row["message_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(message, dict):
+            continue
+        text = _tracememo_message_text(message)
+        sender = str(message.get("sender") or message.get("talker") or "").strip()
+        if needle and needle not in " ".join((row["group_name"], row["group_external_id"], sender, text)).casefold():
+            continue
+        items.append(
+            {
+                "id": row["id"],
+                "external_message_id": row["external_message_id"],
+                "source_group_id": row["source_group_id"],
+                "group_name": row["group_name"],
+                "sent_at": row["source_time"] or parse_message_time(message),
+                "sender": sender,
+                "message_type": str(message.get("type") or message.get("msgType") or "text"),
+                "text_preview": text[:300],
+                "imported": bool(row["imported"]),
+            }
+        )
+    return {"days": days, "start_at": start.isoformat(), "end_at": now.isoformat(), "groups": len(groups), "total": len(items), "items": items[:limit]}
+
+
+def import_selected_tracememo_messages(body: TraceMemoMessageImportRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    message_ids = list(dict.fromkeys(body.message_ids))
+    placeholders = ",".join("?" for _ in message_ids)
+    rows = all_rows(
+        f"""SELECT cache.id,cache.connector_id,cache.source_group_id,cache.message_json
+            FROM tracememo_message_cache cache
+            JOIN source_groups groups ON groups.id=cache.source_group_id
+            WHERE cache.id IN ({placeholders}) AND groups.selected=1 AND groups.enabled=1""",
+        tuple(message_ids),
+    )
+    if len(rows) != len(message_ids):
+        raise HTTPException(400, "只能导入当前已勾选群聊中的消息，请刷新列表后重试")
+    connector = one("SELECT * FROM connectors WHERE id=?", (rows[0]["connector_id"],))
+    if not connector:
+        raise HTTPException(400, "TraceMemo 连接器不存在")
+    settings = json.loads(connector["config_json"] or "{}")
+    client = TraceMemoClient(connector["base_url"], SecretVault().decrypt(settings["token"]) if settings.get("token") else "")
+    stats: dict[str, int] = {"created": 0, "updated": 0, "duplicates": 0, "recognized_skipped": 0, "filtered_system": 0, "media_attached": 0, "media_failed": 0}
+    raw_ids: list[str] = []
+    for row in rows:
+        try:
+            message = json.loads(row["message_json"] or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(400, f"缓存消息内容无效：{row['id']}") from exc
+        if not isinstance(message, dict):
+            raise HTTPException(400, f"缓存消息内容无效：{row['id']}")
+        raw_id = ingest_message(message, row["connector_id"], row["source_group_id"], stats)
+        if raw_id:
+            raw_ids.append(raw_id)
+            _attach_tracememo_media(client, message, raw_id, stats)
+    return {"status": "queued", "requested": len(message_ids), "raw_message_ids": list(dict.fromkeys(raw_ids)), **stats}
 
 
 async def auto_sync_loop() -> None:
@@ -439,6 +582,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="JobPostings", version="0.1.0", lifespan=lifespan)
+app.add_api_route("/api/v1/admin/tracememo/messages", tracememo_messages, methods=["GET"])
+app.add_api_route("/api/v1/admin/tracememo/messages/import", import_selected_tracememo_messages, methods=["POST"])
 
 
 @app.get("/health")

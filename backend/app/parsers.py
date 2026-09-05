@@ -395,6 +395,11 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+def is_wechat_public_url(url: str) -> bool:
+    host = (urlparse(str(url)).hostname or "").lower()
+    return host == "mp.weixin.qq.com" or host.endswith(".weixin.qq.com")
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -610,8 +615,7 @@ def fetch_public_http(url: str, timeout: float = 30, max_bytes: int = 10 * 1024 
 
 def is_access_challenge_page(url: str, text: str) -> bool:
     """Detect the WeChat environment-verification page instead of treating it as article text."""
-    host = (urlparse(url).hostname or "").lower()
-    if host != "mp.weixin.qq.com" and not host.endswith(".weixin.qq.com"):
+    if not is_wechat_public_url(url):
         return False
     compact = normalize_text(text)
     return "当前环境异常" in compact and "完成验证后即可继续访问" in compact

@@ -11,7 +11,7 @@ from uuid import uuid4
 from .config import config
 from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title
 from .db import connect, utc_now
-from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, normalize_event_datetime, parse_message_time, recover_original_source_url
+from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, is_wechat_public_url, normalize_event_datetime, parse_message_time, recover_original_source_url
 
 
 # Imported recruitment content and its derived catalog are reset together so
@@ -133,6 +133,7 @@ def repair_source_urls() -> dict[str, int]:
         "evidences_updated": 0,
         "company_claims_checked": 0,
         "company_claims_updated": 0,
+        "source_types_updated": 0,
         "public_findings_checked": 0,
         "public_findings_updated": 0,
     }
@@ -168,21 +169,43 @@ def repair_source_urls() -> dict[str, int]:
                 )
                 result["raw_messages_updated"] += 1
 
-        evidence_rows = connection.execute("SELECT id,raw_message_id,source_url FROM evidences").fetchall()
+        evidence_rows = connection.execute("SELECT id,raw_message_id,source_url,source_type FROM evidences").fetchall()
         for row in evidence_rows:
             result["evidences_checked"] += 1
             original = raw_sources.get(row["raw_message_id"]) or recover_original_source_url(row["source_url"])
+            source_url = original or row["source_url"]
+            updates: list[str] = []
+            values: list[Any] = []
             if original and original != row["source_url"]:
-                connection.execute("UPDATE evidences SET source_url=? WHERE id=?", (original, row["id"]))
+                updates.append("source_url=?")
+                values.append(original)
                 result["evidences_updated"] += 1
+            if row["source_type"] == "public_web" and is_wechat_public_url(source_url or ""):
+                updates.append("source_type=?")
+                values.append("wechat_official_account")
+                result["source_types_updated"] += 1
+            if updates:
+                values.append(row["id"])
+                connection.execute(f"UPDATE evidences SET {', '.join(updates)} WHERE id=?", tuple(values))
 
-        claim_rows = connection.execute("SELECT id,source_url FROM company_claims").fetchall()
+        claim_rows = connection.execute("SELECT id,source_url,source_type FROM company_claims").fetchall()
         for row in claim_rows:
             result["company_claims_checked"] += 1
             original = recover_original_source_url(row["source_url"])
+            source_url = original or row["source_url"]
+            updates = []
+            values = []
             if original and original != row["source_url"]:
-                connection.execute("UPDATE company_claims SET source_url=? WHERE id=?", (original, row["id"]))
+                updates.append("source_url=?")
+                values.append(original)
                 result["company_claims_updated"] += 1
+            if row["source_type"] == "public_web" and is_wechat_public_url(source_url or ""):
+                updates.append("source_type=?")
+                values.append("wechat_official_account")
+                result["source_types_updated"] += 1
+            if updates:
+                values.append(row["id"])
+                connection.execute(f"UPDATE company_claims SET {', '.join(updates)} WHERE id=?", tuple(values))
         finding_rows = connection.execute("SELECT id,source_url FROM company_public_findings").fetchall()
         for row in finding_rows:
             result["public_findings_checked"] += 1

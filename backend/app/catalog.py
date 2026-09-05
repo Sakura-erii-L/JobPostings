@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .db import connect, one, utc_now
-from .parsers import extract_recruitment_catalog, is_link_message, normalize_event_datetime, recover_original_source_url
+from .parsers import extract_recruitment_catalog, is_link_message, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
 
 
 INDUSTRIES = {
@@ -39,6 +39,10 @@ INDUSTRY_LABELS = {
     "military_defense": "军工/国防",
     "other": "其他行业",
 }
+
+
+def source_type_for_url(url: str) -> str:
+    return "wechat_official_account" if is_wechat_public_url(url) else "public_web"
 COMPANY_TYPE_CODES = {
     "private", "state_owned", "foreign_owned", "joint_venture", "public_company", "government", "unknown",
 }
@@ -631,7 +635,7 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
             except json.JSONDecodeError:
                 raw_metadata = {}
             if is_link_message(raw_row["message_type"], raw_metadata):
-                source_type = "public_web"
+                source_type = source_type_for_url(recover_original_source_url(raw_metadata.get("source_url") or raw_metadata.get("url")) or "")
             source_url = recover_original_source_url(raw_metadata.get("source_url") or raw_metadata.get("url"))
     connection.execute(
         "INSERT INTO evidences(id,job_id,raw_message_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?)",
@@ -679,7 +683,7 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
                 metadata = {}
         source_type = "manual_import" if raw_row and raw_row["connector_id"] == "manual" else "wechat_group"
         if raw_row and is_link_message(raw_row["message_type"], metadata):
-            source_type = "public_web"
+            source_type = source_type_for_url(recover_original_source_url(metadata.get("source_url") or metadata.get("url")) or "")
         source_url = recover_original_source_url(metadata.get("source_url") or metadata.get("url"))
         artifact_id = metadata.get("artifact_id")
         evidence_id = str(uuid4())

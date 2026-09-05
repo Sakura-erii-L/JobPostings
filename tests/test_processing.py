@@ -197,6 +197,7 @@ def test_repair_source_urls_restores_original_links_and_keeps_redirect(tmp_path,
     raw_metadata = json.loads(db.one("SELECT metadata_json FROM raw_messages WHERE id=?", (raw_id,))["metadata_json"])
     assert raw_metadata == {"url": original_url, "source_url": original_url, "resolved_url": challenge_url}
     assert db.one("SELECT source_url FROM evidences WHERE id='legacy-evidence'")["source_url"] == original_url
+    assert db.one("SELECT source_type FROM evidences WHERE id='legacy-evidence'")["source_type"] == "wechat_official_account"
 
 
 def test_system_messages_are_filtered_before_queueing(tmp_path, monkeypatch):
