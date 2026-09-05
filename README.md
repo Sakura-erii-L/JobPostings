@@ -2,6 +2,15 @@
 
 面向个人和受邀用户的招聘信息聚合系统。系统运行在 Windows 本机，以浏览器为主要界面，通过 TraceMemo 读取已选择的微信群消息，使用可配置的 OpenAI-compatible 模型进行招聘识别和结构化抽取，并保留来源、岗位版本、企业介绍和个人求职进度。
 
+## 项目文档
+
+- [`AGENTS.md`](AGENTS.md)：Codex 优先阅读的项目规则、关键文件、约束和常用命令。
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：目录结构、模块职责、数据流、SQLite 数据域和 API 入口。
+- [`docs/STATUS.md`](docs/STATUS.md)：当前完成情况、验证结果、已知问题和近期修改记录。
+- [`docs/SETUP.md`](docs/SETUP.md)：账号、配置、TraceMemo、备份、恢复和 Windows 打包。
+- [`docs/MODEL_AND_PRIVACY.md`](docs/MODEL_AND_PRIVACY.md)：模型调用、脱敏、预算和隐私边界。
+- [`docs/TRACE_MEMO.md`](docs/TRACE_MEMO.md)：TraceMemo 连接器行为和同步语义。
+
 ## 运行
 
 正式基线使用 Python 3.12。开发环境可执行：
