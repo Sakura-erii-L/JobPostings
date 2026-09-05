@@ -110,7 +110,7 @@ def run_codex_json(
                 "--cd",
                 str(temp_dir),
                 "--config",
-                'model_reasoning_effort="medium"',
+                'model_reasoning_effort="max"',
                 "--config",
                 'forced_login_method="chatgpt"',
             ])
