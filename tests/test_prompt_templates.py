@@ -139,7 +139,7 @@ def test_run_codex_json_sends_rendered_markdown_prompt_to_stdin(monkeypatch):
     }
     assert captured["rmtree_kwargs"] == {"ignore_errors": True}
     assert Path(captured["rmtree_args"][0]).parent == data_dir / "temp"
-    assert 'model_reasoning_effort="max"' in captured["command"]
+    assert 'model_reasoning_effort="high"' in captured["command"]
     assert "# Codex 连接测试" in str(captured["prompt"])
     assert '"task": "connection_test"' in str(captured["prompt"])
     assert '"expected_output": {"ok": true}' in str(captured["prompt"])

@@ -10,7 +10,6 @@ from .parsers import validate_public_url
 
 
 MAX_BROWSER_IMAGES = 24
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 def _browser_executable() -> Path | None:
@@ -135,29 +134,6 @@ def fetch_public_browser(url: str) -> dict[str, Any]:
                 if image_url and image_url not in image_urls:
                     image_urls.append(image_url)
 
-            image_data: list[dict[str, Any]] = []
-            for image_url in image_urls[:MAX_BROWSER_IMAGES]:
-                try:
-                    image_response = context.request.get(
-                        image_url,
-                        timeout=30_000,
-                        fail_on_status_code=False,
-                    )
-                    final_image_url = str(image_response.url)
-                    validate_public_url(final_image_url)
-                    if not 200 <= image_response.status < 300:
-                        continue
-                    data = image_response.body()
-                    if not data or len(data) > MAX_IMAGE_BYTES:
-                        continue
-                    image_data.append({
-                        "url": image_url,
-                        "data": data,
-                        "content_type": image_response.headers.get("content-type", ""),
-                    })
-                except Exception:
-                    continue
-
             link_selector = "#js_content a" if article.count() else "body a"
             links = page.locator(link_selector).evaluate_all(
                 "anchors => anchors.map(anchor => anchor.href).filter(Boolean)"
@@ -176,12 +152,12 @@ def fetch_public_browser(url: str) -> dict[str, Any]:
                 "content_type": content_type,
                 "links": list(dict.fromkeys(urljoin(page_url, str(link)) for link in links))[:100],
                 "images": image_urls[:MAX_BROWSER_IMAGES],
-                "image_data": image_data,
+                "image_data": [],
                 "screenshot_data": screenshot_data,
                 "browser_rendered": True,
                 "browser_image_count": len(image_snapshot),
                 "browser_loaded_image_count": sum(bool(item.get("loaded")) for item in image_snapshot),
-                "browser_downloaded_image_count": len(image_data),
+                "browser_downloaded_image_count": 0,
                 "browser_article_text_chars": len(article_text),
                 "access_challenge": bool(challenge_markers),
                 "access_error": "浏览器页面要求环境验证" if challenge_markers else "",

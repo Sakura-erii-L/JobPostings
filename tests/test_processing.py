@@ -491,7 +491,7 @@ def test_wechat_browser_rendered_images_are_processed_after_http_challenge(tmp_p
         "browser_rendered": True,
         "browser_image_count": 1,
         "browser_loaded_image_count": 1,
-        "browser_downloaded_image_count": 1,
+        "browser_downloaded_image_count": 0,
         "browser_article_text_chars": 0,
         "access_challenge": False,
     })
@@ -502,19 +502,21 @@ def test_wechat_browser_rendered_images_are_processed_after_http_challenge(tmp_p
         return {"id": f"artifact-{len(artifact_calls)}", "text": "图片 OCR 招聘正文", "qr_values": ["https://apply.example.com"]}
 
     monkeypatch.setattr("app.processing.attach_artifact", fake_attach)
+    monkeypatch.setattr("app.processing.fetch_public_http", lambda *args, **kwargs: pytest.fail("公众号不应下载单张原图"))
     monkeypatch.setattr("app.processing._codex_extract", lambda *args, **kwargs: "图片 OCR 招聘正文")
     text, metadata = _extract_source_text(job, raw)
     assert "图片 OCR 招聘正文" in text
     assert metadata["browser_attempted"] is True
     assert metadata["browser_rendered"] is True
     assert metadata["browser_loaded_image_count"] == 1
+    assert metadata["browser_downloaded_image_count"] == 0
     assert metadata["browser_screenshot_captured"] is True
     assert metadata["source_url"] == original_url
     assert metadata["resolved_url"] == challenge_url
     assert metadata["web_access_status"] == "ok"
     assert metadata["linked_image_urls"] == [image_url]
     assert metadata["qr_values"] == ["https://apply.example.com"]
-    assert artifact_calls == ["linked-image-1.png", "webpage-screenshot.jpg"]
+    assert artifact_calls == ["webpage-screenshot.jpg"]
 
 
 def test_browser_screenshot_is_used_when_image_ocr_has_no_text(tmp_path, monkeypatch):

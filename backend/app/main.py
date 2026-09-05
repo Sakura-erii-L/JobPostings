@@ -1243,6 +1243,26 @@ def companies(q: str | None = None, industry: str | None = None, _: dict[str, An
     return result
 
 
+def _deduplicate_evidences(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        source_url = str(row.get("source_url") or "").strip()
+        raw_message_id = str(row.get("raw_message_id") or "").strip()
+        if source_url:
+            identity = ("source_url", source_url)
+        elif raw_message_id:
+            identity = ("raw_message_id", raw_message_id)
+        else:
+            result.append(row)
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(row)
+    return result
+
+
 @app.get("/api/v1/companies/{company_id}")
 def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> dict[str, Any]:
     company = one("SELECT * FROM companies WHERE id=?", (company_id,))
@@ -1256,10 +1276,10 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
                     job[key[:-5]] = json.loads(job.pop(key))
                 except json.JSONDecodeError:
                     pass
-    evidences = [dict(row) for row in all_rows("""SELECT * FROM evidences
+    evidences = _deduplicate_evidences([dict(row) for row in all_rows("""SELECT * FROM evidences
         WHERE company_id=? OR job_id IN (SELECT id FROM jobs WHERE company_id=?)
         ORDER BY CASE WHEN source_type='wechat_group' OR lower(COALESCE(source_url,'')) LIKE '%weixin%' THEN 0 ELSE 1 END,
-                 observed_at DESC""", (company_id, company_id))]
+                 observed_at DESC""", (company_id, company_id))])
     public_findings = [dict(row) for row in all_rows("SELECT id,finding_type,title,summary,source_title,source_url,resolved_url,published_at,severity,retrieved_at FROM company_public_findings WHERE company_id=? ORDER BY retrieved_at DESC", (company_id,))]
     shared_details = [dict(row) for row in all_rows(
         """SELECT d.*,b.name AS batch_name,b.year AS batch_year,b.season AS batch_season,

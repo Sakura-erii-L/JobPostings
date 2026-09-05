@@ -642,6 +642,7 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
     qr_values: list[str] = []
     ocr_texts: list[str] = []
     artifact_ids: list[str] = []
+    is_wechat = _is_wechat_public_url(str(metadata.get("source_url") or metadata.get("url") or ""))
     image_urls = [str(value) for value in parsed.get("images") or [] if value]
     browser_image_data = [
         value
@@ -650,60 +651,61 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
     ]
     processed_image_urls: set[str] = set()
     downloaded = 0
-    direct_data = parsed.get("data")
-    if isinstance(direct_data, bytes) and direct_data:
-        try:
-            artifact = attach_artifact(
-                raw["id"],
-                str(parsed.get("filename") or "web-image.bin"),
-                direct_data,
-                str(parsed.get("content_type") or "") or None,
-            )
-            artifact_ids.append(artifact["id"])
-            qr_values.extend(artifact.get("qr_values") or [])
-            ocr_texts.append(str(artifact.get("text") or ""))
-            downloaded += 1
-        except Exception as exc:
-            log_processing(job["id"], "extracting", "网页本身为图片，但图片提取失败", "warning", {"error": str(exc)})
-    for index, image in enumerate(browser_image_data[:24], start=1):
-        image_url = str(image.get("url") or "")
-        try:
-            artifact = attach_artifact(
-                raw["id"],
-                _web_image_filename(image_url, str(image.get("content_type") or ""), index, detect_image_suffix(image["data"])),
-                image["data"],
-                str(image.get("content_type") or "") or None,
-            )
-            artifact_ids.append(artifact["id"])
-            qr_values.extend(artifact.get("qr_values") or [])
-            ocr_texts.append(str(artifact.get("text") or ""))
-            processed_image_urls.add(image_url)
-            downloaded += 1
-        except Exception as exc:
-            log_processing(job["id"], "extracting", "浏览器图片提取失败", "warning", {"url": image_url, "error": str(exc)})
-    image_urls = list(dict.fromkeys([*image_urls, *(str(image.get("url") or "") for image in browser_image_data if image.get("url"))]))
-    for index, image_url in enumerate(image_urls[:24], start=1):
-        if image_url in processed_image_urls:
-            continue
-        try:
-            response = fetch_public_http(image_url, timeout=30, max_bytes=10 * 1024 * 1024)
-            content_type = response.headers.get("content-type", "")
-            media_type = content_type.split(";", 1)[0].strip().lower()
-            detected_suffix = detect_image_suffix(response.content)
-            if not media_type.startswith("image/") and not detected_suffix:
+    if not is_wechat:
+        direct_data = parsed.get("data")
+        if isinstance(direct_data, bytes) and direct_data:
+            try:
+                artifact = attach_artifact(
+                    raw["id"],
+                    str(parsed.get("filename") or "web-image.bin"),
+                    direct_data,
+                    str(parsed.get("content_type") or "") or None,
+                )
+                artifact_ids.append(artifact["id"])
+                qr_values.extend(artifact.get("qr_values") or [])
+                ocr_texts.append(str(artifact.get("text") or ""))
+                downloaded += 1
+            except Exception as exc:
+                log_processing(job["id"], "extracting", "网页本身为图片，但图片提取失败", "warning", {"error": str(exc)})
+        for index, image in enumerate(browser_image_data[:24], start=1):
+            image_url = str(image.get("url") or "")
+            try:
+                artifact = attach_artifact(
+                    raw["id"],
+                    _web_image_filename(image_url, str(image.get("content_type") or ""), index, detect_image_suffix(image["data"])),
+                    image["data"],
+                    str(image.get("content_type") or "") or None,
+                )
+                artifact_ids.append(artifact["id"])
+                qr_values.extend(artifact.get("qr_values") or [])
+                ocr_texts.append(str(artifact.get("text") or ""))
+                processed_image_urls.add(image_url)
+                downloaded += 1
+            except Exception as exc:
+                log_processing(job["id"], "extracting", "浏览器图片提取失败", "warning", {"url": image_url, "error": str(exc)})
+        image_urls = list(dict.fromkeys([*image_urls, *(str(image.get("url") or "") for image in browser_image_data if image.get("url"))]))
+        for index, image_url in enumerate(image_urls[:24], start=1):
+            if image_url in processed_image_urls:
                 continue
-            artifact = attach_artifact(
-                raw["id"],
-                _web_image_filename(image_url, content_type, index, detected_suffix),
-                response.content,
-                content_type or None,
-            )
-            artifact_ids.append(artifact["id"])
-            qr_values.extend(artifact.get("qr_values") or [])
-            ocr_texts.append(str(artifact.get("text") or ""))
-            downloaded += 1
-        except Exception as exc:
-            log_processing(job["id"], "extracting", "网页图片提取失败", "warning", {"url": image_url, "error": str(exc)})
+            try:
+                response = fetch_public_http(image_url, timeout=30, max_bytes=10 * 1024 * 1024)
+                content_type = response.headers.get("content-type", "")
+                media_type = content_type.split(";", 1)[0].strip().lower()
+                detected_suffix = detect_image_suffix(response.content)
+                if not media_type.startswith("image/") and not detected_suffix:
+                    continue
+                artifact = attach_artifact(
+                    raw["id"],
+                    _web_image_filename(image_url, content_type, index, detected_suffix),
+                    response.content,
+                    content_type or None,
+                )
+                artifact_ids.append(artifact["id"])
+                qr_values.extend(artifact.get("qr_values") or [])
+                ocr_texts.append(str(artifact.get("text") or ""))
+                downloaded += 1
+            except Exception as exc:
+                log_processing(job["id"], "extracting", "网页图片提取失败", "warning", {"url": image_url, "error": str(exc)})
     if image_urls:
         metadata["linked_image_urls"] = image_urls[:24]
     screenshot_data = parsed.get("screenshot_data")

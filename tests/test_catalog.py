@@ -86,6 +86,37 @@ def test_catalog_evidence_uses_original_source_url(tmp_path, monkeypatch):
     assert db.one("SELECT source_type FROM company_claims WHERE company_id=(SELECT company_id FROM evidences WHERE raw_message_id=? LIMIT 1)", (raw_id,))["source_type"] == "wechat_official_account"
 
 
+def test_company_detail_deduplicates_evidences_with_same_source_url(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    source_url = "https://mp.weixin.qq.com/s/same-source"
+    raw_id = ingest_message({"id": "same-source", "type": "article", "text": "公众号文章", "url": source_url}, "manual", None)
+    assert raw_id
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "confidence": 0.9,
+            "company": {"display_name": "重复来源测试科技"},
+            "batch": {"name": "2026 校招", "recruitment_type": "campus"},
+            "jobs": [{"title": "测试工程师", "recruitment_type": "campus", "employment_type": "full_time"}],
+        },
+        raw_id,
+        "2026-09-04T00:00:00+00:00",
+    )
+    company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("重复来源测试科技",))["id"]
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO evidences(id,company_id,raw_message_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?)",
+            ("duplicate-evidence", company_id, raw_id, source_url, "wechat_official_account", "重复证据", "2026-09-05T00:00:00+00:00"),
+        )
+
+    payload = company_detail(company_id, {})
+    assert len(payload["evidences"]) == 1
+    assert payload["evidences"][0]["source_url"] == source_url
+
+
 def test_shared_salary_and_locations_are_stored_separately_from_jobs(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(db.config, "db_path", db_path)
