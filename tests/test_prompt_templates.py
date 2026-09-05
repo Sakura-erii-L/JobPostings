@@ -65,6 +65,28 @@ def test_unknown_prompt_task_is_rejected():
 
 def test_run_codex_json_sends_rendered_markdown_prompt_to_stdin(monkeypatch):
     captured: dict[str, object] = {}
+    data_dir = Path("D:/jobpostings-test-data")
+    read_text = codex_agent.Path.read_text
+
+    def capture_mkdtemp(*args, **kwargs):
+        captured["mkdtemp_kwargs"] = kwargs
+        return str(data_dir / "temp" / "jobpostings-codex-test")
+
+    def capture_rmtree(*args, **kwargs):
+        captured["rmtree_args"] = args
+        captured["rmtree_kwargs"] = kwargs
+
+    def fake_exists(path):
+        return path.name == "result.json"
+
+    def fake_write_text(path, value, **kwargs):
+        captured.setdefault("files", {})[str(path)] = value
+
+    def fake_read_text(path, **kwargs):
+        files = captured.get("files", {})
+        if str(path) in files:
+            return files[str(path)]
+        return read_text(path, **kwargs)
 
     class FakeProcess:
         returncode = 0
@@ -86,8 +108,15 @@ def test_run_codex_json_sends_rendered_markdown_prompt_to_stdin(monkeypatch):
             return None
 
     monkeypatch.setattr(codex_agent.Path, "home", lambda: Path("Z:/jobpostings-test-home-does-not-exist"))
+    monkeypatch.setattr(codex_agent.Path, "mkdir", lambda *args, **kwargs: None)
+    monkeypatch.setattr(codex_agent.Path, "exists", fake_exists)
+    monkeypatch.setattr(codex_agent.Path, "write_text", fake_write_text)
+    monkeypatch.setattr(codex_agent.Path, "read_text", fake_read_text)
+    monkeypatch.setattr(codex_agent.config, "data_dir", data_dir)
     monkeypatch.setattr(codex_agent.shutil, "which", lambda _: "codex")
     monkeypatch.setattr(codex_agent.subprocess, "Popen", FakeProcess)
+    monkeypatch.setattr(codex_agent.tempfile, "mkdtemp", capture_mkdtemp)
+    monkeypatch.setattr(codex_agent.shutil, "rmtree", capture_rmtree)
     monkeypatch.setattr(codex_agent, "_acquire_slot", lambda: None)
     monkeypatch.setattr(codex_agent, "_release_slot", lambda: None)
 
@@ -104,6 +133,12 @@ def test_run_codex_json_sends_rendered_markdown_prompt_to_stdin(monkeypatch):
     )
 
     assert result == {"ok": True}
+    assert captured["mkdtemp_kwargs"] == {
+        "prefix": "jobpostings-codex-",
+        "dir": data_dir / "temp",
+    }
+    assert captured["rmtree_kwargs"] == {"ignore_errors": True}
+    assert Path(captured["rmtree_args"][0]).parent == data_dir / "temp"
     assert "# Codex 连接测试" in str(captured["prompt"])
     assert '"task": "connection_test"' in str(captured["prompt"])
     assert '"expected_output": {"ok": true}' in str(captured["prompt"])

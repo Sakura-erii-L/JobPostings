@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from .config import config
 from .prompt_templates import render_prompt_template
 
 
@@ -64,8 +65,10 @@ def run_codex_json(
     model = "gpt-5.6-luna"
     _acquire_slot()
     try:
-        with tempfile.TemporaryDirectory(prefix="jobpostings-codex-") as temp_name:
-            temp_dir = Path(temp_name)
+        temp_root = config.data_dir / "temp"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="jobpostings-codex-", dir=temp_root))
+        try:
             codex_home = temp_dir / "codex-home"
             codex_home.mkdir()
             source_auth = Path.home() / ".codex" / "auth.json"
@@ -153,5 +156,10 @@ def run_codex_json(
             if not isinstance(value, dict):
                 raise ValueError("Local Codex result root must be an object")
             return value
+        finally:
+            # A Windows sandbox or a lingering child handle can temporarily
+            # block deletion. Cleanup is best-effort and must not replace the
+            # model result with PermissionError: [WinError 5].
+            shutil.rmtree(temp_dir, ignore_errors=True)
     finally:
         _release_slot()
