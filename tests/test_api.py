@@ -396,6 +396,18 @@ def test_selected_tracememo_messages_can_be_previewed_and_imported(tmp_path, mon
         assert repeated.json()["duplicates"] == 1
         assert db.one("SELECT COUNT(*) AS count FROM raw_messages")["count"] == 1
 
+        raw_id = db.one("SELECT id FROM raw_messages")["id"]
+        classify_job = db.one("SELECT id FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))
+        canceled = client.post("/api/v1/admin/processing-queue/cancel", json={"ids": [classify_job["id"]]})
+        assert canceled.status_code == 200
+        after_cancel = client.get("/api/v1/admin/tracememo/messages")
+        assert after_cancel.status_code == 200
+        assert after_cancel.json()["items"][0]["imported"] is False
+        reimported = client.post("/api/v1/admin/tracememo/messages/import", json={"message_ids": [item["id"]]})
+        assert reimported.status_code == 200
+        assert reimported.json()["updated"] == 1
+        assert db.one("SELECT status FROM processing_jobs WHERE id=?", (classify_job["id"],))["status"] == "pending"
+
         with db.connect() as connection:
             connection.execute("UPDATE source_groups SET selected=0 WHERE id='group'")
         rejected = client.post("/api/v1/admin/tracememo/messages/import", json={"message_ids": [item["id"]]})

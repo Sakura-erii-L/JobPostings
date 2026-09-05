@@ -156,6 +156,9 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
                     (utc_now(), existing["id"]),
                 )
                 _increment_ingest_stat(stats, "filtered_system")
+            elif existing["recognition_status"] == "canceled":
+                _queue_classification(connection, existing["id"])
+                _increment_ingest_stat(stats, "updated")
             elif existing["recognition_status"] in {"succeeded", "filtered"}:
                 _increment_ingest_stat(stats, "recognized_skipped")
             else:
@@ -202,6 +205,9 @@ def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: 
                         (utc_now(), existing_external["id"]),
                     )
                     _increment_ingest_stat(stats, "filtered_system")
+                elif existing_external["recognition_status"] == "canceled":
+                    _queue_classification(connection, existing_external["id"])
+                    _increment_ingest_stat(stats, "updated")
                 elif existing_external["recognition_status"] in {"succeeded", "filtered"}:
                     _increment_ingest_stat(stats, "recognized_skipped")
                 else:

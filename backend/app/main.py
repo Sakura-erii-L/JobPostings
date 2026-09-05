@@ -498,7 +498,8 @@ def tracememo_messages(days: int = 0, limit: int = 100, query: str = "", _: dict
                    EXISTS(SELECT 1 FROM raw_messages raw
                           WHERE raw.connector_id=cache.connector_id
                             AND raw.source_group_id=cache.source_group_id
-                            AND raw.external_message_id=cache.external_message_id) AS imported
+                            AND raw.external_message_id=cache.external_message_id
+                            AND COALESCE(raw.recognition_status,'') <> 'canceled') AS imported
             FROM tracememo_message_cache cache
             JOIN source_groups groups ON groups.id=cache.source_group_id
             WHERE cache.connector_id=? AND cache.source_group_id IN ({placeholders})
