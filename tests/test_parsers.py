@@ -1,6 +1,9 @@
+import io
+import zipfile
+
 import pytest
 
-from app.parsers import _major_name_catalog, detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, fetch_public_url, is_access_challenge_page, is_link_message, is_major_like_title, is_major_requirement_heading, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
+from app.parsers import _major_name_catalog, detect_file_suffix, detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, fetch_public_url, is_access_challenge_page, is_file_message, is_link_message, is_major_like_title, is_major_requirement_heading, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
 
 
 def test_html_extraction():
@@ -12,6 +15,43 @@ def test_html_extraction():
 def test_text_file_extraction():
     result = extract_file("notice.txt", "招聘岗位：测试工程师".encode("utf-8"))
     assert "测试工程师" in result["text"]
+
+
+def test_pdf_signature_is_detected_for_generic_attachment_name():
+    assert detect_file_suffix("attachment.bin", b"%PDF-1.7\n", "application/octet-stream") == ".pdf"
+
+
+def test_docx_zip_signature_is_detected_for_generic_attachment_name():
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", "<w:document/>")
+    assert detect_file_suffix("attachment.bin", buffer.getvalue()) == ".docx"
+
+
+def test_pdf_binary_is_extracted_when_filename_and_mime_are_generic():
+    fitz = pytest.importorskip("fitz")
+    document = fitz.open()
+    document.new_page().insert_text((72, 72), "Recruitment Test Engineer")
+    result = extract_file("attachment.bin", document.tobytes(), mime_type="application/octet-stream")
+    assert "Recruitment Test Engineer" in result["text"]
+
+
+def test_docx_binary_is_extracted_when_filename_and_mime_are_generic():
+    document_class = pytest.importorskip("docx").Document
+    document = document_class()
+    document.add_paragraph("Document Test Engineer")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    result = extract_file("attachment.bin", buffer.getvalue(), mime_type="application/octet-stream")
+    assert "Document Test Engineer" in result["text"]
+
+
+def test_shared_document_is_file_message_and_not_link_message():
+    message = {"contentData": {"type": "share", "title": "岗位说明.docx"}}
+    assert is_file_message("share", message)
+    assert not is_link_message("share", message)
+    text, _ = parse_message_payload(message)
+    assert text == "岗位说明.docx"
 
 
 def test_private_url_is_rejected():

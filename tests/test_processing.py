@@ -3,9 +3,10 @@ import sqlite3
 from pathlib import Path
 
 from app import db
-from app.maintenance import repair_raw_message_times, repair_source_urls, reset_recruitment_data
+from app.maintenance import repair_raw_message_times, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from app.model_provider import ModelResult, classify_messages
 from app.processing import _extract_source_text, _fail, import_file, ingest_message, log_processing, process_one_batch
+import app.tracememo as tracememo
 
 
 def test_init_db_migrates_legacy_processing_jobs_before_index(tmp_path, monkeypatch):
@@ -24,6 +25,67 @@ def test_init_db_migrates_legacy_processing_jobs_before_index(tmp_path, monkeypa
     columns = {row["name"] for row in db.all_rows("PRAGMA table_info(processing_jobs)")}
     assert "next_attempt_at" in columns
     assert db.one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_processing_jobs_ready'")
+
+
+def test_repair_tracememo_file_attachment_downloads_parses_and_requeues(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    now = db.utc_now()
+    message = {
+        "id": "local-file-1",
+        "serverId": "server-file-1",
+        "type": "file",
+        "contentData": {"type": "share", "title": "history.txt"},
+    }
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+            ("connector-1", "tracememo", "http://127.0.0.1:6131/api/v1", 1, "{\"token\":\"\"}", now),
+        )
+        connection.execute(
+            "INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            ("group-1", "connector-1", "room-1", "招聘群", 1, 1, now, now),
+        )
+        connection.execute(
+            """INSERT INTO raw_messages(
+               id,connector_id,source_group_id,external_message_id,sender,sent_at,message_type,text_content,
+               metadata_json,content_hash,is_recruitment,recognition_status,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ("raw-1", "connector-1", "group-1", "local-file-1", "", now, "file", "history.txt", json.dumps(message, ensure_ascii=False), "hash-1", 0, "succeeded", now),
+        )
+        connection.execute(
+            "INSERT INTO processing_jobs(id,kind,raw_message_id,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("job-1", "classify", "raw-1", "succeeded", "completed", now, now),
+        )
+        connection.execute(
+            """INSERT INTO tracememo_message_cache(
+               id,connector_id,source_group_id,external_message_id,content_hash,source_time,message_json,
+               first_fetched_at,last_fetched_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            ("cache-1", "connector-1", "group-1", "local-file-1", "cache-hash-1", now, json.dumps(message, ensure_ascii=False), now, now, now),
+        )
+
+    class FakeClient:
+        def __init__(self, base_url, token):
+            self.references = []
+
+        def media(self, reference):
+            self.references.append(reference)
+            assert reference == "server-file-1"
+            return "招聘岗位：历史测试工程师".encode("utf-8"), None
+
+    monkeypatch.setattr(tracememo, "TraceMemoClient", FakeClient)
+    monkeypatch.setattr("app.maintenance._create_safety_backup", lambda: "backup.db")
+
+    result = repair_tracememo_file_attachments()
+
+    assert result["status"] == "completed"
+    assert result["media_attached"] == 1
+    assert result["requeued"] == 1
+    assert db.one("SELECT COUNT(*) AS count FROM artifacts WHERE raw_message_id='raw-1'")["count"] == 1
+    assert "历史测试工程师" in db.one("SELECT text_content FROM raw_messages WHERE id='raw-1'")["text_content"]
+    assert db.one("SELECT status FROM processing_jobs WHERE id='job-1'")["status"] == "pending"
 
 
 def test_init_db_migrates_legacy_raw_message_recognition_columns(tmp_path, monkeypatch):

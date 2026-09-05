@@ -24,12 +24,12 @@ from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
 from .company_research import ensure_company_research_jobs
-from .maintenance import repair_event_company_assignments, repair_existing_catalog, repair_source_urls, reset_recruitment_data
+from .maintenance import repair_event_company_assignments, repair_existing_catalog, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from .local_storage import clear_cache, clear_chat_records, delete_local_database_backup, storage_snapshot
 from .parsers import is_file_message, is_image_message, parse_message_time
 from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
 from .security import SecretVault, hash_password, hash_value, token
-from .tracememo import TraceMemoClient, normalize_group
+from .tracememo import TraceMemoClient, normalize_group, tracememo_filename, tracememo_inline_media, tracememo_local_media, tracememo_media_references
 from .tracememo_cache import has_cached_group, load_cached_messages, store_messages
 
 
@@ -331,35 +331,48 @@ def _tracememo_message_sender(message: dict[str, Any]) -> str:
 
 
 def _tracememo_media_id(message: dict[str, Any]) -> str:
-    message_type = str(message.get("type") or message.get("msgType") or "").lower()
-    media_info = message.get("media") if isinstance(message.get("media"), dict) else {}
-    media_url = str(media_info.get("url") or "")
-    return str(
-        message.get("media_id")
-        or message.get("mediaId")
-        or message.get("attachment_id")
-        or (media_url.rstrip("/").rsplit("/", 1)[-1] if media_url else "")
-        or (message.get("id") if is_image_message(message_type, message) or is_file_message(message_type, message) else "")
-        or ""
-    )
+    references = tracememo_media_references(message)
+    return references[0] if references else ""
 
 
 def _attach_tracememo_media(client: TraceMemoClient, message: dict[str, Any], raw_id: str, stats: dict[str, int]) -> None:
     message_type = str(message.get("type") or message.get("msgType") or "").lower()
-    if not _tracememo_media_id(message) or not (is_image_message(message_type, message) or is_file_message(message_type, message)):
+    references = tracememo_media_references(message)
+    inline_media = tracememo_inline_media(message) or tracememo_local_media(message)
+    if not (references or inline_media) or not (is_image_message(message_type, message) or is_file_message(message_type, message)):
         return
-    media_id = _tracememo_media_id(message)
-    try:
-        media, suggested_name = client.media(media_id)
-        media_info = message.get("media") if isinstance(message.get("media"), dict) else {}
-        filename = str(message.get("filename") or message.get("fileName") or media_info.get("filename") or suggested_name or f"{media_id}.bin")
-        attach_artifact(raw_id, filename, media, message.get("mime_type") or message.get("mimeType"))
-        stats["media_attached"] = stats.get("media_attached", 0) + 1
-    except Exception as exc:
-        stats["media_failed"] = stats.get("media_failed", 0) + 1
-        processing_job = one("SELECT id FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))
-        if processing_job:
-            log_processing(processing_job["id"], "extracting", "TraceMemo 媒体下载失败，后续将保留原消息并尝试其他提取方式", "warning", {"media_id": media_id, "error": str(exc)})
+    inline_error: Exception | None = None
+    if inline_media:
+        try:
+            media, filename, mime_type = inline_media
+            attach_artifact(raw_id, filename or tracememo_filename(message), media, mime_type)
+            stats["media_attached"] = stats.get("media_attached", 0) + 1
+            return
+        except Exception as exc:
+            inline_error = exc
+    last_error: Exception | None = None
+    for reference in references:
+        try:
+            media, suggested_name = client.media(reference)
+            filename = tracememo_filename(message, suggested_name)
+            mime_type = message.get("mime_type") or message.get("mimeType")
+            content_data = _tracememo_content_data(message)
+            mime_type = mime_type or content_data.get("mime_type") or content_data.get("mimeType")
+            attach_artifact(raw_id, filename, media, mime_type)
+            stats["media_attached"] = stats.get("media_attached", 0) + 1
+            return
+        except Exception as exc:
+            last_error = exc
+    stats["media_failed"] = stats.get("media_failed", 0) + 1
+    processing_job = one("SELECT id FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))
+    if processing_job and (last_error or inline_error):
+        log_processing(
+            processing_job["id"],
+            "extracting",
+            "TraceMemo 媒体下载失败，后续将保留原消息并尝试其他提取方式",
+            "warning",
+            {"media_references_attempted": len(references), "error": str(last_error or inline_error)},
+        )
 
 
 def sync_tracememo_once(force: bool = False, incremental: bool = False) -> dict[str, Any]:
@@ -587,6 +600,10 @@ async def lifespan(app: FastAPI):
     init_db()
     repair_source_urls()
     repair_existing_catalog()
+    try:
+        repair_tracememo_file_attachments()
+    except Exception as exc:
+        print(f"TraceMemo 历史附件修复失败: {exc}", file=sys.stderr)
     ensure_company_research_jobs()
     config.ensure_dirs()
     SecretVault()
@@ -957,6 +974,12 @@ def trigger_company_research(body: CompanyResearchRequest | None = None, _: dict
 def repair_event_companies(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     """Explicitly repair historical event ownership after reviewing the scope."""
     return {"status": "repaired", "events_reassigned": repair_event_company_assignments()}
+
+
+@app.post("/api/v1/admin/maintenance/tracememo-files")
+def repair_tracememo_files(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    """Retry missing or unreadable TraceMemo file attachments."""
+    return repair_tracememo_file_attachments()
 
 
 @app.get("/api/v1/admin/processing-queue")

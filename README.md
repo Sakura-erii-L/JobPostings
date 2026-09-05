@@ -28,6 +28,8 @@ $env:PYTHONPATH = "backend"
 
 系统使用本地 SQLite，不需要单独安装 MySQL、PostgreSQL 等数据库服务。导出文件默认写入 `%USERPROFILE%\Downloads\JobPostings`，可用 `JOBPOSTINGS_DOWNLOAD_DIR` 覆盖；数据库、密钥和附件仍保存在 `%LOCALAPPDATA%\JobPostings`。
 
+聊天记录中的 PDF、DOC、DOCX、XLS、XLSX 等文件会先保存为附件，再提取正文并送入招聘处理队列；文件名缺失时会结合 MIME 和文件头推断格式。PDF、DOCX、XLSX 可直接解析，旧版 DOC/XLS 需要本机安装 `antiword`、`catdoc` 或 LibreOffice。
+
 ## 外部服务
 
 - TraceMemo 默认地址：`http://127.0.0.1:6131/api/v1`。

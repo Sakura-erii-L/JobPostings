@@ -8,7 +8,11 @@ import ipaddress
 import json
 import mimetypes
 import re
+import shutil
 import socket
+import subprocess
+import tempfile
+import zipfile
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from functools import lru_cache
@@ -613,7 +617,165 @@ def _safe_decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def extract_file(filename: str, data: bytes, *, local_ocr: bool = False) -> dict[str, Any]:
+FILE_SUFFIXES = {
+    ".txt",
+    ".md",
+    ".log",
+    ".csv",
+    ".tsv",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".pdf",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".gif",
+    ".tif",
+    ".tiff",
+}
+FILE_MIME_SUFFIXES = {
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+    "text/tab-separated-values": ".tsv",
+    "application/pdf": ".pdf",
+    "application/msword": ".doc",
+    "application/vnd.ms-word": ".doc",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+}
+GENERIC_FILE_SUFFIXES = {"", ".bin", ".dat", ".tmp", ".file", ".attachment"}
+
+
+def _zip_file_suffix(data: bytes) -> str | None:
+    if not data.startswith(b"PK"):
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = set(archive.namelist())
+    except (OSError, zipfile.BadZipFile):
+        return None
+    if "word/document.xml" in names:
+        return ".docx"
+    if "xl/workbook.xml" in names:
+        return ".xlsx"
+    return None
+
+
+def detect_file_suffix(filename: str, data: bytes, mime_type: str | None = None) -> str:
+    """Infer document type when a connector returns a generic filename."""
+    filename_suffix = Path(str(filename or "")).suffix.lower()
+    if filename_suffix in FILE_SUFFIXES:
+        return filename_suffix
+    normalized_mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+    if normalized_mime in FILE_MIME_SUFFIXES:
+        return FILE_MIME_SUFFIXES[normalized_mime]
+    if data.startswith(b"%PDF-"):
+        return ".pdf"
+    if data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return ".doc"
+    return _zip_file_suffix(data)
+
+
+def normalize_file_filename(filename: str, data: bytes, mime_type: str | None = None) -> str:
+    """Return a safe basename with a usable extension for downstream parsers."""
+    value = Path(str(filename or "")).name.strip() or "attachment"
+    detected = detect_file_suffix(value, data, mime_type)
+    suffix = Path(value).suffix.lower()
+    if detected and suffix in GENERIC_FILE_SUFFIXES:
+        value = f"{Path(value).stem or 'attachment'}{detected}"
+    elif detected and not suffix:
+        value = f"{value}{detected}"
+    return value
+
+
+def _filename_has_file_suffix(value: Any) -> bool:
+    suffix = Path(str(value or "").strip()).suffix.lower()
+    return suffix in FILE_SUFFIXES
+
+
+def _extract_legacy_doc(filename: str, data: bytes) -> dict[str, Any]:
+    """Extract legacy binary .doc through an optional local converter."""
+    errors: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="jobpostings-doc-") as temp_dir:
+        source = Path(temp_dir) / (Path(filename).name or "attachment.doc")
+        source.write_bytes(data)
+        for command in ("antiword", "catdoc"):
+            executable = shutil.which(command)
+            if not executable:
+                continue
+            try:
+                result = subprocess.run(
+                    [executable, str(source)],
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+                if result.returncode == 0 and result.stdout:
+                    return {
+                        "text": result.stdout.decode("utf-8", errors="replace")[:2_000_000],
+                        "metadata": {"format": "doc", "converter": command},
+                    }
+                errors.append(f"{command} exit code {result.returncode}")
+            except (OSError, subprocess.SubprocessError) as exc:
+                errors.append(f"{command}: {exc}")
+        for command in ("soffice", "libreoffice"):
+            executable = shutil.which(command)
+            if not executable:
+                continue
+            try:
+                result = subprocess.run(
+                    [executable, "--headless", "--convert-to", "txt:Text", "--outdir", temp_dir, str(source)],
+                    capture_output=True,
+                    timeout=120,
+                    check=False,
+                )
+                converted = Path(temp_dir) / f"{source.stem}.txt"
+                if result.returncode == 0 and converted.exists():
+                    return {
+                        "text": converted.read_text(encoding="utf-8", errors="replace")[:2_000_000],
+                        "metadata": {"format": "doc", "converter": command},
+                    }
+                errors.append(f"{command} exit code {result.returncode}")
+            except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
+                errors.append(f"{command}: {exc}")
+    detail = "; ".join(errors) or "legacy .doc requires antiword, catdoc or LibreOffice"
+    return {"text": "", "metadata": {"format": "doc", "error": detail}}
+
+
+def _extract_legacy_xls(filename: str, data: bytes) -> dict[str, Any]:
+    """Extract legacy binary .xls through an optional LibreOffice converter."""
+    executable = shutil.which("soffice") or shutil.which("libreoffice")
+    if not executable:
+        return {"text": "", "metadata": {"format": "xls", "error": "legacy .xls requires LibreOffice"}}
+    with tempfile.TemporaryDirectory(prefix="jobpostings-xls-") as temp_dir:
+        source = Path(temp_dir) / (Path(filename).name or "attachment.xls")
+        source.write_bytes(data)
+        try:
+            result = subprocess.run(
+                [executable, "--headless", "--convert-to", "csv:Text", "--outdir", temp_dir, str(source)],
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            converted = Path(temp_dir) / f"{source.stem}.csv"
+            if result.returncode == 0 and converted.exists():
+                return {
+                    "text": converted.read_text(encoding="utf-8", errors="replace")[:2_000_000],
+                    "metadata": {"format": "xls", "converter": Path(executable).name},
+                }
+            return {"text": "", "metadata": {"format": "xls", "error": f"{Path(executable).name} exit code {result.returncode}"}}
+        except (OSError, UnicodeError, subprocess.SubprocessError) as exc:
+            return {"text": "", "metadata": {"format": "xls", "error": str(exc)}}
+
+
+def extract_file(filename: str, data: bytes, *, mime_type: str | None = None, local_ocr: bool = False) -> dict[str, Any]:
+    filename = normalize_file_filename(filename, data, mime_type)
     suffix = Path(filename).suffix.lower()
     if suffix in {".txt", ".md", ".log", ".csv", ".tsv"}:
         text = _safe_decode(data)
@@ -622,6 +784,10 @@ def extract_file(filename: str, data: bytes, *, local_ocr: bool = False) -> dict
             rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))[:20_000]
             text = "\n".join(" | ".join(row) for row in rows)
         return {"text": text[:2_000_000], "metadata": {"format": suffix[1:]}}
+    if suffix == ".doc":
+        return _extract_legacy_doc(filename, data)
+    if suffix == ".xls":
+        return _extract_legacy_xls(filename, data)
     if suffix == ".docx":
         try:
             from docx import Document
@@ -923,6 +1089,8 @@ def is_system_message(message_type: Any, text: str = "", message: dict[str, Any]
 
 
 def is_link_message(message_type: Any, metadata: dict[str, Any] | None = None) -> bool:
+    if is_file_message(message_type, metadata):
+        return False
     normalized = normalized_message_type(message_type)
     if normalized in LINK_MESSAGE_TYPES:
         return True
@@ -946,8 +1114,19 @@ def is_file_message(message_type: Any, message: dict[str, Any] | None = None) ->
     normalized = normalized_message_type(message_type)
     if normalized in FILE_MESSAGE_TYPES:
         return True
-    nested = content_data(message or {})
-    return str(nested.get("type") or "").strip().lower() in {"file", "document", "attachment"}
+    message = message or {}
+    nested = content_data(message)
+    if str(nested.get("type") or "").strip().lower() in {"file", "document", "attachment"}:
+        return True
+    media = _mapping(message.get("media"))
+    for container in (message, nested, media):
+        mime_type = str(container.get("mime_type") or container.get("mimeType") or "")
+        if mime_type.split(";", 1)[0].strip().lower() in FILE_MIME_SUFFIXES:
+            return True
+        for key in ("filename", "fileName", "file_name", "name", "title"):
+            if _filename_has_file_suffix(container.get(key)):
+                return True
+    return False
 
 
 def is_text_message(message_type: Any, message: dict[str, Any] | None = None) -> bool:
@@ -977,6 +1156,8 @@ def parse_message_payload(message: dict[str, Any]) -> tuple[str, dict[str, Any]]
         metadata["shared_description"] = str(nested.get("des") or nested.get("description"))
     segments = [normalize_text(text)]
     if is_link_message(message_type, metadata):
+        segments.extend(normalize_text(str(value)) for value in (nested.get("title"), nested.get("des") or nested.get("description")) if value)
+    elif is_file_message(message_type, message):
         segments.extend(normalize_text(str(value)) for value in (nested.get("title"), nested.get("des") or nested.get("description")) if value)
     deduplicated = list(dict.fromkeys(value for value in segments if value))
     return "\n".join(deduplicated), metadata

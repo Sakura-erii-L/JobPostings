@@ -26,6 +26,7 @@ from .parsers import (
     is_system_message,
     detect_image_suffix,
     is_text_message,
+    normalize_file_filename,
     parse_message_time,
     parse_message_payload,
     recover_original_source_url,
@@ -41,6 +42,8 @@ def message_hash(connector_id: str | None, group_id: str | None, message: dict[s
 
 
 def save_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: str | None = None, parsed: dict[str, Any] | None = None) -> dict[str, Any]:
+    filename = normalize_file_filename(filename, data, mime_type)
+    mime_type = str(mime_type or "").split(";", 1)[0].strip() or mimetypes.guess_type(filename)[0]
     digest = sha256_bytes(data)
     from .config import config
 
@@ -48,7 +51,7 @@ def save_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: st
     target.parent.mkdir(parents=True, exist_ok=True)
     if not target.exists():
         target.write_bytes(data)
-    parsed = parsed or extract_file(filename, data)
+    parsed = parsed or extract_file(filename, data, mime_type=mime_type)
     with connect() as connection:
         artifact_id = str(uuid4())
         try:
@@ -59,7 +62,7 @@ def save_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: st
         except Exception:
             row = connection.execute("SELECT * FROM artifacts WHERE raw_message_id=? AND sha256=?", (raw_message_id, digest)).fetchone()
             artifact_id = row["id"] if row else artifact_id
-    return {"id": artifact_id, "sha256": digest, "path": str(target), **parsed}
+    return {"id": artifact_id, "sha256": digest, "path": str(target), "filename": filename, "mime_type": mime_type, **parsed}
 
 
 def attach_artifact(raw_message_id: str, filename: str, data: bytes, mime_type: str | None = None) -> dict[str, Any]:
@@ -117,6 +120,12 @@ def _queue_classification(connection: Any, raw_id: str) -> None:
         )
 
 
+def requeue_message_for_processing(raw_message_id: str) -> None:
+    """Put a repaired raw message back into the classification queue."""
+    with connect() as connection:
+        _queue_classification(connection, raw_message_id)
+
+
 def _set_recognition_status(raw_message_id: str | None, status: str, error: str | None = None) -> None:
     if not raw_message_id:
         return
@@ -132,6 +141,8 @@ def _set_recognition_status(raw_message_id: str | None, status: str, error: str 
 
 def ingest_message(message: dict[str, Any], connector_id: str | None, group_id: str | None, stats: dict[str, int] | None = None) -> str | None:
     message_type = str(message.get("type") or message.get("msgType") or "text").strip().lower()
+    if is_file_message(message_type, message):
+        message_type = "file"
     original_text = str(message.get("text") or message.get("content") or "")
     system_message = is_system_message(message_type, original_text, message)
     text, metadata = parse_message_payload(message)
@@ -1142,7 +1153,8 @@ def import_url(url: str, source_group_id: str | None = None) -> str | None:
 
 
 def import_file(filename: str, data: bytes, mime_type: str | None = None, source_group_id: str | None = None) -> dict[str, Any]:
-    parsed = extract_file(filename, data)
+    filename = normalize_file_filename(filename, data, mime_type)
+    parsed = extract_file(filename, data, mime_type=mime_type)
     raw_id = ingest_message(
         {"type": "file", "text": parsed.get("text", ""), "filename": filename, "mime_type": mime_type, "qr_values": parsed.get("qr_values", [])},
         "manual",
@@ -1154,6 +1166,6 @@ def import_file(filename: str, data: bytes, mime_type: str | None = None, source
     with connect() as connection:
         connection.execute(
             "UPDATE raw_messages SET metadata_json=? WHERE id=?",
-            (json.dumps({"filename": filename, "mime_type": mime_type, "artifact_id": artifact["id"], "qr_values": parsed.get("qr_values", [])}, ensure_ascii=False), raw_id),
+            (json.dumps({"filename": artifact.get("filename") or filename, "mime_type": artifact.get("mime_type") or mime_type, "artifact_id": artifact["id"], "qr_values": parsed.get("qr_values", [])}, ensure_ascii=False), raw_id),
         )
     return {"raw_message_id": raw_id, "artifact": artifact}

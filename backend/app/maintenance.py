@@ -5,6 +5,7 @@ import re
 import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 from uuid import uuid4
@@ -12,7 +13,7 @@ from uuid import uuid4
 from .config import config
 from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, _store_recruitment_shared_details, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title
 from .db import connect, utc_now
-from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, extract_recruitment_shared_details, is_major_like_title, is_major_requirement_heading, is_wechat_public_url, normalize_event_datetime, parse_message_time, recover_original_source_url
+from .parsers import extract_event_datetime_candidates, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, is_file_message, is_major_like_title, is_major_requirement_heading, is_wechat_public_url, normalize_file_filename, normalize_event_datetime, parse_message_time, recover_original_source_url
 
 
 # Imported recruitment content and its derived catalog are reset together so
@@ -624,6 +625,194 @@ def deduplicate_all_jobs() -> int:
         for company_id in company_ids:
             removed += deduplicate_company_jobs(connection, company_id)
     return removed
+
+
+def _merge_repaired_text(existing: Any, extracted: Any) -> str:
+    old_text = str(existing or "").strip()
+    new_text = str(extracted or "").strip()
+    if not new_text or new_text in old_text:
+        return old_text
+    if old_text and old_text in new_text:
+        return new_text
+    return "\n".join(value for value in (old_text, new_text) if value).strip()
+
+
+def repair_tracememo_file_attachments() -> dict[str, Any]:
+    """Repair cached TraceMemo documents without marking unresolved rows complete."""
+    from .processing import attach_artifact, requeue_message_for_processing
+    from .security import SecretVault
+    from .tracememo import TraceMemoClient, tracememo_filename, tracememo_inline_media, tracememo_local_media, tracememo_media_references
+
+    result: dict[str, Any] = {
+        "status": "no_candidates",
+        "backup_path": None,
+        "raw_checked": 0,
+        "artifacts_reparsed": 0,
+        "artifacts_updated": 0,
+        "cached_files_checked": 0,
+        "matched": 0,
+        "media_attached": 0,
+        "media_failed": 0,
+        "unmatched": 0,
+        "requeued": 0,
+    }
+    with connect() as connection:
+        connector = connection.execute(
+            "SELECT * FROM connectors WHERE kind='tracememo' AND enabled=1"
+        ).fetchone()
+        if not connector:
+            result["status"] = "disabled"
+            return result
+        raw_rows = connection.execute(
+            """SELECT r.*,
+                      EXISTS(SELECT 1 FROM artifacts a WHERE a.raw_message_id=r.id) AS has_artifact
+               FROM raw_messages r
+               WHERE r.connector_id=?""",
+            (connector["id"],),
+        ).fetchall()
+        raw_by_external: dict[tuple[str | None, str], list[Any]] = {}
+        raw_by_metadata: dict[tuple[str | None, str], list[Any]] = {}
+        raw_file_rows: list[Any] = []
+        for raw in raw_rows:
+            result["raw_checked"] += 1
+            try:
+                metadata = json.loads(raw["metadata_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if not is_file_message(raw["message_type"], metadata):
+                continue
+            raw_file_rows.append(raw)
+            group_key = raw["source_group_id"]
+            if raw["external_message_id"]:
+                raw_by_external.setdefault((group_key, str(raw["external_message_id"])), []).append(raw)
+            if isinstance(metadata, dict):
+                for key in ("id", "messageId", "message_id", "serverId", "server_id", "localId", "local_id"):
+                    value = str(metadata.get(key) or "").strip()
+                    if value:
+                        raw_by_metadata.setdefault((group_key, value), []).append(raw)
+        cache_rows = connection.execute(
+            "SELECT source_group_id,external_message_id,message_json FROM tracememo_message_cache WHERE connector_id=?",
+            (connector["id"],),
+        ).fetchall()
+    if not raw_file_rows and not cache_rows:
+        return result
+    local_artifact_candidates = [row for row in raw_file_rows if row["has_artifact"]]
+    cached_file_rows: list[tuple[Any, dict[str, Any], Any | None]] = []
+    cached_file_candidates: list[tuple[Any, dict[str, Any], Any]] = []
+    for cache in cache_rows:
+        try:
+            message = json.loads(cache["message_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(message, dict):
+            continue
+        message_type = str(message.get("type") or message.get("msgType") or "text")
+        if not is_file_message(message_type, message):
+            continue
+        references = tracememo_media_references(message)
+        inline_media = tracememo_inline_media(message) or tracememo_local_media(message)
+        raw_matches: list[Any] = []
+        for value in [cache["external_message_id"], message.get("id"), message.get("messageId"), message.get("serverId")]:
+            if value is None:
+                continue
+            raw_matches.extend(raw_by_external.get((cache["source_group_id"], str(value)), []))
+            raw_matches.extend(raw_by_metadata.get((cache["source_group_id"], str(value)), []))
+        unique_matches = {row["id"]: row for row in raw_matches}
+        raw = next(iter(unique_matches.values()), None)
+        cached_file_rows.append((cache, message, raw))
+        if raw and not raw["has_artifact"] and (references or inline_media):
+            cached_file_candidates.append((cache, message, raw))
+    result["cached_files_checked"] = len(cached_file_rows)
+    result["matched"] = sum(1 for _, _, raw in cached_file_rows if raw)
+    result["unmatched"] = sum(1 for _, _, raw in cached_file_rows if not raw)
+    if not local_artifact_candidates and not cached_file_candidates:
+        return result
+    result["status"] = "repairing"
+    def ensure_backup() -> None:
+        if not result["backup_path"]:
+            result["backup_path"] = _create_safety_backup()
+
+    requeue_ids: set[str] = set()
+    for raw in local_artifact_candidates:
+        with connect() as connection:
+            artifacts = connection.execute(
+                "SELECT * FROM artifacts WHERE raw_message_id=? ORDER BY created_at",
+                (raw["id"],),
+            ).fetchall()
+            for artifact in artifacts:
+                path = Path(str(artifact["path"] or ""))
+                if not path.exists():
+                    continue
+                try:
+                    data = path.read_bytes()
+                    filename = normalize_file_filename(artifact["filename"] or "attachment.bin", data, artifact["mime_type"])
+                    parsed = extract_file(filename, data, mime_type=artifact["mime_type"])
+                except (OSError, ValueError) as exc:
+                    result.setdefault("errors", []).append(f"{raw['id']}: {exc}")
+                    continue
+                result["artifacts_reparsed"] += 1
+                mime_type = str(artifact["mime_type"] or "").split(";", 1)[0].strip() or None
+                new_text = str(parsed.get("text") or "").strip()
+                old_text = str(artifact["ocr_text"] or "").strip()
+                raw_row = connection.execute("SELECT text_content FROM raw_messages WHERE id=?", (raw["id"],)).fetchone()
+                merged_text = _merge_repaired_text(raw_row["text_content"] if raw_row else "", new_text)
+                changed = (
+                    artifact["filename"] != filename
+                    or artifact["mime_type"] != mime_type
+                    or old_text != new_text
+                    or (raw_row and raw_row["text_content"] != merged_text)
+                )
+                if changed:
+                    ensure_backup()
+                    connection.execute(
+                        "UPDATE artifacts SET filename=?,mime_type=?,ocr_text=?,qr_values_json=? WHERE id=?",
+                        (filename, mime_type, new_text, json.dumps(parsed.get("qr_values", []), ensure_ascii=False), artifact["id"]),
+                    )
+                    connection.execute("UPDATE raw_messages SET text_content=? WHERE id=?", (merged_text, raw["id"]))
+                    result["artifacts_updated"] += 1
+                    requeue_ids.add(raw["id"])
+    client = None
+    if cached_file_candidates:
+        settings = json.loads(connector["config_json"] or "{}")
+        client = TraceMemoClient(connector["base_url"], SecretVault().decrypt(settings["token"]) if settings.get("token") else "")
+    for cache, message, raw in cached_file_candidates:
+        inline_media = tracememo_inline_media(message) or tracememo_local_media(message)
+        inline_error: Exception | None = None
+        if inline_media:
+            try:
+                ensure_backup()
+                media, filename, mime_type = inline_media
+                attach_artifact(raw["id"], filename or tracememo_filename(message), media, mime_type)
+                result["media_attached"] += 1
+                requeue_ids.add(raw["id"])
+                continue
+            except Exception as exc:
+                inline_error = exc
+        last_error: Exception | None = None
+        for reference in tracememo_media_references(message):
+            try:
+                if client is None:
+                    raise RuntimeError("TraceMemo client is not available")
+                media, suggested_name = client.media(reference)
+                filename = tracememo_filename(message, suggested_name)
+                mime_type = message.get("mime_type") or message.get("mimeType")
+                content_data = message.get("contentData") if isinstance(message.get("contentData"), dict) else {}
+                mime_type = mime_type or content_data.get("mime_type") or content_data.get("mimeType")
+                ensure_backup()
+                attach_artifact(raw["id"], filename, media, mime_type)
+                result["media_attached"] += 1
+                requeue_ids.add(raw["id"])
+                break
+            except Exception as exc:
+                last_error = exc
+        else:
+            result["media_failed"] += 1
+            result.setdefault("errors", []).append(f"{raw['id']}: {last_error or inline_error}")
+    for raw_id in sorted(requeue_ids):
+        requeue_message_for_processing(raw_id)
+    result["requeued"] = len(requeue_ids)
+    result["status"] = "completed" if not result["media_failed"] else "partial"
+    return result
 
 
 def repair_existing_catalog() -> dict[str, Any]:

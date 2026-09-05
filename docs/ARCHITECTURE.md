@@ -32,7 +32,7 @@ TraceMemo / 手工文本 / 公开 URL / 文件
 - 后端：Python 3.12+、FastAPI、Uvicorn、Pydantic。
 - 前端：React 19、TypeScript、Vite。
 - 存储：本地 SQLite；附件保存到本地 Blob 目录。
-- 解析：BeautifulSoup、Playwright、`openpyxl`，可选 PDF/DOCX/RapidOCR 依赖。
+- 解析：BeautifulSoup、Playwright、`openpyxl`，PDF/DOCX 解析，以及通过可选 `antiword`/`catdoc`/LibreOffice 转换的 DOC/XLS 兼容路径、RapidOCR。
 - 模型：本地 Codex CLI，或 Chat Completions / Responses API。
 - 桌面发布：PyInstaller 服务目录、托盘启动器和可选 Inno Setup 安装器。
 
@@ -89,13 +89,14 @@ JobPostings/
 
 ### 3.1 来源到目录
 
-1. 管理员配置 TraceMemo 并选择最多 20 个招聘群，或通过文本、公开 URL、PDF/DOCX/XLSX/CSV/TXT/图片手工导入。
+1. 管理员配置 TraceMemo 并选择最多 20 个招聘群，或通过文本、公开 URL、PDF/DOC/DOCX/XLS/XLSX/CSV/TXT/图片手工导入。
 2. `processing.ingest_message()` 以外部消息 ID 或内容指纹去重，把原始消息写入 `raw_messages`，附件写入 `artifacts`，并创建 `processing_jobs`。
-3. 队列先由本地解析器提取正文、链接、图片、时间和元数据。公众号页面遇到环境验证或正文过短时由 Playwright 渲染，并触发图片懒加载。
-4. 图片默认由本地 Codex OCR；Codex 无法使用或无可读文本时回退到可选 RapidOCR，同时解析二维码。
-5. `model_provider.py` 或 `codex_agent.py` 调用模型，以 Markdown prompt 和严格 JSON schema 输出招聘分类与结构化字段。
-6. `catalog.apply_model_item()` 写入企业、招聘批次、共享详情、岗位、事件和证据，并执行归并、去重和版本记录。
-7. 低置信度、字段冲突、模型失败或企业归并异常生成 `review_items`，管理员可查看原始消息、处理任务和阶段日志。
+3. TraceMemo 文件消息即使外层类型为 `share`，也会根据 `contentData` 中的文件名、MIME 或文件头识别；媒体按内嵌资源、显式媒体 ID/URL、文件 `serverId` 等候选顺序读取，成功后按文件名和内容解析。
+4. 队列先由本地解析器提取正文、链接、图片、文件、时间和元数据。公众号页面遇到环境验证或正文过短时由 Playwright 渲染，并触发图片懒加载。
+5. 图片默认由本地 Codex OCR；Codex 无法使用或无可读文本时回退到可选 RapidOCR，同时解析二维码。
+6. `model_provider.py` 或 `codex_agent.py` 调用模型，以 Markdown prompt 和严格 JSON schema 输出招聘分类与结构化字段。
+7. `catalog.apply_model_item()` 写入企业、招聘批次、共享详情、岗位、事件和证据，并执行归并、去重和版本记录。
+8. 低置信度、字段冲突、模型失败或企业归并异常生成 `review_items`，管理员可查看原始消息、处理任务和阶段日志。
 
 ### 3.2 后台循环
 
@@ -119,11 +120,11 @@ JobPostings/
 | `catalog.py` | 结构化结果持久化、企业/岗位/事件归并去重 | 证据关联、岗位身份、专业与岗位类别边界 |
 | `model_provider.py` | OpenAI-compatible API、额度、脱敏、JSON | provider 启用状态、Token 统计、输出结构 |
 | `codex_agent.py` | 本地 Codex CLI 隔离调用 | `CODEX_CLI_PATH`、只读沙箱、临时文件清理 |
-| `tracememo.py` / cache | TraceMemo API、群聊归一化、缓存 | 真实字段映射、Bearer Token、缓存语义 |
+| `tracememo.py` / cache | TraceMemo API、群聊归一化、缓存和媒体候选 | 真实字段映射、Bearer Token、文件资源只访问配置的同源服务 |
 | `company_research.py` | 企业公开资料、标签和风险来源 | 公开来源必须可追溯，不能覆盖招聘来源 |
 | `db.py` | schema、索引、旧库迁移 | 新字段必须兼容旧数据库 |
 | `auth.py` / `security.py` | 本机 bootstrap、登录、邀请、scope、秘密 | HttpOnly Cookie、DPAPI、禁止泄密 |
-| `backups.py` / `maintenance.py` | 备份、恢复、修复、强制重置 | 破坏性操作先备份，恢复先校验 |
+| `backups.py` / `maintenance.py` | 备份、恢复、修复、强制重置和历史附件修复 | 破坏性操作先备份，恢复先校验；附件失败不标记为已完成 |
 | `frontend/src/main.tsx` | 页面、导航、API、SSE、异步交互 | 管理员可见性、持久反馈、避免重复提交 |
 
 ## 5. SQLite 数据域
@@ -152,6 +153,7 @@ JobPostings/
 | `/api/v1/bootstrap`、`/api/v1/auth/*` | 初始化、密码登录、OTP、密码设置、会话 |
 | `/api/v1/admin/invitations`、`/api/v1/admin/settings` | 邀请、系统设置、模型测试 |
 | `/api/v1/admin/connectors/tracememo/*`、`/admin/source-groups`、`/admin/sync` | TraceMemo 配置、选群、同步、消息导入 |
+| `/api/v1/admin/maintenance/tracememo-files` | 重试缺失/不可读的 TraceMemo 文件附件并重新排队 |
 | `/api/v1/admin/processing-queue/*` | 队列运行/暂停、取消、重试、文本和日志 |
 | `/api/v1/imports/*` | 文本、URL、文件导入 |
 | `/api/v1/companies/*`、`/jobs`、`/recruitment-events`、`/evidences/*`、`/artifacts/*` | 招聘目录和证据 |
