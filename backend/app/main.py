@@ -24,7 +24,7 @@ from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
 from .company_research import ensure_company_research_jobs
-from .maintenance import repair_event_company_assignments, repair_existing_catalog, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
+from .maintenance import repair_event_company_assignments, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from .local_storage import clear_cache, clear_chat_records, delete_local_database_backup, storage_snapshot
 from .parsers import is_file_message, is_image_message, parse_message_time
 from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
@@ -599,7 +599,6 @@ async def auto_sync_loop() -> None:
 async def lifespan(app: FastAPI):
     init_db()
     repair_source_urls()
-    repair_existing_catalog()
     try:
         repair_tracememo_file_attachments()
     except Exception as exc:

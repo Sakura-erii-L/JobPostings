@@ -181,8 +181,46 @@ def _strict_object(properties: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_schema_payload(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+    """Validate the strict JSON Schema subset used by model contracts."""
+    expected = schema.get("type")
+    expected_types = expected if isinstance(expected, list) else [expected]
+    if expected:
+        valid = any(
+            (kind == "object" and isinstance(value, dict))
+            or (kind == "array" and isinstance(value, list))
+            or (kind == "string" and isinstance(value, str))
+            or (kind == "integer" and isinstance(value, int) and not isinstance(value, bool))
+            or (kind == "number" and isinstance(value, (int, float)) and not isinstance(value, bool))
+            or (kind == "boolean" and isinstance(value, bool))
+            or (kind == "null" and value is None)
+            for kind in expected_types
+        )
+        if not valid:
+            raise ValueError(f"Model response schema mismatch at {path}: expected {expected}")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"Model response schema mismatch at {path}: value is not in enum")
+    if isinstance(value, dict):
+        properties = schema.get("properties", {})
+        missing = [key for key in schema.get("required", []) if key not in value]
+        if missing:
+            raise ValueError(f"Model response schema mismatch at {path}: missing {missing}")
+        if schema.get("additionalProperties") is False:
+            extra = [key for key in value if key not in properties]
+            if extra:
+                raise ValueError(f"Model response schema mismatch at {path}: unexpected {extra}")
+        for key, child_schema in properties.items():
+            if key in value:
+                validate_schema_payload(value[key], child_schema, f"{path}.{key}")
+    elif isinstance(value, list) and schema.get("items"):
+        for index, child_value in enumerate(value):
+            validate_schema_payload(child_value, schema["items"], f"{path}[{index}]")
+
+
 _STRING = {"type": "string"}
 _STRING_LIST = {"type": "array", "items": _STRING}
+_NULLABLE_STRING = {"type": ["string", "null"]}
+_NULLABLE_INT = {"type": ["integer", "null"]}
 _COMPANY_TAG_SCHEMA = _strict_object({
     "category": {"type": "string", "enum": ["company_type", "industry", "attribute"]},
     "code": _STRING,
@@ -191,28 +229,28 @@ _COMPANY_TAG_SCHEMA = _strict_object({
 _COMPANY_TAG_LIST = {"type": "array", "items": _COMPANY_TAG_SCHEMA}
 _RELATION_SCHEMA = _strict_object({"type": _STRING, "related_company_name": _STRING})
 _COMPANY_SCHEMA = _strict_object({
-    "matched_company_id": _STRING,
     "display_name": _STRING,
-    "legal_name": _STRING,
+    "legal_name": _NULLABLE_STRING,
     "aliases": _STRING_LIST,
-    "company_nature": _STRING,
+    "company_nature": _NULLABLE_STRING,
+    "primary_industry": _NULLABLE_STRING,
+    "secondary_industries": _STRING_LIST,
     "industry_codes": _STRING_LIST,
     "businesses": _STRING_LIST,
-    "headquarters": _STRING,
-    "founded_at": _STRING,
-    "company_size": _STRING,
-    "website": _STRING,
+    "headquarters": _NULLABLE_STRING,
+    "founded_at": _NULLABLE_STRING,
+    "company_size": _NULLABLE_STRING,
+    "website": _NULLABLE_STRING,
     "official_channels": _STRING_LIST,
     "highlights": _STRING_LIST,
-    "major_requirements": _STRING_LIST,
     "tags": _COMPANY_TAG_LIST,
     "relationship": _RELATION_SCHEMA,
 })
 _BATCH_SCHEMA = _strict_object({
-    "name": _STRING,
-    "year": {"type": "integer"},
-    "season": _STRING,
-    "recruitment_type": _STRING,
+    "name": _NULLABLE_STRING,
+    "year": _NULLABLE_INT,
+    "season": _NULLABLE_STRING,
+    "recruitment_type": _NULLABLE_STRING,
 })
 _SALARY_SCHEMA = _strict_object({
     "currency": _STRING,
@@ -223,57 +261,63 @@ _SALARY_SCHEMA = _strict_object({
 })
 _SHARED_JOB_INFO_SCHEMA = _strict_object({
     "locations": _STRING_LIST,
-    "salary": _SALARY_SCHEMA,
+    "salary": {"type": ["object", "null"], "properties": _SALARY_SCHEMA["properties"], "required": _SALARY_SCHEMA["required"], "additionalProperties": False},
+    "target_graduation_years": {"type": "array", "items": {"type": "integer"}},
+    "education_requirements": _STRING_LIST,
+    "major_requirements": _STRING_LIST,
+    "application_url": _NULLABLE_STRING,
+    "deadline": _NULLABLE_STRING,
+    "process": _STRING_LIST,
+    "benefits": _STRING_LIST,
 })
 _JOB_SCHEMA = _strict_object({
     "title": _STRING,
-    "department": _STRING,
+    "department": _NULLABLE_STRING,
     "locations": _STRING_LIST,
-    "recruitment_type": _STRING,
-    "employment_type": _STRING,
-    "headcount": _STRING,
-    "education": _STRING_LIST,
-    "majors": _STRING_LIST,
-    "experience_requirement": _STRING,
-    "salary": _SALARY_SCHEMA,
-    "responsibilities": _STRING,
-    "requirements": _STRING,
+    "recruitment_type": _NULLABLE_STRING,
+    "employment_type": _NULLABLE_STRING,
+    "headcount": _NULLABLE_STRING,
+    "salary": {"type": ["object", "null"], "properties": _SALARY_SCHEMA["properties"], "required": _SALARY_SCHEMA["required"], "additionalProperties": False},
+    "education_requirements": _STRING_LIST,
+    "major_requirements": _STRING_LIST,
+    "experience_requirement": _NULLABLE_STRING,
+    "responsibilities": _STRING_LIST,
+    "requirements": _STRING_LIST,
     "benefits": _STRING_LIST,
     "application_methods": _STRING_LIST,
     "contacts": _STRING_LIST,
-    "deadline": _STRING,
+    "deadline": _NULLABLE_STRING,
 })
 _EVENT_SCHEMA = _strict_object({
     "title": _STRING,
-    "company_name": _STRING,
     "event_type": _STRING,
-    "start_at": _STRING,
-    "end_at": _STRING,
-    "timezone": _STRING,
-    "format": _STRING,
-    "city": _STRING,
-    "campus": _STRING,
-    "location": _STRING,
-    "application_url": _STRING,
-    "audience": _STRING,
-    "notes": _STRING,
+    "start_at": _NULLABLE_STRING,
+    "end_at": _NULLABLE_STRING,
+    "timezone": _NULLABLE_STRING,
+    "format": _NULLABLE_STRING,
+    "city": _NULLABLE_STRING,
+    "campus": _NULLABLE_STRING,
+    "location": _NULLABLE_STRING,
+    "application_url": _NULLABLE_STRING,
+    "audience": _NULLABLE_STRING,
+    "notes": _NULLABLE_STRING,
     "job_titles": _STRING_LIST,
+})
+_RECRUITMENT_SCHEMA = _strict_object({
+    "batch": _BATCH_SCHEMA,
+    "shared_details": _SHARED_JOB_INFO_SCHEMA,
+    "jobs": {"type": "array", "items": _JOB_SCHEMA},
+    "events": {"type": "array", "items": _EVENT_SCHEMA},
+})
+_COMPANY_RECRUITMENT_SCHEMA = _strict_object({
+    "company": _COMPANY_SCHEMA,
+    "recruitment": _RECRUITMENT_SCHEMA,
 })
 
 MODEL_OUTPUT_SCHEMA: dict[str, Any] = _strict_object({
-    "items": {
-        "type": "array",
-        "items": _strict_object({
-            "message_id": _STRING,
-            "is_recruitment": {"type": "boolean"},
-            "decision_reason": _STRING,
-            "company": _COMPANY_SCHEMA,
-            "batch": _BATCH_SCHEMA,
-            "shared_job_info": _SHARED_JOB_INFO_SCHEMA,
-            "jobs": {"type": "array", "items": _JOB_SCHEMA},
-            "events": {"type": "array", "items": _EVENT_SCHEMA},
-        }),
-    }
+    "is_recruitment": {"type": "boolean"},
+    "decision_reason": _STRING,
+    "companies": {"type": "array", "items": _COMPANY_RECRUITMENT_SCHEMA},
 })
 
 
@@ -344,11 +388,14 @@ def _call_processing_engine(
 ) -> ModelResult:
     engine = str(get_setting("processing_engine", "codex") or "codex")
     if engine == "generic":
-        return _call_model(messages, task_type)
+        result = _call_model(messages, task_type)
+        validate_schema_payload(result.payload, schema)
+        return result
     from .codex_agent import run_codex_json
 
     prompt = {"messages": [message for message in messages if message.get("role") != "system"]}
     payload = run_codex_json(task_type, prompt, schema, job_id=job_id)
+    validate_schema_payload(payload, schema)
     input_tokens = estimate_tokens(json.dumps(prompt, ensure_ascii=False))
     output_tokens = estimate_tokens(json.dumps(payload, ensure_ascii=False))
     result = ModelResult(payload, input_tokens, output_tokens, True, "local_codex", "gpt-5.6-luna")
@@ -382,51 +429,55 @@ def classify_messages(messages: list[dict[str, Any]], job_id: str = "") -> Model
         if source_datetime:
             item["source_datetime"] = str(source_datetime)
         items.append(item)
-    candidates = []
-    for row in all_rows(
-        "SELECT id,display_name,legal_name,aliases_json,website FROM companies ORDER BY updated_at DESC LIMIT 200"
-    ):
-        candidates.append({
-            "id": row["id"],
-            "display_name": row["display_name"],
-            "legal_name": row["legal_name"],
-            "aliases": json.loads(row["aliases_json"] or "[]"),
-            "website": row["website"],
-        })
     user_prompt = {
         "industry_codes": ["internet_software", "ai_data", "electronics_semiconductor", "telecommunications", "manufacturing_automation", "automotive_transport_equipment", "energy_chemical_materials", "construction_real_estate", "finance", "consumer_retail_ecommerce", "healthcare_biopharma", "education_research", "media_culture_entertainment", "logistics_transportation", "professional_services", "government_public_nonprofit", "agriculture", "military_defense", "other"],
         "job_function_codes": ["software_engineering", "hardware_engineering", "ai_data", "product_design", "testing_quality", "it_operations_security", "production_supply_chain", "sales_business_development", "marketing_content", "operations_customer_service", "finance_audit", "hr_admin_legal", "consulting_research", "healthcare", "education", "construction_engineering", "other"],
         "recruitment_types": ["campus", "social", "internship", "part_time", "labor", "unknown"],
-        "company_candidates": candidates,
         "messages": items,
         "output_shape": {
-            "items": [{
-                "message_id": "...",
-                "is_recruitment": False,
-                "decision_reason": "",
+            "is_recruitment": True,
+            "decision_reason": "",
+            "companies": [{
                 "company": {
-                    "matched_company_id": "",
                     "display_name": "",
-                    "legal_name": "",
+                    "legal_name": None,
                     "aliases": [],
-                    "company_nature": "",
+                    "company_nature": None,
+                    "primary_industry": None,
+                    "secondary_industries": [],
                     "industry_codes": [],
+                    "founded_at": None,
+                    "company_size": None,
+                    "headquarters": None,
                     "businesses": [],
-                    "headquarters": "",
-                    "founded_at": "",
-                    "company_size": "",
-                    "website": "",
-                    "official_channels": [],
                     "highlights": [],
-                    "major_requirements": [],
+                    "official_channels": [],
+                    "website": None,
                     "tags": [],
                     "relationship": {"type": "", "related_company_name": ""},
                 },
-                "batch": {"name": "", "year": 0, "season": "", "recruitment_type": "unknown"},
-                "shared_job_info": {"locations": [], "salary": {"currency": "", "minimum": "", "maximum": "", "period": "", "description": ""}},
-                "jobs": [{"title": "", "department": "", "locations": [], "recruitment_type": "unknown", "employment_type": "unknown", "headcount": "", "education": [], "majors": [], "experience_requirement": "", "salary": {"currency": "", "minimum": "", "maximum": "", "period": "", "description": ""}, "responsibilities": "", "requirements": "", "benefits": [], "application_methods": [], "contacts": [], "deadline": ""}],
-                "events": [{"title": "", "company_name": "", "event_type": "presentation", "start_at": "", "end_at": "", "timezone": "Asia/Shanghai", "format": "offline", "city": "", "campus": "", "location": "", "application_url": "", "audience": "", "notes": "", "job_titles": []}]
-            }]
+                "recruitment": {
+                    "batch": {"name": None, "year": None, "season": None, "recruitment_type": None},
+                    "shared_details": {
+                        "locations": [], "salary": None, "target_graduation_years": [],
+                        "education_requirements": [], "major_requirements": [], "application_url": None,
+                        "deadline": None, "process": [], "benefits": [],
+                    },
+                    "jobs": [{
+                        "title": "", "department": None, "locations": [], "recruitment_type": None,
+                        "employment_type": None, "headcount": None, "salary": None,
+                        "education_requirements": [], "major_requirements": [], "responsibilities": [],
+                        "requirements": [], "experience_requirement": None, "benefits": [],
+                        "application_methods": [], "contacts": [], "deadline": None,
+                    }],
+                    "events": [{
+                        "title": "", "event_type": "other", "start_at": None, "end_at": None,
+                        "timezone": "Asia/Shanghai", "format": "unknown", "city": None, "campus": None,
+                        "location": None, "application_url": None, "audience": None, "notes": None,
+                        "job_titles": [],
+                    }],
+                },
+            }],
         },
     }
     return _call_processing_engine(

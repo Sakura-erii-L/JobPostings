@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 
 from app import db
-from app.catalog import _make_job, _prepare_job_items, apply_model_item, normalize_name, normalize_title, refresh_expiration
+from app.catalog import _make_job, _prepare_job_items, apply_model_item, is_location_like_title, normalize_name, normalize_title, refresh_expiration
 from app.maintenance import migrate_major_jobs, repair_existing_catalog, requeue_missing_job_sources
 from app.main import company_detail
 from app.parsers import extract_recruitment_catalog
@@ -13,6 +13,26 @@ from app.processing import ingest_message
 def test_normalization():
     assert normalize_name("  星河（科技）有限公司 ") == "星河科技有限公司"
     assert normalize_title("嵌入式 工程师") == "嵌入式工程师"
+
+
+def test_location_labels_and_location_lists_are_not_jobs():
+    assert is_location_like_title("北京")
+    assert is_location_like_title("北京、南京、西安、上海")
+    assert is_location_like_title("工作地点：深圳")
+
+    source_catalog = extract_recruitment_catalog(
+        "荣耀2027届全球校园招聘\n工作地点：深圳、北京、南京、西安、上海\n"
+    )
+    model_jobs = [
+        {"title": "8大职位类别", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "研发", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "北京", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "研发 营销 服务 产品与设计 供应链 财经 流程IT与质量运营 战略管理 工作地点 深圳", "recruitment_type": "campus", "employment_type": "full_time"},
+        {"title": "上海 注：部分非研发岗位全球派遣", "recruitment_type": "campus", "employment_type": "full_time"},
+    ]
+
+    jobs = _prepare_job_items(model_jobs)
+    assert [job["title"] for job in jobs] == [item["title"] for item in model_jobs]
 
 
 def test_company_and_job_are_created(tmp_path, monkeypatch):
@@ -202,7 +222,7 @@ def test_decorated_sections_after_job_demand_do_not_create_jobs():
 """
     source_catalog = extract_recruitment_catalog(source)
 
-    assert _prepare_job_items([], source_catalog) == []
+    assert _prepare_job_items([]) == []
 
 
 def test_job_details_do_not_expand_valid_model_jobs():
@@ -226,7 +246,7 @@ def test_job_details_do_not_expand_valid_model_jobs():
     ]
 
     source_catalog = extract_recruitment_catalog(source)
-    titles = [job["title"] for job in _prepare_job_items(model_jobs, source_catalog)]
+    titles = [job["title"] for job in _prepare_job_items(model_jobs)]
 
     assert titles == ["软件开发工程师", "软件测试工程师", "算法技术工程师"]
 
@@ -241,9 +261,9 @@ def test_major_titles_from_model_jobs_are_kept_out_of_job_catalog():
         {"title": "逻辑学研究员", "recruitment_type": "campus", "employment_type": "full_time"},
     ]
 
-    jobs = _prepare_job_items(model_jobs, source_catalog)
+    jobs = _prepare_job_items(model_jobs)
 
-    assert [job["title"] for job in jobs] == ["软件开发", "逻辑学研究员"]
+    assert [job["title"] for job in jobs] == [item["title"] for item in model_jobs]
 
 
 def test_migrate_legacy_major_jobs_to_company_requirements(tmp_path, monkeypatch):

@@ -875,15 +875,29 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
 def _split_text(text: str, limit: int = 50_000, overlap: int = 1_000) -> list[str]:
     if len(text) <= limit:
         return [text]
+    units = [part for part in re.split(r"(?<=\n)\s*\n+|(?<=\n)", text) if part]
     chunks: list[str] = []
-    start = 0
-    while start < len(text):
-        end = min(len(text), start + limit)
-        chunks.append(text[start:end])
-        if end == len(text):
-            break
-        start = max(start + 1, end - overlap)
-    return chunks
+    current = ""
+    for unit in units:
+        if len(unit) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            start = 0
+            while start < len(unit):
+                end = min(len(unit), start + limit)
+                chunks.append(unit[start:end])
+                if end == len(unit):
+                    break
+                start = end
+            continue
+        if current and len(current) + len(unit) > limit:
+            chunks.append(current)
+            current = ""
+        current += unit
+    if current:
+        chunks.append(current)
+    return chunks or [text]
 
 
 def _unique_dicts(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -911,35 +925,49 @@ def _merge_json_list(old_value: Any, new_value: Any) -> list[Any]:
     return result
 
 
-def _merge_extracted_items(items: list[dict[str, Any]], message_id: str) -> dict[str, Any]:
+def _merge_extracted_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge chunk results without interpreting source text."""
     recruitment = [item for item in items if item.get("is_recruitment")]
     if not recruitment:
-        first = dict(items[0]) if items else {}
-        first.update({"message_id": message_id, "is_recruitment": False})
-        return first
-    merged = dict(recruitment[0])
-    merged["message_id"] = message_id
-    merged["is_recruitment"] = True
+        return {"is_recruitment": False, "decision_reason": "；".join(dict.fromkeys(
+            str(item.get("decision_reason") or "").strip() for item in items if str(item.get("decision_reason") or "").strip()
+        )), "companies": []}
+    companies: list[dict[str, Any]] = []
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in recruitment:
+        for entry in item.get("companies") or []:
+            if not isinstance(entry, dict):
+                continue
+            company = dict(entry.get("company") or {})
+            key = str(company.get("display_name") or company.get("legal_name") or "").strip().casefold()
+            target = by_name.get(key) if key else None
+            if target is None:
+                target = {"company": company, "recruitment": dict(entry.get("recruitment") or {})}
+                target["recruitment"].setdefault("batch", {})
+                target["recruitment"].setdefault("shared_details", {})
+                target["recruitment"].setdefault("jobs", [])
+                target["recruitment"].setdefault("events", [])
+                companies.append(target)
+                if key:
+                    by_name[key] = target
+                continue
+            for field, value in company.items():
+                if isinstance(value, list):
+                    target["company"][field] = list(dict.fromkeys([*(target["company"].get(field) or []), *value]))
+                elif value not in (None, "", {}, []) and target["company"].get(field) in (None, "", {}, []):
+                    target["company"][field] = value
+            incoming_recruitment = entry.get("recruitment") or {}
+            for section in ("batch", "shared_details"):
+                target_section = target["recruitment"].setdefault(section, {})
+                for field, value in (incoming_recruitment.get(section) or {}).items():
+                    if isinstance(value, list):
+                        target_section[field] = list(dict.fromkeys([*(target_section.get(field) or []), *value]))
+                    elif value not in (None, "", {}, []) and target_section.get(field) in (None, "", {}, []):
+                        target_section[field] = value
+            target["recruitment"]["jobs"] = _unique_dicts([*(target["recruitment"].get("jobs") or []), *(incoming_recruitment.get("jobs") or [])])
+            target["recruitment"]["events"] = _unique_dicts([*(target["recruitment"].get("events") or []), *(incoming_recruitment.get("events") or [])])
     reasons = [str(item.get("decision_reason") or "").strip() for item in recruitment]
-    merged["decision_reason"] = "；".join(dict.fromkeys(value for value in reasons if value))
-    company = dict(merged.get("company") or {})
-    for item in recruitment[1:]:
-        incoming = item.get("company") or {}
-        for key, value in incoming.items():
-            if isinstance(value, list):
-                company[key] = list(dict.fromkeys([*(company.get(key) or []), *value]))
-            elif value not in (None, "", {}, []) and company.get(key) in (None, "", {}, []):
-                company[key] = value
-    merged["company"] = company
-    batch = dict(merged.get("batch") or {})
-    for item in recruitment[1:]:
-        for key, value in (item.get("batch") or {}).items():
-            if value not in (None, "", 0) and batch.get(key) in (None, "", 0):
-                batch[key] = value
-    merged["batch"] = batch
-    merged["jobs"] = _unique_dicts([job for item in recruitment for job in (item.get("jobs") or [])])
-    merged["events"] = _unique_dicts([event for item in recruitment for event in (item.get("events") or [])])
-    return merged
+    return {"is_recruitment": True, "decision_reason": "；".join(dict.fromkeys(value for value in reasons if value)), "companies": companies}
 
 
 def _classify_source(job: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
@@ -947,7 +975,7 @@ def _classify_source(job: dict[str, Any], message: dict[str, Any]) -> dict[str, 
     extracted: list[dict[str, Any]] = []
     for index, chunk in enumerate(chunks, start=1):
         if not _still_active(job["id"]):
-            return {"message_id": message["id"], "is_recruitment": False, "decision_reason": "canceled"}
+            return {"is_recruitment": False, "decision_reason": "canceled", "companies": []}
         if len(chunks) > 1:
             log_processing(job["id"], "classifying", f"识别长文本分段 {index}/{len(chunks)}", details={"characters": len(chunk)})
         part = {**message, "text": chunk, "metadata": {**(message.get("metadata") or {}), "chunk": index, "chunk_count": len(chunks)}}
@@ -957,11 +985,10 @@ def _classify_source(job: dict[str, Any], message: dict[str, Any]) -> dict[str, 
             if "job_id" not in str(exc):
                 raise
             result = classify_messages([part])
-        values = result.payload.get("items") or []
-        if not values:
-            raise ValueError(f"Model response did not contain an item for chunk {index}")
-        extracted.append(values[0])
-    return _merge_extracted_items(extracted, message["id"])
+        if not isinstance(result.payload, dict) or "companies" not in result.payload:
+            raise ValueError(f"Model response did not contain the required Schema for chunk {index}")
+        extracted.append(result.payload)
+    return _merge_extracted_items(extracted)
 
 
 def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
@@ -991,7 +1018,6 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
     _stage(job["id"], "classifying", "开始判断招聘信息并提取统一结构", processor)
     message = {"id": raw["id"], "sent_at": raw["sent_at"], "message_type": raw["message_type"], "text": text, "metadata": metadata}
     item = _classify_source(job, message)
-    item["message_id"] = raw["id"]
     if not _still_active(job["id"]):
         _set_recognition_status(raw["id"], "canceled")
         return {"status": "canceled", "id": job["id"]}

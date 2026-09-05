@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .db import connect, one, utc_now
-from .parsers import extract_recruitment_catalog, extract_recruitment_shared_details, is_job_category_title, is_link_message, is_major_like_title, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
+from .parsers import is_link_message, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
 
 
 INDUSTRIES = {
@@ -82,9 +82,34 @@ NON_JOB_TITLE_PATTERNS = (
     r"招聘流程|招聘行程|校招行程|活动(?:时间|安排|对象|形式)|宣讲会|招聘会|参访|大咖分享",
     r"安家费|年收入|薪资|工资|福利|津贴|补贴|奖金|事业编制|住房|公寓",
     r"博士研究生|硕士研究生|博士|硕士|本科|毕业|应届生|面向对象|活动对象",
-    r"具体岗位(?:见|以)|岗位(?:列表|汇总|职责|要求)",
+    r"具体岗位(?:见|以)|(?:岗位|职位)(?:列表|汇总|类别|职责|要求)",
+    r"工作地点|岗位地点|办公地点|工作城市|招聘地点",
     r"^(?:[^岗位]{1,30})(?:类|专业|类别|方向)$",
 )
+
+# 纯地点是 OCR/模型最容易误报成岗位标题的一类值。这里只拦截“地点本身”
+# 或明显的地点串，不会影响“北京研发工程师”这类真实岗位名称。
+LOCATION_TITLE_NAMES = frozenset({
+    "北京", "上海", "天津", "重庆", "广州", "深圳", "杭州", "南京", "苏州", "无锡",
+    "常州", "合肥", "武汉", "西安", "成都", "长沙", "郑州", "济南", "青岛", "厦门",
+    "福州", "南昌", "昆明", "贵阳", "太原", "石家庄", "沈阳", "大连", "长春", "哈尔滨",
+    "海口", "乌鲁木齐", "兰州", "银川", "呼和浩特", "南宁", "珠海", "东莞", "佛山",
+    "宁波", "嘉兴", "绍兴", "岳阳", "日本", "海外", "国内", "全国",
+})
+
+
+def is_location_like_title(value: Any) -> bool:
+    """Return whether a candidate title is a venue/location label, not a job role."""
+    title = re.sub(r"\s+", "", str(value or "").strip("。；;，, "))
+    if not title:
+        return True
+    if re.search(r"(?:工作地点|岗位地点|办公地点|工作城市|招聘地点)", title):
+        return True
+    if any(title.startswith(location) for location in LOCATION_TITLE_NAMES) and re.search(r"(?:注[:：]|说明|部分(?:非|不)|全球派遣)", title):
+        return True
+    # Location-only lists can arrive as one model title when OCR removed line breaks.
+    parts = [part for part in re.split(r"[、/／,，;；|｜]+", title) if part]
+    return bool(parts) and all(part in LOCATION_TITLE_NAMES for part in parts)
 
 
 def is_non_job_title(value: Any) -> bool:
@@ -96,7 +121,7 @@ def is_non_job_title(value: Any) -> bool:
         return True
     if re.search(r"(?:20\d{2}年)?\d{1,2}月\d{1,2}日|20\d{2}届|\d{1,2}月(?:底|初)", title):
         return True
-    return any(re.search(pattern, title, re.IGNORECASE) for pattern in NON_JOB_TITLE_PATTERNS)
+    return is_location_like_title(title) or any(re.search(pattern, title, re.IGNORECASE) for pattern in NON_JOB_TITLE_PATTERNS)
 
 
 def is_location_like_name(value: Any) -> bool:
@@ -297,82 +322,24 @@ def _raw_source_text(connection: Any, raw_message_id: str | None) -> str:
     return "\n".join(text for text in texts if text).strip()
 
 
-def _split_job_title_parts(value: Any) -> list[str]:
-    title = str(value or "").strip()
-    if not title:
-        return []
-    parts: list[str] = []
-    current: list[str] = []
-    depth = 0
-    for character in title:
-        if character in "（(【[":
-            depth += 1
-        elif character in "）)】]" and depth:
-            depth -= 1
-        if character in "、；;•·，" and depth == 0:
-            part = "".join(current).strip()
-            if part:
-                parts.append(part)
-            current = []
-        else:
-            current.append(character)
-    part = "".join(current).strip()
-    if part:
-        parts.append(part)
-    return parts
-
-
-def _major_requirements_from_jobs(job_values: Any) -> list[str]:
-    requirements: list[str] = []
+def _prepare_job_items(job_values: Any) -> list[dict[str, Any]]:
+    """Normalize only the structure returned by Codex."""
+    prepared: list[dict[str, Any]] = []
     for value in job_values or []:
         if not isinstance(value, dict):
             continue
-        for major in value.get("majors") or []:
-            text = str(major or "").strip()
-            if text:
-                requirements.append(text)
-        for title in _split_job_title_parts(value.get("title")):
-            if is_major_like_title(title):
-                requirements.append(title.rstrip("。；;"))
-    return list(dict.fromkeys(requirements))
-
-
-def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) -> list[dict[str, Any]]:
-    model_jobs: list[dict[str, Any]] = []
-    for value in job_values or []:
-        if not isinstance(value, dict) or (is_non_job_title(value.get("title")) and not is_job_category_title(value.get("title"))):
+        title = str(value.get("title") or "").strip()
+        if not title:
             continue
-        for part in _split_job_title_parts(value.get("title")):
-            if (is_non_job_title(part) and not is_job_category_title(part)) or (is_major_like_title(part) and not is_job_category_title(part)):
-                continue
-            model_jobs.append({**dict(value), "title": part, "majors": []})
-    expanded: list[dict[str, Any]] = []
-    expanded.extend(model_jobs)
-
-    source_titles = [
-        title for title in source_catalog.get("job_titles") or []
-        if (not is_non_job_title(title) or is_job_category_title(title))
-        and (not is_major_like_title(title) or is_job_category_title(title))
-    ]
-    if not source_titles or (len(source_titles) < 2 and expanded):
-        return expanded
-    specific = [job for job in expanded if not is_aggregate_job_title(job.get("title"))]
-    template = next((job for job in specific), None)
-    by_title = {normalize_title(str(job.get("title") or "")): job for job in specific}
-    result: list[dict[str, Any]] = []
-    for title in source_titles:
-        matched = by_title.get(normalize_title(title))
-        if matched:
-            result.append({**matched, "title": title})
-            continue
-        if template:
-            result.append({**template, "title": title})
-        else:
-            result.append({"title": title, "recruitment_type": "unknown", "employment_type": "unknown"})
-    for job in specific:
-        if normalize_title(str(job.get("title") or "")) not in {normalize_title(title) for title in source_titles}:
-            result.append(job)
-    return result
+        job = dict(value)
+        job["title"] = title
+        job["education"] = list(job.get("education_requirements") or job.get("education") or [])
+        job["majors"] = list(job.get("major_requirements") or job.get("majors") or [])
+        for key in ("responsibilities", "requirements"):
+            values = job.get(key) or []
+            job[key] = "\n".join(str(item).strip() for item in values if str(item).strip()) if isinstance(values, list) else str(values)
+        prepared.append(job)
+    return prepared
 
 
 def _store_recruitment_shared_details(
@@ -582,36 +549,6 @@ def _job_identity_matches(row: Any, normalized_title: str, recruitment_type: str
     return not known_department or not current_department or known_department == current_department
 
 
-def _source_deadline(value: Any, source_text: str, observed_at: str) -> str | None:
-    """Keep a deadline only when the source explicitly presents a deadline context."""
-    raw = str(value or "").strip()
-    if not raw or not source_text:
-        return raw or None
-    deadline_context = re.compile(
-        r"(?:网申|报名|申请|投递|简历).{0,30}(?:截止|截至|最后|止于)|"
-        r"(?:截止|截至|最后|止于).{0,30}(?:网申|报名|申请|投递|简历)|"
-        r"(?:网申|报名|申请|投递).{0,20}(?:时间|日期)",
-        re.IGNORECASE | re.DOTALL,
-    )
-    contexts = list(deadline_context.finditer(source_text))
-    if not contexts:
-        return None
-    normalized = normalize_event_datetime(raw, "Asia/Shanghai", observed_at)
-    if not normalized:
-        return None
-    local_date = datetime.fromisoformat(normalized).astimezone(timezone(timedelta(hours=8)))
-    date_patterns = (
-        rf"{local_date.year}\s*(?:年|[-/.])\s*{local_date.month}\s*(?:月|[-/.])\s*{local_date.day}",
-        rf"{local_date.month}\s*月\s*{local_date.day}\s*(?:日|号)?",
-        rf"{local_date.month:02d}[-/.]{local_date.day:02d}",
-    )
-    for context in contexts:
-        window = source_text[max(0, context.start() - 30) : context.end() + 100]
-        if any(re.search(pattern, window) for pattern in date_patterns):
-            return local_date.date().isoformat()
-    return None
-
-
 def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[str, Any], observed_at: str, raw_message_id: str | None) -> str:
     title = str(job_data.get("title") or "未命名岗位").strip()
     normalized = normalize_title(title)
@@ -632,12 +569,7 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         None,
     )
     now = utc_now()
-    source_text = _raw_source_text(connection, raw_message_id)
-    explicit_deadline = _source_deadline(
-        job_data.get("deadline") or job_data.get("explicit_deadline"),
-        source_text,
-        observed_at,
-    )
+    explicit_deadline = str(job_data.get("deadline") or job_data.get("explicit_deadline") or "").strip() or None
     payload = {**job_data, "deadline": explicit_deadline or ""}
     content_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     if row:
@@ -718,34 +650,37 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
 def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_at: str | None) -> list[str]:
     if not item.get("is_recruitment"):
         return []
+    # Mechanical compatibility for explicitly supplied legacy callers.  This
+    # does not inspect source text or classify any value; normal model output
+    # always arrives through the strict ``companies`` schema.
+    if "companies" not in item and isinstance(item.get("company"), dict):
+        shared = item.get("shared_job_info") if isinstance(item.get("shared_job_info"), dict) else {}
+        item = {
+            "is_recruitment": True,
+            "companies": [{
+                "company": dict(item.get("company") or {}),
+                "recruitment": {
+                    "batch": dict(item.get("batch") or {}),
+                    "shared_details": {
+                        "locations": list(shared.get("locations") or []),
+                        "salary": shared.get("salary"),
+                        "target_graduation_years": [], "education_requirements": [],
+                        "major_requirements": [], "application_url": None, "deadline": None,
+                        "process": [], "benefits": [],
+                    },
+                    "jobs": list(item.get("jobs") or []),
+                    "events": list(item.get("events") or []),
+                },
+            }],
+        }
     observed = observed_at or utc_now()
+    company_items = item.get("companies") if isinstance(item.get("companies"), list) else []
+    if not company_items:
+        return []
+    all_job_ids: list[str] = []
+    persisted_company_ids: list[str] = []
     with connect() as connection:
         raw_row = connection.execute("SELECT connector_id,message_type,metadata_json FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone() if raw_message_id else None
-        source_catalog = extract_recruitment_catalog(_raw_source_text(connection, raw_message_id))
-        company = dict(item.get("company") or {})
-        company["major_requirements"] = list(dict.fromkeys([
-            *(company.get("major_requirements") or []),
-            *(source_catalog.get("major_requirements") or []),
-            *_major_requirements_from_jobs(item.get("jobs") or []),
-        ]))
-        job_items = _prepare_job_items(item.get("jobs") or [], source_catalog)
-        matched_company_id = str(company.get("matched_company_id") or "").strip()
-        company_name = str(company.get("display_name") or company.get("legal_name") or "").strip()
-        if not matched_company_id and is_location_like_name(company_name):
-            company["display_name"] = ""
-            company["legal_name"] = ""
-            company_name = ""
-        company_id = _company_for(connection, company) if matched_company_id or company_name else None
-        if company_id is None:
-            for candidate_event in item.get("events") or []:
-                company_id = event_company_for_title(connection, None, candidate_event)
-                if company_id:
-                    break
-        if company_id is None:
-            # Do not create a synthetic company for an event-only summary or a
-            # model result whose company name is actually a venue/campus.
-            return []
-        _record_company_relationship(connection, company_id, company.get("relationship") or {})
         metadata: dict[str, Any] = {}
         if raw_row:
             try:
@@ -757,68 +692,68 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             source_type = source_type_for_url(recover_original_source_url(metadata.get("source_url") or metadata.get("url")) or "")
         source_url = recover_original_source_url(metadata.get("source_url") or metadata.get("url"))
         artifact_id = metadata.get("artifact_id")
-        evidence_id = str(uuid4())
-        connection.execute(
-            "INSERT INTO evidences(id,company_id,raw_message_id,artifact_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?,?)",
-            (evidence_id, company_id, raw_message_id if raw_row else None, artifact_id, source_url, source_type, json.dumps(item, ensure_ascii=False), observed),
-        )
-        for field_name, value in company.items():
-            if field_name in {"matched_company_id", "relationship"} or value in (None, "", []):
+        for company_entry in company_items:
+            if not isinstance(company_entry, dict):
                 continue
+            company = dict(company_entry.get("company") or {})
+            recruitment = dict(company_entry.get("recruitment") or {})
+            company_name = str(company.get("display_name") or company.get("legal_name") or "").strip()
+            if not company_name:
+                continue
+            industry_codes = list(dict.fromkeys([
+                value for value in [company.get("primary_industry"), *(company.get("secondary_industries") or [])]
+                if isinstance(value, str) and value.strip()
+            ]))
+            company["industry_codes"] = industry_codes
+            company_id = _company_for(connection, company)
+            persisted_company_ids.append(company_id)
+            _record_company_relationship(connection, company_id, company.get("relationship") or {})
+            evidence_id = str(uuid4())
             connection.execute(
-                "INSERT INTO company_claims(id,company_id,field_name,field_value,source_url,source_type,retrieved_at,confidence,is_current) VALUES(?,?,?,?,?,?,?,?,1)",
-                (str(uuid4()), company_id, field_name, json.dumps(value, ensure_ascii=False), source_url, source_type, observed, 1.0),
+                "INSERT INTO evidences(id,company_id,raw_message_id,artifact_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?,?)",
+                (evidence_id, company_id, raw_message_id if raw_row else None, artifact_id, source_url, source_type, json.dumps(company_entry, ensure_ascii=False), observed),
             )
-        recruitment_type = str((item.get("batch") or {}).get("recruitment_type") or "unknown")
-        if recruitment_type not in RECRUITMENT_TYPES:
-            recruitment_type = "unknown"
-        batch_id = _batch_for(connection, company_id, item.get("batch") or {}, recruitment_type)
-        source_shared = extract_recruitment_shared_details(_raw_source_text(connection, raw_message_id))
-        model_shared = item.get("shared_job_info") if isinstance(item.get("shared_job_info"), dict) else {}
-        shared_details = {
-            "locations": model_shared.get("locations") or source_shared.get("locations") or [],
-            "salary": model_shared.get("salary") or source_shared.get("salary") or {},
-        }
-        _store_recruitment_shared_details(connection, company_id, batch_id, evidence_id, raw_message_id, shared_details, observed)
-        job_ids = [_make_job(connection, company_id, batch_id, job, observed, raw_message_id) for job in job_items]
-        title_to_job = {normalize_title(str(job.get("title") or "")): job_id for job, job_id in zip(job_items, job_ids)}
-        event_company_ids: list[str] = []
-        for event in item.get("events") or []:
-            event_company_id = event_company_for_title(connection, None, event)
-            if not event_company_id and not is_aggregate_event_title(event.get("title")):
-                event_company_id = company_id
-            if not event_company_id:
-                continue
-            event_company_ids.append(event_company_id)
-            event_batch_id = batch_id if event_company_id == company_id else _batch_for(connection, event_company_id, item.get("batch") or {}, recruitment_type)
-            event_evidence_id = evidence_id
-            if event_company_id != company_id:
-                event_evidence_id = str(uuid4())
+            for field_name, value in company.items():
+                if field_name in {"industry_codes", "relationship"} or value in (None, "", []):
+                    continue
                 connection.execute(
-                    "INSERT INTO evidences(id,company_id,raw_message_id,artifact_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (event_evidence_id, event_company_id, raw_message_id if raw_row else None, artifact_id, source_url, source_type, json.dumps(item, ensure_ascii=False), observed),
+                    "INSERT INTO company_claims(id,company_id,field_name,field_value,source_url,source_type,retrieved_at,confidence,is_current) VALUES(?,?,?,?,?,?,?,?,1)",
+                    (str(uuid4()), company_id, field_name, json.dumps(value, ensure_ascii=False), source_url, source_type, observed, 1.0),
                 )
-            _merge_event(connection, event_company_id, event_batch_id, event, title_to_job if event_company_id == company_id else {}, event_evidence_id, observed)
+            batch = recruitment.get("batch") if isinstance(recruitment.get("batch"), dict) else {}
+            recruitment_type = str(batch.get("recruitment_type") or "unknown")
+            if recruitment_type not in RECRUITMENT_TYPES:
+                recruitment_type = "unknown"
+            batch_id = _batch_for(connection, company_id, batch, recruitment_type)
+            shared = recruitment.get("shared_details") if isinstance(recruitment.get("shared_details"), dict) else {}
+            _store_recruitment_shared_details(connection, company_id, batch_id, evidence_id, raw_message_id, {
+                "locations": shared.get("locations") or [],
+                "salary": shared.get("salary") or {},
+            }, observed)
+            job_items = _prepare_job_items(recruitment.get("jobs") or [])
+            job_ids = [_make_job(connection, company_id, batch_id, job, observed, raw_message_id) for job in job_items]
+            all_job_ids.extend(job_ids)
+            title_to_job = {normalize_title(str(job.get("title") or "")): job_id for job, job_id in zip(job_items, job_ids)}
+            for event in recruitment.get("events") or []:
+                if isinstance(event, dict):
+                    _merge_event(connection, company_id, batch_id, event, title_to_job, evidence_id, observed)
         ready_at = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="seconds")
-        pending = connection.execute(
-            "SELECT id FROM processing_jobs WHERE kind='consolidate_company' AND company_id=? AND status='pending' LIMIT 1",
-            (company_id,),
-        ).fetchone()
-        if pending:
-            connection.execute("UPDATE processing_jobs SET next_attempt_at=?,updated_at=? WHERE id=?", (ready_at, utc_now(), pending["id"]))
-        else:
-            connection.execute(
-                "INSERT INTO processing_jobs(id,kind,company_id,status,stage,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (str(uuid4()), "consolidate_company", company_id, "pending", "waiting_for_sources", ready_at, utc_now(), utc_now()),
-            )
-        from .company_research import queue_company_research_in_connection
-
-        queue_company_research_in_connection(connection, company_id)
-        for event_company_id in set(event_company_ids):
-            if event_company_id != company_id:
-                queue_company_research_in_connection(connection, event_company_id)
-        deduplicate_company_jobs(connection, company_id)
-    return job_ids
+        for company_id in dict.fromkeys(persisted_company_ids):
+            pending = connection.execute(
+                "SELECT id FROM processing_jobs WHERE kind='consolidate_company' AND company_id=? AND status='pending' LIMIT 1",
+                (company_id,),
+            ).fetchone()
+            if pending:
+                connection.execute("UPDATE processing_jobs SET next_attempt_at=?,updated_at=? WHERE id=?", (ready_at, utc_now(), pending["id"]))
+            else:
+                connection.execute(
+                    "INSERT INTO processing_jobs(id,kind,company_id,status,stage,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (str(uuid4()), "consolidate_company", company_id, "pending", "waiting_for_sources", ready_at, utc_now(), utc_now()),
+                )
+            from .company_research import queue_company_research_in_connection
+            queue_company_research_in_connection(connection, company_id)
+            deduplicate_company_jobs(connection, company_id)
+    return all_job_ids
 
 
 def _merge_event(
