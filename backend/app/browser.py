@@ -105,6 +105,8 @@ def fetch_public_browser(url: str) -> dict[str, Any]:
         try:
             context = browser.new_context(
                 locale="zh-CN",
+                viewport={"width": 1280, "height": 720},
+                device_scale_factor=2,
                 service_workers="block",
                 extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
             )
@@ -165,7 +167,7 @@ def fetch_public_browser(url: str) -> dict[str, Any]:
                 for marker in ("当前环境异常", "完成验证后即可继续", "环境验证", "验证码", "访问过于频繁")
                 if marker in body_text or marker in page_url
             ]
-            screenshot_data = page.screenshot(full_page=True, type="jpeg", quality=90)
+            screenshot_data = page.screenshot(full_page=True, type="jpeg", quality=95)
             content_type = response.headers.get("content-type", "text/html") if response else "text/html"
             return {
                 "url": page_url,
