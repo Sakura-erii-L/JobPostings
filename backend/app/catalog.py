@@ -290,6 +290,24 @@ def _parse_reliable_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _deadline_is_expired(value: Any) -> bool:
+    text = normalize_text_value(value)
+    if not text:
+        return False
+
+    try:
+        deadline_date = date.fromisoformat(text)
+        return deadline_date < datetime.now(timezone.utc).date()
+    except ValueError:
+        pass
+
+    parsed = _parse_reliable_datetime(text)
+    if parsed is None:
+        return False
+
+    return parsed < datetime.now(timezone.utc)
+
+
 def _choose_temporal_text(values: list[Any], *, latest: bool) -> str | None:
     candidates = [normalize_text_value(value) for value in values]
     candidates = [value for value in candidates if value]
@@ -826,11 +844,29 @@ def _record_company_relationship(connection: Any, company_id: str, relationship:
 
 
 def _job_identity_matches(row: Any, normalized_title: str, recruitment_type: str, employment_type: str, department: Any) -> bool:
-    if row["normalized_title"] != normalized_title or row["recruitment_type"] != recruitment_type:
+    if row["normalized_title"] != normalized_title:
         return False
+
+    if row["recruitment_type"] != recruitment_type:
+        return False
+
     known_department = normalize_title(str(row["department"] or ""))
     current_department = normalize_title(str(department or ""))
-    return not known_department or not current_department or known_department == current_department
+
+    if known_department and current_department and known_department != current_department:
+        return False
+
+    known_employment = normalize_employment_type(row["employment_type"])
+    current_employment = normalize_employment_type(employment_type)
+
+    if (
+        known_employment != "unknown"
+        and current_employment != "unknown"
+        and known_employment != current_employment
+    ):
+        return False
+
+    return True
 
 
 def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[str, Any], observed_at: str, raw_message_id: str | None) -> str:
@@ -861,9 +897,8 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         job_id = row["id"]
         last = observed_at or now
         status = row["status"]
-        parsed_deadline = _parse_reliable_datetime(explicit_deadline)
-        if parsed_deadline is not None:
-            status = "expired" if parsed_deadline < datetime.now(timezone.utc) else "active"
+        if explicit_deadline:
+            status = "expired" if _deadline_is_expired(explicit_deadline) else "active"
         merged_locations = _merge_list(row["locations_json"], locations)
         merged_education = _merge_list(row["education_json"], job_data.get("education"))
         merged_majors = _merge_list(row["majors_json"], job_data.get("majors"))
@@ -888,8 +923,7 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         )
     else:
         job_id = str(uuid4())
-        parsed_deadline = _parse_reliable_datetime(explicit_deadline)
-        status = "expired" if parsed_deadline is not None and parsed_deadline < datetime.now(timezone.utc) else "active"
+        status = "expired" if _deadline_is_expired(explicit_deadline) else "active"
         connection.execute(
             "INSERT INTO jobs(id,company_id,batch_id,canonical_title,normalized_title,department,locations_json,recruitment_type,employment_type,headcount,education_json,majors_json,experience_requirement,salary_json,responsibilities,requirements,benefits_json,application_methods_json,contacts_json,explicit_deadline,effective_posted_at,last_effective_posted_at,status,industry_codes_json,job_function_codes_json,confidence,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (job_id, company_id, batch_id, title, normalized, job_data.get("department"), json_text(locations, []), recruitment_type, employment_type, job_data.get("headcount"), json_text(job_data.get("education"), []), json_text(job_data.get("majors"), []), job_data.get("experience_requirement"), json_text(job_data.get("salary"), {}), job_data.get("responsibilities"), job_data.get("requirements"), json_text(job_data.get("benefits"), []), json_text(job_data.get("application_methods"), []), json_text(job_data.get("contacts"), []), explicit_deadline, observed_at, observed_at, status, json_text(job_data.get("industry_codes"), []), json_text([x for x in job_data.get("job_function_codes", []) if x in JOB_FUNCTIONS], []), float(job_data.get("confidence", 0)), now, now),

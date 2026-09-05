@@ -1,5 +1,6 @@
 import json
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import db
@@ -511,6 +512,64 @@ def test_duplicate_jobs_across_batches_are_hidden_but_departments_stay_separate(
     apply_model_item({**base, "batch": {"name": "2027 校招", "recruitment_type": "campus"}, "jobs": [{**base["jobs"][0], "employment_type": "part_time"}]}, None, "2026-09-05T00:00:00+00:00")
     apply_model_item({**base, "batch": {"name": "2028 校招", "recruitment_type": "campus"}, "jobs": [{**base["jobs"][0], "department": "测试"}]}, None, "2026-09-06T00:00:00+00:00")
     company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("去重测试科技",))["id"]
-    assert db.one("SELECT COUNT(*) AS n FROM jobs WHERE company_id=? AND status<>'superseded'", (company_id,))["n"] == 2
+    assert db.one("SELECT COUNT(*) AS n FROM jobs WHERE company_id=? AND status<>'superseded'", (company_id,))["n"] == 3
     assert db.one("SELECT COUNT(*) AS n FROM jobs WHERE company_id=? AND status='superseded'", (company_id,))["n"] == 0
-    assert db.one("SELECT employment_type FROM jobs WHERE company_id=? AND department='研发'", (company_id,))["employment_type"] == "unknown"
+    assert {row["employment_type"] for row in db.all_rows("SELECT employment_type FROM jobs WHERE company_id=? AND department='研发'", (company_id,))} == {"full_time", "part_time"}
+
+
+def test_deadline_status_uses_date_for_date_only_values(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    today = datetime.now(timezone.utc).date()
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "截止日期状态科技"},
+            "jobs": [
+                {"title": "今日截止工程师", "deadline": today.isoformat()},
+                {"title": "昨日截止工程师", "deadline": (today - timedelta(days=1)).isoformat()},
+                {"title": "中文日期工程师", "deadline": "9月30日"},
+            ],
+        },
+        None,
+        "2026-09-06T00:00:00+00:00",
+    )
+    statuses = {
+        row["canonical_title"]: (row["status"], row["explicit_deadline"])
+        for row in db.all_rows("SELECT canonical_title,status,explicit_deadline FROM jobs")
+    }
+    assert statuses == {
+        "今日截止工程师": ("active", today.isoformat()),
+        "昨日截止工程师": ("expired", (today - timedelta(days=1)).isoformat()),
+        "中文日期工程师": ("active", "9月30日"),
+    }
+
+
+def test_different_employment_types_are_separate_jobs(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    base = {
+        "is_recruitment": True,
+        "company": {"display_name": "用工类型科技"},
+        "batch": {"name": "2026 校招", "recruitment_type": "campus"},
+    }
+    apply_model_item(
+        {**base, "jobs": [{"title": "软件工程师", "recruitment_type": "campus", "employment_type": "full_time", "department": "研发"}]},
+        None,
+        "2026-09-06T00:00:00+00:00",
+    )
+    apply_model_item(
+        {**base, "jobs": [{"title": "软件工程师", "recruitment_type": "campus", "employment_type": "part_time", "department": "研发"}]},
+        None,
+        "2026-09-06T00:00:00+00:00",
+    )
+    company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("用工类型科技",))["id"]
+    jobs = db.all_rows(
+        "SELECT employment_type FROM jobs WHERE company_id=? AND status<>'superseded' ORDER BY employment_type",
+        (company_id,),
+    )
+    assert [row["employment_type"] for row in jobs] == ["full_time", "part_time"]
