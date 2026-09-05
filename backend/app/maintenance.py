@@ -299,7 +299,7 @@ def repair_event_company_assignments() -> int:
         events = connection.execute("SELECT id,company_id,batch_id,title FROM recruitment_events").fetchall()
         for event in events:
             target_id = event_company_for_title(connection, event["company_id"], {"title": event["title"]})
-            if target_id == event["company_id"]:
+            if not target_id or target_id == event["company_id"]:
                 continue
             target_batch_id = None
             if event["batch_id"]:

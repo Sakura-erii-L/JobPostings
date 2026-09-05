@@ -71,6 +71,42 @@ def normalize_title(value: str) -> str:
     return re.sub(r"[（）()【】\[\]，,。·•\s]", "", value)
 
 
+NON_JOB_TITLE_PATTERNS = (
+    r"网申|报名|投递|网址|链接|二维码",
+    r"简历(?:筛选|匹配)|资格(?:初审|审查)|初审",
+    r"测评|笔试|面试|体检|录用|入职|签约|公示|审核",
+    r"招聘流程|招聘行程|校招行程|活动(?:时间|安排|对象|形式)|宣讲会|招聘会|参访|大咖分享",
+    r"安家费|年收入|薪资|工资|福利|津贴|补贴|奖金|事业编制|住房|公寓",
+    r"博士研究生|硕士研究生|博士|硕士|本科|毕业|应届生|面向对象|活动对象",
+    r"具体岗位(?:见|以)|岗位(?:列表|汇总|职责|要求)",
+    r"^(?:[^岗位]{1,30})(?:类|专业|类别|方向)$",
+)
+
+
+def is_non_job_title(value: Any) -> bool:
+    """Reject process, eligibility, benefits, event and URL text as job titles."""
+    title = re.sub(r"\s+", "", str(value or "").strip())
+    if not title:
+        return True
+    if len(title) > 120 or re.fullmatch(r"https?://\S+|[\w.-]+\.(?:com|cn|org|net)", title, re.IGNORECASE):
+        return True
+    if re.search(r"(?:20\d{2}年)?\d{1,2}月\d{1,2}日|20\d{2}届|\d{1,2}月(?:底|初)", title):
+        return True
+    return any(re.search(pattern, title, re.IGNORECASE) for pattern in NON_JOB_TITLE_PATTERNS)
+
+
+def is_location_like_name(value: Any) -> bool:
+    """Reject common venue/campus labels from becoming company names."""
+    name = re.sub(r"\s+", "", str(value or "").strip())
+    if not name:
+        return False
+    if re.fullmatch(r"[A-Z][0-9]{2,4}", name, re.IGNORECASE):
+        return True
+    if any(marker in name for marker in ("教学楼", "会议室", "科技会堂", "报告厅", "体育馆", "校区", "举办场地", "活动场地", "就业创业指导服务中心", "就业指导中心")):
+        return not any(marker in name for marker in ("有限公司", "集团", "研究所", "大学", "学院", "银行", "医院"))
+    return False
+
+
 def json_text(value: Any, default: Any) -> str:
     return json.dumps(value if value is not None else default, ensure_ascii=False)
 
@@ -231,6 +267,12 @@ def _raw_source_text(connection: Any, raw_message_id: str | None) -> str:
             metadata = {}
         if metadata.get("_original_text_content"):
             texts.append(str(metadata["_original_text_content"]))
+        for key in ("shared_title", "title"):
+            if metadata.get(key):
+                texts.append(str(metadata[key]))
+        content_data = metadata.get("contentData")
+        if isinstance(content_data, dict) and content_data.get("title"):
+            texts.append(str(content_data["title"]))
         texts.append(str(raw["text_content"] or ""))
     texts.extend(
         str(row["ocr_text"] or "")
@@ -241,7 +283,11 @@ def _raw_source_text(connection: Any, raw_message_id: str | None) -> str:
 
 
 def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) -> list[dict[str, Any]]:
-    model_jobs = [dict(value) for value in job_values or [] if isinstance(value, dict)]
+    model_jobs = [
+        dict(value)
+        for value in job_values or []
+        if isinstance(value, dict) and not is_non_job_title(value.get("title"))
+    ]
     expanded: list[dict[str, Any]] = []
     for job in model_jobs:
         title = str(job.get("title") or "").strip()
@@ -265,9 +311,11 @@ def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) ->
             if value:
                 parts.append(value)
         for part in parts or [title]:
-            expanded.append({**job, "title": part})
+            if is_non_job_title(part):
+                continue
+            expanded.append({**job, "title": part, "majors": []})
 
-    source_titles = source_catalog.get("job_titles") or []
+    source_titles = [title for title in source_catalog.get("job_titles") or [] if not is_non_job_title(title)]
     if len(source_titles) < 2:
         return expanded
     specific = [job for job in expanded if not is_aggregate_job_title(job.get("title"))]
@@ -304,19 +352,38 @@ def _event_title_company_candidate(title: Any) -> str:
     return candidate
 
 
-def event_company_for_title(connection: Any, fallback_company_id: str, event: dict[str, Any]) -> str:
-    candidate = _event_title_company_candidate(event.get("title")) or str(event.get("company_name") or "").strip()
-    if not candidate:
-        return fallback_company_id
-    normalized = normalize_name(candidate)
-    if not normalized:
-        return fallback_company_id
-    for row in connection.execute("SELECT id,display_name FROM companies").fetchall():
-        if normalize_name(str(row["display_name"] or "")) == normalized:
-            return row["id"]
-    if not any(marker in candidate for marker in ("有限公司", "股份有限公司", "集团", "研究所", "大学", "银行", "中心")):
-        return fallback_company_id
-    return _company_for(connection, {"display_name": candidate, "industry_codes": []})
+def is_aggregate_event_title(value: Any) -> bool:
+    title = str(value or "").strip()
+    return not _event_title_company_candidate(title) and bool(re.search(r"汇总|安排|日程|一览|活动信息", title))
+
+
+def event_company_for_title(connection: Any, fallback_company_id: str | None, event: dict[str, Any]) -> str | None:
+    venue_values = {
+        normalize_name(str(event.get(key) or ""))
+        for key in ("city", "campus", "location")
+        if event.get(key)
+    }
+    candidates = [
+        _event_title_company_candidate(event.get("title")),
+        str(event.get("company_name") or "").strip(),
+    ]
+    for candidate in candidates:
+        if not candidate or is_location_like_name(candidate):
+            continue
+        normalized = normalize_name(candidate)
+        if not normalized or normalized in venue_values:
+            continue
+        for row in connection.execute("SELECT id,display_name,legal_name,aliases_json FROM companies").fetchall():
+            names = [row["display_name"], row["legal_name"]]
+            try:
+                names.extend(json.loads(row["aliases_json"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                pass
+            if normalized in {normalize_name(str(name)) for name in names if name}:
+                return row["id"]
+        if any(marker in candidate for marker in ("有限公司", "股份有限公司", "集团", "研究所", "大学", "学院", "银行", "医院", "中心")):
+            return _company_for(connection, {"display_name": candidate, "industry_codes": []})
+    return fallback_company_id
 
 
 def _company_for(connection, company_data: dict[str, Any]) -> str:
@@ -440,6 +507,36 @@ def _job_identity_matches(row: Any, normalized_title: str, recruitment_type: str
     return not known_department or not current_department or known_department == current_department
 
 
+def _source_deadline(value: Any, source_text: str, observed_at: str) -> str | None:
+    """Keep a deadline only when the source explicitly presents a deadline context."""
+    raw = str(value or "").strip()
+    if not raw or not source_text:
+        return raw or None
+    deadline_context = re.compile(
+        r"(?:网申|报名|申请|投递|简历).{0,30}(?:截止|截至|最后|止于)|"
+        r"(?:截止|截至|最后|止于).{0,30}(?:网申|报名|申请|投递|简历)|"
+        r"(?:网申|报名|申请|投递).{0,20}(?:时间|日期)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    contexts = list(deadline_context.finditer(source_text))
+    if not contexts:
+        return None
+    normalized = normalize_event_datetime(raw, "Asia/Shanghai", observed_at)
+    if not normalized:
+        return None
+    local_date = datetime.fromisoformat(normalized).astimezone(timezone(timedelta(hours=8)))
+    date_patterns = (
+        rf"{local_date.year}\s*(?:年|[-/.])\s*{local_date.month}\s*(?:月|[-/.])\s*{local_date.day}",
+        rf"{local_date.month}\s*月\s*{local_date.day}\s*(?:日|号)?",
+        rf"{local_date.month:02d}[-/.]{local_date.day:02d}",
+    )
+    for context in contexts:
+        window = source_text[max(0, context.start() - 30) : context.end() + 100]
+        if any(re.search(pattern, window) for pattern in date_patterns):
+            return local_date.date().isoformat()
+    return None
+
+
 def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[str, Any], observed_at: str, raw_message_id: str | None) -> str:
     title = str(job_data.get("title") or "未命名岗位").strip()
     normalized = normalize_title(title)
@@ -460,8 +557,13 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         None,
     )
     now = utc_now()
-    explicit_deadline = job_data.get("deadline") or job_data.get("explicit_deadline")
-    payload = dict(job_data)
+    source_text = _raw_source_text(connection, raw_message_id)
+    explicit_deadline = _source_deadline(
+        job_data.get("deadline") or job_data.get("explicit_deadline"),
+        source_text,
+        observed_at,
+    )
+    payload = {**job_data, "deadline": explicit_deadline or ""}
     content_hash = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
     if row:
         job_id = row["id"]
@@ -551,7 +653,23 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             *(source_catalog.get("major_requirements") or []),
             *(major for job in item.get("jobs") or [] if isinstance(job, dict) for major in (job.get("majors") or [])),
         ]))
-        company_id = _company_for(connection, company)
+        job_items = _prepare_job_items(item.get("jobs") or [], source_catalog)
+        matched_company_id = str(company.get("matched_company_id") or "").strip()
+        company_name = str(company.get("display_name") or company.get("legal_name") or "").strip()
+        if not matched_company_id and is_location_like_name(company_name):
+            company["display_name"] = ""
+            company["legal_name"] = ""
+            company_name = ""
+        company_id = _company_for(connection, company) if matched_company_id or company_name else None
+        if company_id is None:
+            for candidate_event in item.get("events") or []:
+                company_id = event_company_for_title(connection, None, candidate_event)
+                if company_id:
+                    break
+        if company_id is None:
+            # Do not create a synthetic company for an event-only summary or a
+            # model result whose company name is actually a venue/campus.
+            return []
         _record_company_relationship(connection, company_id, company.get("relationship") or {})
         metadata: dict[str, Any] = {}
         if raw_row:
@@ -580,11 +698,16 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         if recruitment_type not in RECRUITMENT_TYPES:
             recruitment_type = "unknown"
         batch_id = _batch_for(connection, company_id, item.get("batch") or {}, recruitment_type)
-        job_items = _prepare_job_items(item.get("jobs") or [], source_catalog)
         job_ids = [_make_job(connection, company_id, batch_id, job, observed, raw_message_id) for job in job_items]
         title_to_job = {normalize_title(str(job.get("title") or "")): job_id for job, job_id in zip(job_items, job_ids)}
+        event_company_ids: list[str] = []
         for event in item.get("events") or []:
-            event_company_id = event_company_for_title(connection, company_id, event)
+            event_company_id = event_company_for_title(connection, None, event)
+            if not event_company_id and not is_aggregate_event_title(event.get("title")):
+                event_company_id = company_id
+            if not event_company_id:
+                continue
+            event_company_ids.append(event_company_id)
             event_batch_id = batch_id if event_company_id == company_id else _batch_for(connection, event_company_id, item.get("batch") or {}, recruitment_type)
             event_evidence_id = evidence_id
             if event_company_id != company_id:
@@ -609,12 +732,11 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         from .company_research import queue_company_research_in_connection
 
         queue_company_research_in_connection(connection, company_id)
-        for event in item.get("events") or []:
-            event_company_id = event_company_for_title(connection, company_id, event)
+        for event_company_id in set(event_company_ids):
             if event_company_id != company_id:
                 queue_company_research_in_connection(connection, event_company_id)
         deduplicate_company_jobs(connection, company_id)
-        return job_ids
+    return job_ids
 
 
 def _merge_event(

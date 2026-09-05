@@ -175,7 +175,10 @@ def _parse_relative_datetime(value: Any, timezone_name: str, reference_at: str |
 
 def _parse_month_day_datetime(value: Any, timezone_name: str, reference_at: str | None) -> datetime | None:
     text = str(value or "").strip()
-    match = re.search(r"(?<!\d)(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*(?:日|号)", text)
+    match = re.search(
+        r"(?<!\d)(?P<month>\d{1,2})\s*(?:月|[./-])\s*(?P<day>\d{1,2})\s*(?:日|号)?",
+        text,
+    )
     if not match:
         return None
     reference = _parse_explicit_datetime(reference_at, timezone_name) if reference_at else None

@@ -74,6 +74,12 @@ def test_relative_event_time_uses_source_message_date():
     assert "2026-09-05T11:00:00+00:00" in extract_event_datetime_candidates("说明会：明日19点", "Asia/Shanghai", reference)
 
 
+def test_numeric_month_day_time_uses_source_year_and_clock():
+    reference = "2026-09-03T15:58:47+00:00"
+    assert normalize_event_datetime("09-04 09:00", "Asia/Shanghai", reference) == "2026-09-04T01:00:00+00:00"
+    assert normalize_event_datetime("09-04 10:20", "Asia/Shanghai", reference) == "2026-09-04T02:20:00+00:00"
+
+
 def test_month_day_and_recruitment_catalog_are_extracted():
     reference = "2026-09-04T00:00:00+00:00"
     assert normalize_event_datetime("9月5号19:00", "Asia/Shanghai", reference) == "2026-09-05T11:00:00+00:00"

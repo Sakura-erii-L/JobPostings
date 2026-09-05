@@ -99,6 +99,80 @@ def test_explicit_job_and_major_sections_are_saved_separately(tmp_path, monkeypa
         "能源动力类：动力工程、工程热物理、动力机械及工程",
         "机械类：机械工程、机械设计制造及其自动化",
     ]
+    assert all(json.loads(row["majors_json"] or "[]") == [] for row in db.all_rows("SELECT majors_json FROM jobs"))
+
+
+def test_process_benefits_and_eligibility_are_not_jobs(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    ids = apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "字段隔离科技", "industry_codes": ["ai_data"]},
+            "jobs": [
+                {"title": "网申投递", "majors": ["计算机科学与技术"]},
+                {"title": "简历筛选"},
+                {"title": "安家费30-50万元"},
+                {"title": "2027届博士"},
+                {"title": "软件工程师", "majors": ["计算机科学与技术"]},
+            ],
+        },
+        None,
+        "2026-09-04T00:00:00+00:00",
+    )
+    assert len(ids) == 1
+    assert [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs")] == ["软件工程师"]
+    company = db.one("SELECT major_requirements_json FROM companies WHERE display_name=?", ("字段隔离科技",))
+    assert json.loads(company["major_requirements_json"]) == ["计算机科学与技术"]
+    assert json.loads(db.one("SELECT majors_json FROM jobs")["majors_json"]) == []
+
+
+def test_event_summary_does_not_create_venue_company_and_keeps_time(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {},
+            "jobs": [],
+            "events": [
+                {"title": "9月4日招聘会宣讲会汇总", "event_type": "presentation", "city": "南京", "campus": "南京理工大学", "location": "第四教学楼A106"},
+                {"title": "中国航发贵阳发动机设计研究所招聘宣讲会", "event_type": "presentation", "start_at": "09-04 09:00", "end_at": "09-04 10:20", "timezone": "Asia/Shanghai", "city": "南京", "campus": "南京理工大学", "location": "第四教学楼A106"},
+            ],
+        },
+        None,
+        "2026-09-03T15:58:47+00:00",
+    )
+    assert db.one("SELECT COUNT(*) AS n FROM companies")["n"] == 1
+    assert db.one("SELECT display_name FROM companies")["display_name"] == "中国航发贵阳发动机设计研究所"
+    event = db.one("SELECT start_at,end_at,location FROM recruitment_events")
+    assert dict(event) == {"start_at": "2026-09-04T01:00:00+00:00", "end_at": "2026-09-04T02:20:00+00:00", "location": "第四教学楼A106"}
+
+
+def test_deadline_requires_source_deadline_context(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    raw_id = ingest_message({"id": "deadline-source", "type": "普通文本", "text": "报名截止时间：9月30日\n招聘对象：2027年12月31日前毕业"}, "manual", None)
+    apply_model_item(
+        {"is_recruitment": True, "company": {"display_name": "截止测试科技"}, "jobs": [{"title": "算法工程师", "deadline": "9月30日"}]},
+        raw_id,
+        "2026-09-04T00:00:00+00:00",
+    )
+    assert db.one("SELECT explicit_deadline FROM jobs")["explicit_deadline"] == "2026-09-30"
+
+    raw_id = ingest_message({"id": "eligibility-only", "type": "普通文本", "text": "招聘对象：2027年12月31日前毕业"}, "manual", None)
+    apply_model_item(
+        {"is_recruitment": True, "company": {"display_name": "资格测试科技"}, "jobs": [{"title": "测试工程师", "deadline": "2027-12-31"}]},
+        raw_id,
+        "2026-09-04T00:00:00+00:00",
+    )
+    assert db.one("SELECT explicit_deadline FROM jobs WHERE canonical_title=?", ("测试工程师",))["explicit_deadline"] is None
 
 
 def test_event_title_company_overrides_context_company(tmp_path, monkeypatch):
