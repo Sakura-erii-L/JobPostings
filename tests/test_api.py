@@ -368,7 +368,7 @@ def test_selected_tracememo_messages_can_be_previewed_and_imported(tmp_path, mon
     store_messages(
         "trace",
         "group",
-        [{"id": "selected-message", "type": "普通文本", "sender": "张三", "text": "测试科技招聘算法工程师", "datetime": now.isoformat()}],
+        [{"id": "selected-message", "type": "公众号链接", "name": "张三", "contentData": {"type": "share", "title": "测试科技招聘算法工程师", "des": "欢迎投递", "url": "https://mp.weixin.qq.com/s/test"}, "datetime": now.isoformat()}],
         now - timedelta(days=1),
         now,
     )
@@ -379,6 +379,9 @@ def test_selected_tracememo_messages_can_be_previewed_and_imported(tmp_path, mon
         assert listed.status_code == 200
         item = listed.json()["items"][0]
         assert item["group_name"] == "招聘群"
+        assert item["sender"] == "张三"
+        assert "测试科技招聘算法工程师" in item["text_preview"]
+        assert "https://mp.weixin.qq.com/s/test" in item["text_preview"]
         assert item["imported"] is False
 
         imported = client.post("/api/v1/admin/tracememo/messages/import", json={"message_ids": [item["id"]]})

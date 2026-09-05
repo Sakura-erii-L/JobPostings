@@ -293,14 +293,41 @@ def _sync_cursor_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _tracememo_message_text(message: dict[str, Any]) -> str:
-    text = str(message.get("text") or message.get("content") or "").strip()
-    if text:
-        return text
-    content_data = message.get("contentData")
+def _tracememo_content_data(message: dict[str, Any]) -> dict[str, Any]:
+    content_data = message.get("contentData") or message.get("content_data")
     if isinstance(content_data, dict):
-        return str(content_data.get("title") or content_data.get("description") or "").strip()
-    return ""
+        return content_data
+    if isinstance(content_data, str):
+        try:
+            parsed = json.loads(content_data)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _tracememo_message_text(message: dict[str, Any]) -> str:
+    content_data = _tracememo_content_data(message)
+    values = (
+        message.get("text"),
+        message.get("content"),
+        message.get("title"),
+        content_data.get("title"),
+        content_data.get("description"),
+        content_data.get("des"),
+        message.get("url"),
+        content_data.get("url"),
+    )
+    unique_values: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in unique_values:
+            unique_values.append(text)
+    return "\n".join(unique_values)
+
+
+def _tracememo_message_sender(message: dict[str, Any]) -> str:
+    return str(message.get("sender") or message.get("talker") or message.get("name") or "").strip()
 
 
 def _tracememo_media_id(message: dict[str, Any]) -> str:
@@ -486,7 +513,7 @@ def tracememo_messages(days: int = 0, limit: int = 100, query: str = "", _: dict
         if not isinstance(message, dict):
             continue
         text = _tracememo_message_text(message)
-        sender = str(message.get("sender") or message.get("talker") or "").strip()
+        sender = _tracememo_message_sender(message)
         if needle and needle not in " ".join((row["group_name"], row["group_external_id"], sender, text)).casefold():
             continue
         items.append(
