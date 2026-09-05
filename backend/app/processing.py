@@ -346,16 +346,13 @@ def _codex_extract(job: dict[str, Any], raw: dict[str, Any], metadata: dict[str,
     ]
     images = [row["path"] for row in artifacts if row["path"]]
     artifact = artifacts[-1] if artifacts else None
-    instruction = "提取来源中的完整可读正文。网页需要访问原始 URL；图片或附件需要读取内容。不要总结。"
-    if metadata.get("web_access_status") == "challenge":
-        instruction += "后端访问公众号 URL 返回了微信环境验证页，不能把验证页文字当作正文；请尝试通过公开可访问的转载、搜索结果或其他来源获取原文，无法取得时明确说明。"
     payload = {
         "reason": reason,
         "source_type": raw["message_type"],
+        "web_access_status": metadata.get("web_access_status"),
         "url": metadata.get("url"),
         "filename": artifact["filename"] if artifact else metadata.get("filename"),
         "existing_text": raw.get("text_content") or "",
-        "instruction": instruction,
     }
     schema = {
         "type": "object",
