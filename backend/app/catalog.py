@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from .db import connect, one, utc_now
-from .parsers import is_link_message, normalize_event_datetime, recover_original_source_url
+from .parsers import extract_recruitment_catalog, is_link_message, normalize_event_datetime, recover_original_source_url
 
 
 INDUSTRIES = {
@@ -204,31 +204,138 @@ def _merge_list(old_value: str | None, new_value: Any) -> list[Any]:
     return list(dict.fromkeys([*old, *incoming]))
 
 
+def normalize_employment_type(value: Any) -> str:
+    text = str(value or "unknown").strip().lower().replace("-", "_").replace(" ", "")
+    aliases = {
+        "全职": "full_time", "全日制": "full_time", "正式": "full_time", "正式员工": "full_time",
+        "实习": "internship", "实习生": "internship", "intern": "internship",
+        "兼职": "part_time", "非全日制": "part_time", "劳务": "labor",
+    }
+    return aliases.get(text, text or "unknown")
+
+
+def is_aggregate_job_title(value: Any) -> bool:
+    title = str(value or "").strip()
+    return any(marker in title for marker in ("招聘岗位", "招聘职位", "具体岗位", "岗位列表", "岗位汇总", "研发与技术岗位", "专业需求"))
+
+
+def _raw_source_text(connection: Any, raw_message_id: str | None) -> str:
+    if not raw_message_id:
+        return ""
+    raw = connection.execute("SELECT text_content,metadata_json FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone()
+    texts: list[str] = []
+    if raw:
+        try:
+            metadata = json.loads(raw["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if metadata.get("_original_text_content"):
+            texts.append(str(metadata["_original_text_content"]))
+        texts.append(str(raw["text_content"] or ""))
+    texts.extend(
+        str(row["ocr_text"] or "")
+        for row in connection.execute("SELECT ocr_text FROM artifacts WHERE raw_message_id=?", (raw_message_id,)).fetchall()
+        if row["ocr_text"]
+    )
+    return "\n".join(text for text in texts if text).strip()
+
+
+def _prepare_job_items(job_values: Any, source_catalog: dict[str, list[str]]) -> list[dict[str, Any]]:
+    model_jobs = [dict(value) for value in job_values or [] if isinstance(value, dict)]
+    expanded: list[dict[str, Any]] = []
+    for job in model_jobs:
+        title = str(job.get("title") or "").strip()
+        parts: list[str] = []
+        if title:
+            current: list[str] = []
+            depth = 0
+            for character in title:
+                if character in "（(【[":
+                    depth += 1
+                elif character in "）)】]" and depth:
+                    depth -= 1
+                if character in "、；;•·，" and depth == 0:
+                    value = "".join(current).strip()
+                    if value:
+                        parts.append(value)
+                    current = []
+                else:
+                    current.append(character)
+            value = "".join(current).strip()
+            if value:
+                parts.append(value)
+        for part in parts or [title]:
+            expanded.append({**job, "title": part})
+
+    source_titles = source_catalog.get("job_titles") or []
+    if len(source_titles) < 2:
+        return expanded
+    specific = [job for job in expanded if not is_aggregate_job_title(job.get("title"))]
+    template = next((job for job in specific), None)
+    by_title = {normalize_title(str(job.get("title") or "")): job for job in specific}
+    result: list[dict[str, Any]] = []
+    for title in source_titles:
+        matched = by_title.get(normalize_title(title))
+        if matched:
+            result.append({**matched, "title": title})
+            continue
+        if template:
+            result.append({**template, "title": title})
+        else:
+            result.append({"title": title, "recruitment_type": "unknown", "employment_type": "unknown"})
+    for job in specific:
+        if normalize_title(str(job.get("title") or "")) not in {normalize_title(title) for title in source_titles}:
+            result.append(job)
+    return result
+
+
+def _event_title_company_candidate(title: Any) -> str:
+    text = str(title or "").strip()
+    if not text:
+        return ""
+    candidate = re.split(
+        r"(?:20\d{2}(?:届|年)?|20\d{2})?(?:秋季|春季|暑期|寒假)?"
+        r"(?:校园|空中|线上|线下)?(?:招聘会|招聘|宣讲会|宣讲|说明会|说明|双选会|双选|开放日|网申|笔试|面试|全国统考)",
+        text,
+        maxsplit=1,
+    )[0].strip(" ：:—-·")
+    if not candidate or re.search(r"(?:^|\D)\d{1,2}月\d{1,2}[日号]?", candidate) or "汇总" in candidate:
+        return ""
+    return candidate
+
+
+def event_company_for_title(connection: Any, fallback_company_id: str, event: dict[str, Any]) -> str:
+    candidate = _event_title_company_candidate(event.get("title")) or str(event.get("company_name") or "").strip()
+    if not candidate:
+        return fallback_company_id
+    normalized = normalize_name(candidate)
+    if not normalized:
+        return fallback_company_id
+    for row in connection.execute("SELECT id,display_name FROM companies").fetchall():
+        if normalize_name(str(row["display_name"] or "")) == normalized:
+            return row["id"]
+    if not any(marker in candidate for marker in ("有限公司", "股份有限公司", "集团", "研究所", "大学", "银行", "中心")):
+        return fallback_company_id
+    return _company_for(connection, {"display_name": candidate, "industry_codes": []})
+
+
 def _company_for(connection, company_data: dict[str, Any]) -> str:
-    display_name = str(company_data.get("display_name") or "未识别企业").strip()
+    display_name = str(company_data.get("display_name") or "").strip()
     legal_name = str(company_data.get("legal_name") or "").strip() or None
     aliases = company_data.get("aliases") or []
-    candidates = [display_name, legal_name, *aliases]
+    if not display_name:
+        display_name = legal_name or f"未识别企业-{uuid4().hex[:8]}"
     existing = None
     matched_company_id = str(company_data.get("matched_company_id") or "").strip()
     if matched_company_id:
         existing = connection.execute("SELECT * FROM companies WHERE id=?", (matched_company_id,)).fetchone()
-    for candidate in candidates:
-        if existing:
-            break
-        if candidate:
-            existing = connection.execute(
-                "SELECT * FROM companies WHERE lower(display_name)=lower(?) OR lower(COALESCE(legal_name,''))=lower(?)",
-                (candidate, candidate),
-            ).fetchone()
-            if existing:
-                break
+        if existing and normalize_name(str(existing["display_name"] or "")) != normalize_name(display_name):
+            existing = None
     now = utc_now()
     if not existing:
-        normalized_candidates = {normalize_name(str(value)) for value in candidates if value}
+        normalized_display_name = normalize_name(display_name)
         for row in connection.execute("SELECT * FROM companies").fetchall():
-            known_names = [row["display_name"], row["legal_name"], *json.loads(row["aliases_json"] or "[]")]
-            if normalized_candidates.intersection(normalize_name(str(value)) for value in known_names if value):
+            if normalize_name(str(row["display_name"] or "")) == normalized_display_name:
                 existing = row
                 break
     industries = [x for x in company_data.get("industry_codes", []) if x in INDUSTRIES]
@@ -239,6 +346,7 @@ def _company_for(connection, company_data: dict[str, Any]) -> str:
         merged_businesses = _merge_list(existing["businesses_json"], company_data.get("businesses"))
         merged_highlights = _merge_list(existing["highlights_json"], company_data.get("highlights"))
         merged_channels = _merge_list(existing["official_channels_json"], company_data.get("official_channels"))
+        merged_major_requirements = _merge_list(existing["major_requirements_json"], company_data.get("major_requirements"))
         secondary = _merge_list(existing["secondary_industries_json"], industries[1:])
         merged_industries = list(dict.fromkeys([existing["primary_industry"], *json.loads(existing["secondary_industries_json"] or "[]"), *industries]))
         merged_tags = normalize_company_tags(
@@ -251,12 +359,13 @@ def _company_for(connection, company_data: dict[str, Any]) -> str:
                primary_industry=CASE WHEN ?='other' THEN primary_industry ELSE ? END,
                secondary_industries_json=?,website=COALESCE(?,website),company_nature=COALESCE(?,company_nature),
                founded_at=COALESCE(?,founded_at),company_size=COALESCE(?,company_size),headquarters=COALESCE(?,headquarters),
-               businesses_json=?,highlights_json=?,official_channels_json=?,company_tags_json=?,updated_at=? WHERE id=?""",
+               businesses_json=?,highlights_json=?,official_channels_json=?,major_requirements_json=?,company_tags_json=?,updated_at=? WHERE id=?""",
             (legal_name, json_text(merged_aliases, []), primary, primary, json_text(secondary, []),
              company_data.get("website") or None, company_data.get("company_nature") or None,
              company_data.get("founded_at") or None, company_data.get("company_size") or None,
              company_data.get("headquarters") or None, json_text(merged_businesses, []),
-             json_text(merged_highlights, []), json_text(merged_channels, []), json_text(merged_tags, []), now, company_id),
+             json_text(merged_highlights, []), json_text(merged_channels, []), json_text(merged_major_requirements, []),
+             json_text(merged_tags, []), now, company_id),
         )
         apply_company_overrides(connection, company_id, company_overrides(existing["manual_overrides_json"]), now)
         return company_id
@@ -264,13 +373,14 @@ def _company_for(connection, company_data: dict[str, Any]) -> str:
     tags = normalize_company_tags(company_data.get("tags"), company_data.get("company_nature"), industries)
     connection.execute(
         """INSERT INTO companies(id,display_name,legal_name,aliases_json,primary_industry,secondary_industries_json,
-           website,company_nature,founded_at,company_size,headquarters,businesses_json,highlights_json,official_channels_json,company_tags_json,created_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           website,company_nature,founded_at,company_size,headquarters,businesses_json,highlights_json,official_channels_json,major_requirements_json,company_tags_json,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (company_id, display_name, legal_name, json_text(aliases, []), primary, json_text(industries[1:], []),
          company_data.get("website") or None, company_data.get("company_nature") or None,
          company_data.get("founded_at") or None, company_data.get("company_size") or None,
          company_data.get("headquarters") or None, json_text(company_data.get("businesses"), []),
-         json_text(company_data.get("highlights"), []), json_text(company_data.get("official_channels"), []), json_text(tags, []), now, now),
+         json_text(company_data.get("highlights"), []), json_text(company_data.get("official_channels"), []),
+         json_text(company_data.get("major_requirements"), []), json_text(tags, []), now, now),
     )
     connection.execute("INSERT INTO search_index(entity_type,entity_id,title,body) VALUES('company',?,?,?)", (company_id, display_name, display_name))
     return company_id
@@ -322,18 +432,33 @@ def _record_company_relationship(connection: Any, company_id: str, relationship:
     )
 
 
+def _job_identity_matches(row: Any, normalized_title: str, recruitment_type: str, employment_type: str, department: Any) -> bool:
+    if row["normalized_title"] != normalized_title or row["recruitment_type"] != recruitment_type:
+        return False
+    known_department = normalize_title(str(row["department"] or ""))
+    current_department = normalize_title(str(department or ""))
+    return not known_department or not current_department or known_department == current_department
+
+
 def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[str, Any], observed_at: str, raw_message_id: str | None) -> str:
     title = str(job_data.get("title") or "未命名岗位").strip()
     normalized = normalize_title(title)
     recruitment_type = str(job_data.get("recruitment_type") or "unknown")
     if recruitment_type not in RECRUITMENT_TYPES:
         recruitment_type = "unknown"
-    employment_type = str(job_data.get("employment_type") or "unknown")
+    employment_type = normalize_employment_type(job_data.get("employment_type"))
     locations = job_data.get("locations") or []
-    row = connection.execute(
-        "SELECT * FROM jobs WHERE company_id=? AND normalized_title=? AND recruitment_type=? AND employment_type=? AND COALESCE(batch_id,'')=COALESCE(?,'') LIMIT 1",
-        (company_id, normalized, recruitment_type, employment_type, batch_id),
-    ).fetchone()
+    row = next(
+        (
+            candidate
+            for candidate in connection.execute(
+                "SELECT * FROM jobs WHERE company_id=? AND normalized_title=? AND recruitment_type=? ORDER BY created_at,id",
+                (company_id, normalized, recruitment_type),
+            ).fetchall()
+            if _job_identity_matches(candidate, normalized, recruitment_type, employment_type, job_data.get("department"))
+        ),
+        None,
+    )
     now = utc_now()
     explicit_deadline = job_data.get("deadline") or job_data.get("explicit_deadline")
     payload = dict(job_data)
@@ -353,16 +478,20 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
         merged_benefits = _merge_list(row["benefits_json"], job_data.get("benefits"))
         merged_methods = _merge_list(row["application_methods_json"], job_data.get("application_methods"))
         merged_contacts = _merge_list(row["contacts_json"], job_data.get("contacts"))
+        existing_employment_type = normalize_employment_type(row["employment_type"])
+        merged_employment_type = employment_type if existing_employment_type == "unknown" else existing_employment_type
+        if employment_type not in {"unknown", merged_employment_type}:
+            merged_employment_type = "unknown"
         connection.execute(
-            """UPDATE jobs SET batch_id=COALESCE(?,batch_id),department=COALESCE(?,department),locations_json=?,
+            """UPDATE jobs SET batch_id=COALESCE(?,batch_id),department=COALESCE(?,department),employment_type=?,locations_json=?,
                headcount=COALESCE(?,headcount),education_json=?,majors_json=?,experience_requirement=COALESCE(?,experience_requirement),
                salary_json=CASE WHEN ?='{}' THEN salary_json ELSE ? END,responsibilities=COALESCE(?,responsibilities),
                requirements=COALESCE(?,requirements),benefits_json=?,application_methods_json=?,contacts_json=?,
                last_effective_posted_at=?,explicit_deadline=COALESCE(?,explicit_deadline),status=?,updated_at=? WHERE id=?""",
-            (batch_id, job_data.get("department") or None, json_text(merged_locations, []), job_data.get("headcount") or None,
-             json_text(merged_education, []), json_text(merged_majors, []), job_data.get("experience_requirement") or None,
-             json_text(job_data.get("salary"), {}), json_text(job_data.get("salary"), {}), job_data.get("responsibilities") or None,
-             job_data.get("requirements") or None, json_text(merged_benefits, []), json_text(merged_methods, []),
+            (batch_id, job_data.get("department") or None, merged_employment_type, json_text(merged_locations, []), job_data.get("headcount") or None,
+             json_text(merged_education, []), json_text(merged_majors, []), _merge_text(row["experience_requirement"], job_data.get("experience_requirement")),
+             json_text(job_data.get("salary"), {}), json_text(job_data.get("salary"), {}), _merge_text(row["responsibilities"], job_data.get("responsibilities")),
+             _merge_text(row["requirements"], job_data.get("requirements")), json_text(merged_benefits, []), json_text(merged_methods, []),
              json_text(merged_contacts, []), last, explicit_deadline, status, now, job_id),
         )
     else:
@@ -414,10 +543,16 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         return []
     observed = observed_at or utc_now()
     with connect() as connection:
-        company = item.get("company") or {}
+        raw_row = connection.execute("SELECT connector_id,message_type,metadata_json FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone() if raw_message_id else None
+        source_catalog = extract_recruitment_catalog(_raw_source_text(connection, raw_message_id))
+        company = dict(item.get("company") or {})
+        company["major_requirements"] = list(dict.fromkeys([
+            *(company.get("major_requirements") or []),
+            *(source_catalog.get("major_requirements") or []),
+            *(major for job in item.get("jobs") or [] if isinstance(job, dict) for major in (job.get("majors") or [])),
+        ]))
         company_id = _company_for(connection, company)
         _record_company_relationship(connection, company_id, company.get("relationship") or {})
-        raw_row = connection.execute("SELECT connector_id,message_type,metadata_json FROM raw_messages WHERE id=?", (raw_message_id,)).fetchone() if raw_message_id else None
         metadata: dict[str, Any] = {}
         if raw_row:
             try:
@@ -445,10 +580,20 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         if recruitment_type not in RECRUITMENT_TYPES:
             recruitment_type = "unknown"
         batch_id = _batch_for(connection, company_id, item.get("batch") or {}, recruitment_type)
-        job_ids = [_make_job(connection, company_id, batch_id, job, observed, raw_message_id) for job in item.get("jobs") or []]
-        title_to_job = {normalize_title(str(job.get("title") or "")): job_id for job, job_id in zip(item.get("jobs") or [], job_ids)}
+        job_items = _prepare_job_items(item.get("jobs") or [], source_catalog)
+        job_ids = [_make_job(connection, company_id, batch_id, job, observed, raw_message_id) for job in job_items]
+        title_to_job = {normalize_title(str(job.get("title") or "")): job_id for job, job_id in zip(job_items, job_ids)}
         for event in item.get("events") or []:
-            _merge_event(connection, company_id, batch_id, event, title_to_job, evidence_id, observed)
+            event_company_id = event_company_for_title(connection, company_id, event)
+            event_batch_id = batch_id if event_company_id == company_id else _batch_for(connection, event_company_id, item.get("batch") or {}, recruitment_type)
+            event_evidence_id = evidence_id
+            if event_company_id != company_id:
+                event_evidence_id = str(uuid4())
+                connection.execute(
+                    "INSERT INTO evidences(id,company_id,raw_message_id,artifact_id,source_url,source_type,excerpt,observed_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (event_evidence_id, event_company_id, raw_message_id if raw_row else None, artifact_id, source_url, source_type, json.dumps(item, ensure_ascii=False), observed),
+                )
+            _merge_event(connection, event_company_id, event_batch_id, event, title_to_job if event_company_id == company_id else {}, event_evidence_id, observed)
         ready_at = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="seconds")
         pending = connection.execute(
             "SELECT id FROM processing_jobs WHERE kind='consolidate_company' AND company_id=? AND status='pending' LIMIT 1",
@@ -464,6 +609,10 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
         from .company_research import queue_company_research_in_connection
 
         queue_company_research_in_connection(connection, company_id)
+        for event in item.get("events") or []:
+            event_company_id = event_company_for_title(connection, company_id, event)
+            if event_company_id != company_id:
+                queue_company_research_in_connection(connection, event_company_id)
         deduplicate_company_jobs(connection, company_id)
         return job_ids
 
@@ -479,13 +628,16 @@ def _merge_event(
 ) -> str:
     event_type = str(event.get("event_type") or "other")
     timezone_name = str(event.get("timezone") or "Asia/Shanghai")
-    start_at = normalize_event_datetime(event.get("start_at"), timezone_name, observed_at)
-    end_at = normalize_event_datetime(event.get("end_at"), timezone_name, observed_at)
+    start_value = event.get("start_at") or event.get("date")
+    end_value = event.get("end_at") or event.get("end_date")
+    start_at = normalize_event_datetime(start_value, timezone_name, observed_at)
+    end_at = normalize_event_datetime(end_value, timezone_name, observed_at)
     normalized_event = {**event, "start_at": start_at or "", "end_at": end_at or "", "timezone": timezone_name}
     location = str(event.get("location") or "").strip()
+    title = str(event.get("title") or event_type).strip()
     existing = connection.execute(
-        "SELECT * FROM recruitment_events WHERE company_id=? AND COALESCE(batch_id,'')=COALESCE(?,'') AND event_type=? AND COALESCE(start_at,'')=COALESCE(?,'') AND COALESCE(location,'')=COALESCE(?,'') LIMIT 1",
-        (company_id, batch_id, event_type, start_at, location),
+        "SELECT * FROM recruitment_events WHERE company_id=? AND COALESCE(batch_id,'')=COALESCE(?,'') AND event_type=? AND lower(title)=lower(?) AND COALESCE(start_at,'')=COALESCE(?,'') AND COALESCE(location,'')=COALESCE(?,'') LIMIT 1",
+        (company_id, batch_id, event_type, title, start_at, location),
     ).fetchone()
     job_ids = [title_to_job[normalize_title(str(title))] for title in event.get("job_titles") or [] if normalize_title(str(title)) in title_to_job]
     now = utc_now()
@@ -506,7 +658,7 @@ def _merge_event(
         connection.execute(
             """INSERT INTO recruitment_events(id,company_id,batch_id,title,event_type,start_at,end_at,timezone,format,city,campus,location,
                application_url,audience,notes,job_ids_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (event_id, company_id, batch_id, event.get("title") or event_type, event_type, start_at, end_at,
+            (event_id, company_id, batch_id, title, event_type, start_at, end_at,
              timezone_name, event.get("format") or "unknown", event.get("city"), event.get("campus"),
              location or None, event.get("application_url"), event.get("audience"), event.get("notes"), json_text(job_ids, []), status, now, now),
         )
@@ -576,14 +728,20 @@ def _merge_job_into(connection: Any, keep: Any, duplicate: Any) -> None:
     first_posted = min(posted_values) if posted_values else None
     last_values = [value for value in (keep["last_effective_posted_at"], duplicate["last_effective_posted_at"]) if value]
     last_posted = max(last_values) if last_values else None
+    employment_type = normalize_employment_type(keep["employment_type"])
+    duplicate_employment_type = normalize_employment_type(duplicate["employment_type"])
+    if employment_type == "unknown":
+        employment_type = duplicate_employment_type
+    elif duplicate_employment_type not in {"unknown", employment_type}:
+        employment_type = "unknown"
     updated_at = max(str(keep["updated_at"] or ""), str(duplicate["updated_at"] or "")) or utc_now()
     connection.execute(
-        """UPDATE jobs SET department=?,locations_json=?,headcount=?,education_json=?,majors_json=?,experience_requirement=?,
+        """UPDATE jobs SET department=?,employment_type=?,locations_json=?,headcount=?,education_json=?,majors_json=?,experience_requirement=?,
            salary_json=?,responsibilities=?,requirements=?,benefits_json=?,application_methods_json=?,contacts_json=?,
            explicit_deadline=?,effective_posted_at=?,last_effective_posted_at=?,status=?,industry_codes_json=?,
            job_function_codes_json=?,confidence=?,updated_at=? WHERE id=?""",
         (
-            _merge_text(keep["department"], duplicate["department"]), merged_lists["locations_json"],
+            _merge_text(keep["department"], duplicate["department"]), employment_type, merged_lists["locations_json"],
             _merge_text(keep["headcount"], duplicate["headcount"]), merged_lists["education_json"],
             merged_lists["majors_json"], _merge_text(keep["experience_requirement"], duplicate["experience_requirement"]),
             _merge_json_object(keep["salary_json"], duplicate["salary_json"]),
@@ -644,11 +802,13 @@ def deduplicate_company_jobs(connection: Any, company_id: str) -> int:
         matched = None
         for group in groups:
             first = group[0]
-            if (first["normalized_title"], first["batch_id"], first["recruitment_type"]) != (row["normalized_title"], row["batch_id"], row["recruitment_type"]):
-                continue
-            known_types = {str(item["employment_type"] or "unknown") for item in group if item["employment_type"] != "unknown"}
-            current_type = str(row["employment_type"] or "unknown")
-            if current_type == "unknown" or not known_types or current_type in known_types:
+            if _job_identity_matches(
+                row,
+                first["normalized_title"],
+                first["recruitment_type"],
+                normalize_employment_type(first["employment_type"]),
+                first["department"],
+            ):
                 matched = group
                 break
         if matched is None:

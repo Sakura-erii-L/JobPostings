@@ -1,6 +1,6 @@
 import pytest
 
-from app.parsers import detect_image_suffix, extract_html, extract_file, fetch_public_url, is_access_challenge_page, is_link_message, is_system_message, parse_message_payload, parse_message_time, recover_original_source_url
+from app.parsers import detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, fetch_public_url, is_access_challenge_page, is_link_message, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
 
 
 def test_html_extraction():
@@ -65,3 +65,25 @@ def test_wechat_verification_redirect_recovers_original_source_url():
     redirected = "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=temporary&target_url=https%3A%2F%2Fmp.weixin.qq.com%2Fs%2Fexample%3Fmid%3D123"
     assert recover_original_source_url(redirected) == original
     assert recover_original_source_url(original) == original
+
+
+def test_relative_event_time_uses_source_message_date():
+    reference = "2026-09-04T11:00:00+00:00"
+    assert normalize_event_datetime("明日19点", "Asia/Shanghai", reference) == "2026-09-05T11:00:00+00:00"
+    assert normalize_event_datetime("次日晚上7:30", "Asia/Shanghai", reference) == "2026-09-05T11:30:00+00:00"
+    assert "2026-09-05T11:00:00+00:00" in extract_event_datetime_candidates("说明会：明日19点", "Asia/Shanghai", reference)
+
+
+def test_month_day_and_recruitment_catalog_are_extracted():
+    reference = "2026-09-04T00:00:00+00:00"
+    assert normalize_event_datetime("9月5号19:00", "Asia/Shanghai", reference) == "2026-09-05T11:00:00+00:00"
+    catalog = extract_recruitment_catalog("""四、招聘岗位
+航空发动机总体设计、航空发动机部件设计、传动系统设计
+五、需求专业
+航空航天类：航空宇航推进理论与工程、航空宇航科学与技术
+能源动力类：动力工程、工程热物理
+六、报名方式
+请在线报名
+""")
+    assert catalog["job_titles"] == ["航空发动机总体设计", "航空发动机部件设计", "传动系统设计"]
+    assert catalog["major_requirements"] == ["航空航天类：航空宇航推进理论与工程、航空宇航科学与技术", "能源动力类：动力工程、工程热物理"]

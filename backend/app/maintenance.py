@@ -5,11 +5,13 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+from uuid import uuid4
 
 from .config import config
-from .catalog import deduplicate_company_jobs, normalize_company_tags
+from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title
 from .db import connect, utc_now
-from .parsers import extract_event_datetime_candidates, normalize_event_datetime, parse_message_time, recover_original_source_url
+from .parsers import extract_event_datetime_candidates, extract_recruitment_catalog, normalize_event_datetime, parse_message_time, recover_original_source_url
 
 
 # Imported recruitment content and its derived catalog are reset together so
@@ -226,23 +228,41 @@ def repair_timeline_events() -> dict[str, int]:
             ).fetchone()
             reference_at = version["observed_at"] if version else None
             evidence_rows = connection.execute(
-                """SELECT COALESCE(r.text_content,'') AS raw_text,COALESCE(e.excerpt,'') AS excerpt
+                """SELECT r.id AS raw_message_id,COALESCE(r.text_content,'') AS raw_text,COALESCE(e.excerpt,'') AS excerpt
                    FROM recruitment_event_evidences ee JOIN evidences e ON e.id=ee.evidence_id
                    LEFT JOIN raw_messages r ON r.id=e.raw_message_id WHERE ee.event_id=?""",
                 (event["id"],),
             ).fetchall()
-            source_text = "\n".join(value for row in evidence_rows for value in (row["raw_text"], row["excerpt"]) if value)
+            source_text = "\n".join(
+                value
+                for row in evidence_rows
+                for value in (_raw_source_text(connection, row["raw_message_id"]) or row["raw_text"], row["excerpt"])
+                if value
+            )
             if version and version["payload_json"]:
                 source_text = f"{source_text}\n{version['payload_json']}"
             candidates = extract_event_datetime_candidates(source_text, event["timezone"] or "Asia/Shanghai", reference_at)
             current_start = normalize_event_datetime(event["start_at"], event["timezone"] or "Asia/Shanghai", reference_at)
             current_end = normalize_event_datetime(event["end_at"], event["timezone"] or "Asia/Shanghai", reference_at)
+            timed_candidates = []
+            try:
+                event_zone = ZoneInfo(event["timezone"] or "Asia/Shanghai")
+            except Exception:
+                event_zone = ZoneInfo("Asia/Shanghai")
+            for candidate in candidates:
+                try:
+                    parsed_candidate = datetime.fromisoformat(candidate)
+                except ValueError:
+                    continue
+                local_candidate = parsed_candidate.astimezone(event_zone)
+                if local_candidate.hour or local_candidate.minute:
+                    timed_candidates.append(candidate)
             recovered = False
-            if event["start_at"] and not current_start:
-                current_start = _nearest_candidate(candidates, reference_at)
+            if event["start_at"] and (not current_start or (current_start.endswith("T00:00:00+00:00") and timed_candidates)):
+                current_start = _nearest_candidate(timed_candidates or candidates, reference_at)
                 recovered = bool(current_start)
             if event["end_at"] and not current_end:
-                current_end = _nearest_candidate(candidates, reference_at, current_start)
+                current_end = _nearest_candidate(timed_candidates or candidates, reference_at, current_start)
                 recovered = recovered or bool(current_end)
             new_status = event["status"]
             if current_start:
@@ -270,6 +290,153 @@ def repair_timeline_events() -> dict[str, int]:
                     connection.execute("UPDATE recruitment_event_versions SET payload_json=? WHERE id=?", (json.dumps(payload, ensure_ascii=False), version["id"]))
             result["updated"] += 1
     return result
+
+
+def repair_event_company_assignments() -> int:
+    """Move events whose title contains an explicit, distinct company name."""
+    updated = 0
+    with connect() as connection:
+        events = connection.execute("SELECT id,company_id,batch_id,title FROM recruitment_events").fetchall()
+        for event in events:
+            target_id = event_company_for_title(connection, event["company_id"], {"title": event["title"]})
+            if target_id == event["company_id"]:
+                continue
+            target_batch_id = None
+            if event["batch_id"]:
+                source_batch = connection.execute(
+                    "SELECT name,year,season,recruitment_type,confidence FROM recruitment_batches WHERE id=?",
+                    (event["batch_id"],),
+                ).fetchone()
+                if source_batch:
+                    target_batch_id = _batch_for(connection, target_id, dict(source_batch), source_batch["recruitment_type"])
+            connection.execute("UPDATE recruitment_events SET company_id=?,batch_id=?,updated_at=? WHERE id=?", (target_id, target_batch_id, utc_now(), event["id"]))
+            evidence_rows = connection.execute(
+                "SELECT e.* FROM recruitment_event_evidences ee JOIN evidences e ON e.id=ee.evidence_id WHERE ee.event_id=?",
+                (event["id"],),
+            ).fetchall()
+            for evidence in evidence_rows:
+                if evidence["company_id"] == target_id and evidence["job_id"] is None:
+                    continue
+                copied_id = str(uuid4())
+                connection.execute(
+                    "INSERT INTO evidences(id,company_id,job_id,raw_message_id,artifact_id,source_url,source_type,excerpt,location,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (copied_id, target_id, None, evidence["raw_message_id"], evidence["artifact_id"], evidence["source_url"], evidence["source_type"], evidence["excerpt"], evidence["location"], evidence["observed_at"]),
+                )
+                connection.execute("UPDATE recruitment_event_evidences SET evidence_id=? WHERE event_id=? AND evidence_id=?", (copied_id, event["id"], evidence["id"]))
+            updated += 1
+    return updated
+
+
+def backfill_major_requirements() -> int:
+    """Backfill company-level major requirements from stored source text and OCR."""
+    updated = 0
+    with connect() as connection:
+        companies = connection.execute("SELECT id,major_requirements_json FROM companies").fetchall()
+        for company in companies:
+            try:
+                existing = json.loads(company["major_requirements_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                existing = []
+            raw_ids = connection.execute(
+                """SELECT DISTINCT e.raw_message_id FROM evidences e
+                   WHERE e.company_id=? OR e.job_id IN (SELECT id FROM jobs WHERE company_id=?)""",
+                (company["id"], company["id"]),
+            ).fetchall()
+            discovered: list[str] = []
+            for raw in raw_ids:
+                catalog = extract_recruitment_catalog(_raw_source_text(connection, raw["raw_message_id"]))
+                discovered.extend(catalog.get("major_requirements") or [])
+            merged = list(dict.fromkeys([*existing, *discovered]))
+            encoded = json.dumps(merged, ensure_ascii=False)
+            if encoded != company["major_requirements_json"]:
+                connection.execute("UPDATE companies SET major_requirements_json=?,updated_at=? WHERE id=?", (encoded, utc_now(), company["id"]))
+                updated += 1
+    return updated
+
+
+def split_existing_job_lists() -> int:
+    """Create missing jobs from explicit multi-job lists in existing sources."""
+    created = 0
+    with connect() as connection:
+        company_ids = [row["id"] for row in connection.execute("SELECT id FROM companies").fetchall()]
+        for company_id in company_ids:
+            raw_rows = connection.execute(
+                """SELECT DISTINCT e.raw_message_id,COALESCE(r.sent_at,e.observed_at) AS observed_at
+                   FROM evidences e LEFT JOIN raw_messages r ON r.id=e.raw_message_id
+                   WHERE e.company_id=? OR e.job_id IN (SELECT id FROM jobs WHERE company_id=?)""",
+                (company_id, company_id),
+            ).fetchall()
+            for raw in raw_rows:
+                catalog = extract_recruitment_catalog(_raw_source_text(connection, raw["raw_message_id"]))
+                titles = catalog.get("job_titles") or []
+                if len(titles) < 2:
+                    continue
+                current_jobs = [dict(row) for row in connection.execute("SELECT * FROM jobs WHERE company_id=? AND status<>'superseded'", (company_id,)).fetchall()]
+                template = next((job for job in current_jobs if is_aggregate_job_title(job["canonical_title"])), None)
+                for title in titles:
+                    if any(normalize_title(job["canonical_title"]) == normalize_title(title) for job in current_jobs):
+                        continue
+                    job_data: dict[str, Any] = {
+                        "title": title,
+                        "recruitment_type": template["recruitment_type"] if template else "unknown",
+                        "employment_type": template["employment_type"] if template else "unknown",
+                    }
+                    if template:
+                        try:
+                            job_data["locations"] = json.loads(template["locations_json"] or "[]")
+                        except (TypeError, json.JSONDecodeError):
+                            job_data["locations"] = []
+                    _make_job(connection, company_id, template["batch_id"] if template else None, job_data, raw["observed_at"] or utc_now(), raw["raw_message_id"])
+                    current_jobs = [dict(row) for row in connection.execute("SELECT * FROM jobs WHERE company_id=? AND status<>'superseded'", (company_id,)).fetchall()]
+                    created += 1
+                if template:
+                    connection.execute("UPDATE jobs SET status='superseded',updated_at=? WHERE id=?", (utc_now(), template["id"]))
+                    connection.execute("UPDATE evidences SET company_id=?,job_id=NULL WHERE job_id=?", (company_id, template["id"]))
+                    connection.execute("DELETE FROM search_index WHERE entity_type='job' AND entity_id=?", (template["id"],))
+    return created
+
+
+def supersede_duplicate_jobs() -> int:
+    """Hide duplicate jobs without deleting their historical records."""
+    updated = 0
+    with connect() as connection:
+        for company in connection.execute("SELECT id FROM companies").fetchall():
+            rows = [dict(row) for row in connection.execute(
+                "SELECT * FROM jobs WHERE company_id=? AND status<>'superseded' ORDER BY normalized_title,created_at,id",
+                (company["id"],),
+            ).fetchall()]
+            groups: list[list[dict[str, Any]]] = []
+            for row in rows:
+                group = next(
+                    (
+                        candidate for candidate in groups
+                        if _job_identity_matches(
+                            row,
+                            candidate[0]["normalized_title"],
+                            candidate[0]["recruitment_type"],
+                            normalize_employment_type(candidate[0]["employment_type"]),
+                            candidate[0]["department"],
+                        )
+                    ),
+                    None,
+                )
+                if group is None:
+                    group = []
+                    groups.append(group)
+                group.append(row)
+            for group in groups:
+                for duplicate in group[1:]:
+                    has_user_state = any(
+                        connection.execute(f"SELECT 1 FROM {table} WHERE job_id=? LIMIT 1", (duplicate["id"],)).fetchone()
+                        for table in ("user_job_states", "application_events", "user_notes", "job_tag_links")
+                    )
+                    if has_user_state:
+                        continue
+                    connection.execute("UPDATE jobs SET status='superseded',updated_at=? WHERE id=?", (utc_now(), duplicate["id"]))
+                    connection.execute("UPDATE evidences SET company_id=?,job_id=NULL WHERE job_id=?", (company["id"], duplicate["id"]))
+                    connection.execute("DELETE FROM search_index WHERE entity_type='job' AND entity_id=?", (duplicate["id"],))
+                    updated += 1
+    return updated
 
 
 def backfill_company_tags() -> int:
@@ -301,19 +468,22 @@ def deduplicate_all_jobs() -> int:
 
 def repair_existing_catalog() -> dict[str, Any]:
     """Run the one-time historical repair behind a recoverable database backup."""
-    marker = "historical_catalog_repair_v2"
+    marker = "historical_catalog_repair_v3"
     with connect() as connection:
         if connection.execute("SELECT 1 FROM schema_meta WHERE key=?", (marker,)).fetchone():
-            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "jobs_removed": 0, "tags_updated": 0}
+            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "events_reassigned": 0, "jobs_created": 0, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": 0}
         counts = {
             "events": connection.execute("SELECT COUNT(*) AS count FROM recruitment_events").fetchone()["count"],
             "jobs": connection.execute("SELECT COUNT(*) AS count FROM jobs").fetchone()["count"],
             "companies": connection.execute("SELECT COUNT(*) AS count FROM companies").fetchone()["count"],
         }
     backup_path = _create_safety_backup() if any(counts.values()) else None
+    events_reassigned = repair_event_company_assignments()
+    jobs_created = split_existing_job_lists()
+    major_requirements_updated = backfill_major_requirements()
     timeline = repair_timeline_events()
-    jobs_removed = deduplicate_all_jobs()
+    jobs_superseded = supersede_duplicate_jobs()
     tags_updated = backfill_company_tags()
     with connect() as connection:
         connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
-    return {"status": "repaired", "backup_path": backup_path, "timeline": timeline, "jobs_removed": jobs_removed, "tags_updated": tags_updated}
+    return {"status": "repaired", "backup_path": backup_path, "timeline": timeline, "events_reassigned": events_reassigned, "jobs_created": jobs_created, "jobs_superseded": jobs_superseded, "tags_updated": tags_updated, "major_requirements_updated": major_requirements_updated}

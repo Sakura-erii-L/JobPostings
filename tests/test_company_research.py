@@ -4,6 +4,7 @@ from app import db
 from app.catalog import apply_model_item, normalize_company_tags
 from app.company_research import ensure_company_research_jobs, persist_company_research
 from app.maintenance import repair_timeline_events
+from app.processing import ingest_message
 
 
 def configure_test_db(tmp_path, monkeypatch):
@@ -29,7 +30,7 @@ def test_model_company_tags_keep_taxonomy_labels_and_allow_supported_attributes(
     }
 
 
-def test_company_aliases_and_duplicate_jobs_are_merged(tmp_path, monkeypatch):
+def test_company_names_stay_independent_but_same_company_jobs_are_merged(tmp_path, monkeypatch):
     configure_test_db(tmp_path, monkeypatch)
     apply_model_item(
         {
@@ -75,16 +76,38 @@ def test_company_aliases_and_duplicate_jobs_are_merged(tmp_path, monkeypatch):
         "2026-09-04T01:00:00+00:00",
     )
 
-    company = db.one("SELECT * FROM companies")
-    jobs = db.all_rows("SELECT * FROM jobs")
-    assert company["display_name"] == "合并科技"
-    assert "合并科技招聘品牌" in json.loads(company["aliases_json"])
-    tags = json.loads(company["company_tags_json"])
-    assert {tag["code"] for tag in tags} >= {"private", "electronics_semiconductor", "r_and_d_oriented"}
-    assert len(jobs) == 1
-    assert set(json.loads(jobs[0]["locations_json"])) == {"南京", "上海"}
-    assert "底层开发" in jobs[0]["responsibilities"]
-    assert "芯片驱动开发" in jobs[0]["responsibilities"]
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "合并科技", "industry_codes": ["electronics_semiconductor"]},
+            "batch": {"name": "2027 春招", "recruitment_type": "campus"},
+            "jobs": [{
+                "title": "嵌入式 工程师",
+                "recruitment_type": "campus",
+                "employment_type": "full_time",
+                "locations": ["上海"],
+                "responsibilities": "参与芯片驱动开发",
+            }],
+        },
+        None,
+        "2026-09-04T02:00:00+00:00",
+    )
+
+    companies = db.all_rows("SELECT * FROM companies ORDER BY display_name")
+    assert [company["display_name"] for company in companies] == ["合并科技", "合并科技有限公司"]
+    first = next(company for company in companies if company["display_name"] == "合并科技")
+    second = next(company for company in companies if company["display_name"] == "合并科技有限公司")
+    assert "合并科技招聘品牌" not in json.loads(first["aliases_json"])
+    assert "合并科技招聘品牌" in json.loads(second["aliases_json"])
+    tags = json.loads(first["company_tags_json"])
+    assert {tag["code"] for tag in tags} >= {"private", "electronics_semiconductor"}
+    first_jobs = db.all_rows("SELECT * FROM jobs WHERE company_id=?", (first["id"],))
+    second_jobs = db.all_rows("SELECT * FROM jobs WHERE company_id=?", (second["id"],))
+    assert len(first_jobs) == 1
+    assert len(second_jobs) == 1
+    assert set(json.loads(first_jobs[0]["locations_json"])) == {"南京", "上海"}
+    assert "底层开发" in first_jobs[0]["responsibilities"]
+    assert "芯片驱动开发" in first_jobs[0]["responsibilities"]
 
 
 def test_public_research_persists_summary_tags_and_original_sources(tmp_path, monkeypatch):
@@ -174,3 +197,24 @@ def test_legacy_implausible_timeline_date_is_recovered_from_version_source(tmp_p
     event = db.one("SELECT start_at FROM recruitment_events WHERE id='event-legacy'")
     assert result["recovered"] == 1
     assert event["start_at"] == "2026-09-16T16:00:00+00:00"
+
+
+def test_midnight_event_is_repaired_from_relative_source_time(tmp_path, monkeypatch):
+    configure_test_db(tmp_path, monkeypatch)
+    raw_id = ingest_message({"id": "relative-event", "type": "普通文本", "text": "招聘说明会：明日19点线上举行"}, "manual", None)
+    assert raw_id
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "相对时间科技"},
+            "events": [{"title": "相对时间科技宣讲会", "event_type": "presentation", "start_at": "2026-09-04T00:00:00+00:00", "timezone": "Asia/Shanghai"}],
+            "jobs": [],
+        },
+        raw_id,
+        "2026-09-04T00:00:00+00:00",
+    )
+
+    result = repair_timeline_events()
+    event = db.one("SELECT start_at FROM recruitment_events")
+    assert result["recovered"] == 1
+    assert event["start_at"] == "2026-09-05T11:00:00+00:00"

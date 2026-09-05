@@ -63,6 +63,25 @@ button { cursor: pointer; }
 .timeline-event-detail p { flex-basis:100%; margin:0; line-height:1.6; }
 .timeline-event-detail a { color:#5269d5; }
 .timeline-event-detail .secondary { padding:7px 10px; font-size:11px; }
+.timeline-view-switch { display:flex; gap:8px; }
+.active-filter { border-color:#7186ed; color:#5269d5; background:#eef2ff; }
+.timeline-week-controls { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.timeline-week-controls .secondary { padding:9px 12px; font-size:12px; }
+.timeline-week-controls span { color:#71809c; font-size:12px; }
+.timeline-week { display:grid; grid-template-columns:repeat(7, minmax(155px, 1fr)); gap:10px; overflow-x:auto; padding-bottom:4px; }
+.timeline-day { min-width:155px; min-height:240px; padding:11px; border:1px solid #e8ebf3; border-radius:13px; background:#f8f9fd; }
+.timeline-day header { display:flex; justify-content:space-between; align-items:baseline; gap:7px; padding:3px 2px 10px; }
+.timeline-day header strong { color:#35415d; font-size:13px; }
+.timeline-day header time { color:#8994a8; font-size:11px; }
+.timeline-day-empty { padding:25px 7px; color:#a0a9bb; text-align:center; font-size:11px; }
+.timeline-day .timeline-event { margin-bottom:8px; }
+.timeline-day .timeline-event:last-child { margin-bottom:0; }
+.timeline-day .timeline-event summary { display:block; padding:11px; }
+.timeline-day .timeline-event summary>time { display:block; margin-bottom:7px; }
+.timeline-day .timeline-event summary>div { margin-bottom:7px; }
+.timeline-day .timeline-event summary .status { display:inline-block; }
+.timeline-day .timeline-event-detail { padding:0 11px 11px; }
+.timeline-uncertain { margin-top:20px; }
 .status.upcoming { color:#239268; background:#e4f7ee; }
 .status.historical { color:#b97827; background:#fff0d9; }
 

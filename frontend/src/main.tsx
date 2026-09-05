@@ -6,7 +6,7 @@ import './queue.css'
 type User = { id: string; email: string; role: string; password_configured?: boolean }
 type CompanyTag = { category: 'company_type' | 'industry' | string; code: string; label: string }
 type PublicFinding = { id: string; finding_type?: string; title: string; summary: string; source_title?: string | null; source_url: string; resolved_url?: string | null; published_at?: string | null; severity: string; retrieved_at: string }
-type Company = { id: string; display_name: string; legal_name?: string; website?: string; summary?: string; primary_industry: string; secondary_industries?: string[]; tags?: CompanyTag[]; job_count: number; updated_at: string; company_nature?: string; founded_at?: string; company_size?: string; headquarters?: string; businesses?: string[]; highlights?: string[]; official_channels?: string[]; public_researched_at?: string | null; verification_status?: string }
+type Company = { id: string; display_name: string; legal_name?: string; website?: string; summary?: string; primary_industry: string; secondary_industries?: string[]; tags?: CompanyTag[]; job_count: number; updated_at: string; company_nature?: string; founded_at?: string; company_size?: string; headquarters?: string; businesses?: string[]; highlights?: string[]; official_channels?: string[]; major_requirements?: string[]; public_researched_at?: string | null; verification_status?: string }
 type Job = { id: string; canonical_title: string; recruitment_type: string; employment_type: string; status: string; locations_json?: string; locations?: string[]; company_name?: string; updated_at?: string; department?: string; headcount?: string; education?: string[]; majors?: string[]; experience_requirement?: string; salary?: Record<string, any>; responsibilities?: string; requirements?: string; benefits?: string[]; application_methods?: string[]; contacts?: string[]; explicit_deadline?: string }
 type Application = Job & { state: string; favorite: number; updated_at: string }
 type Evidence = { id: string; source_url?: string; source_type: string; excerpt?: string; artifact_id?: string; artifact_ids?: string[]; qr_values?: string[]; observed_at?: string; raw_text?: string; ocr_text?: string; sender?: string; sent_at?: string; source_group_name?: string; filename?: string; mime_type?: string; metadata?: Record<string, any> }
@@ -366,6 +366,7 @@ function CompanyView({ company, onBack, onState, onFollow }: { company: CompanyD
     ['企业全称', company.legal_name], ['企业性质', company.company_nature], ['成立时间', company.founded_at],
     ['企业规模', company.company_size], ['总部及办公地点', company.headquarters], ['主要业务', company.businesses?.join('、')],
     ['企业亮点', company.highlights?.join('、')], ['官方网站', company.website], ['官方招聘渠道', company.official_channels?.join('、')],
+    ['需求专业', company.major_requirements?.join('、')],
   ].filter(([, value]) => value)
   const findings = company.public_findings || []
   return <><button className="back" onClick={onBack}>← 返回企业列表</button><PageHeader eyebrow="企业详情" title={company.display_name} description={`${TAG_LABELS[company.primary_industry] || company.primary_industry} · ${company.jobs.length} 个岗位`}><button className="secondary" onClick={() => onFollow(company.id)}>☆ 关注企业</button></PageHeader><div className="detail-layout"><section><div className="detail-card intro"><div className="large-avatar">{company.display_name.slice(0, 1)}</div><div><h2>企业概览</h2><p>{company.summary || '企业资料正在根据来源整理。'}</p><CompanyTags tags={company.tags} primaryIndustry={company.primary_industry} /><div className="chips alias-tags">{company.aliases.map(alias => <span key={alias}>{alias}</span>)}</div>{company.public_researched_at && <small className="research-time">公开信息检索于 {formatDate(company.public_researched_at)}</small>}</div></div>{findings.length > 0 ? <div className="detail-card public-findings"><div className="section-title"><h2>公开信息核查</h2><span>{findings.length} 条需留意</span></div><p className="research-disclaimer">以下内容来自公开报道或监管/司法公开来源，需结合原文核实，不等同于对企业作出司法结论。</p>{findings.map(finding => <article className={`public-finding ${finding.severity}`} key={finding.id}><div className="public-finding-head"><strong>{finding.title}</strong><span className={`severity ${finding.severity}`}>{finding.severity === 'high' ? '高关注' : finding.severity === 'medium' ? '中关注' : finding.severity === 'low' ? '低关注' : '待确认'}</span></div><p>{finding.summary}</p><div className="public-finding-meta">{finding.source_title && <span>{finding.source_title}</span>}{finding.published_at && <span>报道时间：{finding.published_at}</span>}<a href={finding.source_url} target="_blank" rel="noreferrer">查看原始来源 ↗</a></div>{finding.resolved_url && finding.resolved_url !== finding.source_url && <details className="resolved-source"><summary>查看跳转诊断地址</summary><code>{finding.resolved_url}</code></details>}</article>)}</div> : company.verification_status?.startsWith('public_web') && <div className="detail-card public-findings empty-public-findings"><div className="section-title"><h2>公开信息核查</h2><span>本次已检索</span></div><p>本次检索未发现带有可靠直接来源的重大负面公开信息；这不等于不存在相关信息，建议结合原始来源持续复核。</p></div>}{facts.length > 0 && <div className="detail-card"><div className="section-title"><h2>企业资料</h2><span>由模型根据证据整理</span></div><dl className="company-facts">{facts.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl></div>}<div className="detail-card"><div className="section-title"><h2>招聘时间轴</h2><span>{company.events.length} 项</span></div>{company.events.length ? company.events.map(event => <TimelineEventCard event={event} key={event.id} />) : <div className="empty-inline">暂无明确时间事件</div>}</div><div className="detail-card"><div className="section-title"><h2>招聘岗位</h2><span>{company.jobs.length} 个岗位</span></div>{company.jobs.length ? company.jobs.map(job => <JobRow key={job.id} job={job} onState={onState} />) : <div className="empty-inline">暂无岗位</div>}</div></section><aside><div className="detail-card"><div className="section-title"><h2>来源与证据</h2><span>{company.evidences.length}</span></div>{company.evidences.map(evidence => <EvidenceCard key={evidence.id} evidence={evidence} />)}</div></aside></div></>
@@ -399,15 +400,83 @@ function EvidenceCard({ evidence }: { evidence: Evidence }) {
   return <div className={`evidence${open ? ' open' : ''}`}><span className="evidence-dot" /><div><button className="evidence-toggle" onClick={toggle}><strong>{evidence.source_type}</strong><span>{open ? '收起' : '展开全文'}</span></button><p>{evidence.excerpt || '已保存来源证据'}</p>{open && <div className="evidence-full">{error && <div className="form-error">{error}</div>}<div className="evidence-meta">{value.source_group_name && <span>来源群：{value.source_group_name}</span>}{value.sender && <span>发送者：{value.sender}</span>}{value.sent_at && <span>消息时间：{formatDate(value.sent_at)}</span>}{value.observed_at && <span>处理时间：{formatDate(value.observed_at)}</span>}</div>{value.artifact_id && value.mime_type?.startsWith('image/') && <img src={`/api/v1/artifacts/${value.artifact_id}`} alt={value.filename || '来源图片'} />}{value.qr_values?.length ? <><h4>二维码链接</h4><div className="qr-list">{value.qr_values.map((qr, index) => /^https?:\/\//i.test(qr) ? <a href={qr} target="_blank" rel="noreferrer" key={`${qr}-${index}`}>{qr}</a> : <span key={`${qr}-${index}`}>{qr}</span>)}</div></> : null}{value.raw_text && <><h4>原始/提取正文</h4><pre>{value.raw_text}</pre></>}{value.ocr_text && value.ocr_text !== value.raw_text && <><h4>OCR 全文</h4><pre>{value.ocr_text}</pre></>}{value.excerpt && <><h4>结构化结果</h4><pre>{value.excerpt}</pre></>}</div>}{evidence.source_url && <a href={evidence.source_url} target="_blank" rel="noreferrer">打开原始来源 ↗</a>}</div></div>
 }
 
+const WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+
+function formatEventDate(value?: string | null, timezone?: string) {
+  if (!value) return '时间待确认'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return formatDate(value)
+  try {
+    return new Intl.DateTimeFormat('zh-CN', { timeZone: timezone || 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(date)
+  } catch {
+    return formatDate(value)
+  }
+}
+
+function eventDateKey(value?: string | null, timezone?: string) {
+  if (!value) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  try {
+    const parts = new Intl.DateTimeFormat('en', { timeZone: timezone || 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(date)
+    const part = (type: string) => parts.find(item => item.type === type)?.value || ''
+    return `${part('year')}-${part('month')}-${part('day')}`
+  } catch {
+    return localDateKey(date)
+  }
+}
+
+function localDateKey(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+function startOfWeek(value: Date) {
+  const result = new Date(value.getFullYear(), value.getMonth(), value.getDate())
+  const day = result.getDay()
+  result.setDate(result.getDate() - (day === 0 ? 6 : day - 1))
+  return result
+}
+
+function addDays(value: Date, days: number) {
+  const result = new Date(value)
+  result.setDate(result.getDate() + days)
+  return result
+}
+
+function formatShortDate(value: Date) {
+  return `${value.getMonth() + 1}月${value.getDate()}日`
+}
+
+function formatWeekRange(start: Date, end: Date) {
+  return `${start.getFullYear()}年${formatShortDate(start)}—${formatShortDate(end)}`
+}
+
 function TimelineEventCard({ event, onOpenCompany }: { event: RecruitmentEvent; onOpenCompany?: (id: string) => void }) {
-  return <details className="timeline-event"><summary><time>{event.start_at ? formatDate(event.start_at) : '时间待确认'}</time><div><strong>{event.title}</strong><span>{event.company_name}{event.city ? ` · ${event.city}` : ''}{event.location ? ` · ${event.location}` : ''}</span></div><span className={`status ${event.status}`}>{event.status === 'historical' ? '历史活动' : '即将开始'}</span></summary><div className="timeline-event-detail"><p>{event.notes || '暂无补充说明'}</p>{event.campus && <span>校区：{event.campus}</span>}{event.audience && <span>面向：{event.audience}</span>}{event.application_url && <a href={event.application_url} target="_blank" rel="noreferrer">打开网申/活动地址 ↗</a>}{onOpenCompany && <button className="secondary" onClick={() => onOpenCompany(event.company_id)}>查看企业</button>}</div></details>
+  return <details className="timeline-event"><summary><time>{event.start_at ? formatEventDate(event.start_at, event.timezone) : '时间待确认'}</time><div><strong>{event.title}</strong><span>{event.company_name}{event.city ? ` · ${event.city}` : ''}{event.location ? ` · ${event.location}` : ''}</span></div><span className={`status ${event.status}`}>{event.status === 'historical' ? '历史活动' : '即将开始'}</span></summary><div className="timeline-event-detail"><p>{event.notes || '暂无补充说明'}</p>{event.start_at && <span>活动时间：{formatEventDate(event.start_at, event.timezone)}{event.end_at ? ` 至 ${formatEventDate(event.end_at, event.timezone)}` : ''}</span>}{event.campus && <span>校区：{event.campus}</span>}{event.audience && <span>面向：{event.audience}</span>}{event.application_url && <a href={event.application_url} target="_blank" rel="noreferrer">打开网申/活动地址 ↗</a>}{onOpenCompany && <button className="secondary" onClick={() => onOpenCompany(event.company_id)}>查看企业</button>}</div></details>
 }
 
 function TimelinePage({ events, onOpenCompany }: { events: RecruitmentEvent[]; onOpenCompany: (id: string) => void }) {
   const [filter, setFilter] = useState('')
+  const [viewMode, setViewMode] = useState<'list' | 'week'>('list')
+  const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()))
   const visible = events.filter(event => !filter || event.event_type === filter)
   const types = Array.from(new Set(events.map(event => event.event_type)))
-  return <><PageHeader eyebrow="招聘日程" title="招聘时间轴" description="集中查看宣讲、网申截止、笔试、面试和其他招聘节点。" /><div className="toolbar"><select className="filter" value={filter} onChange={event => setFilter(event.target.value)}><option value="">全部事件</option>{types.map(value => <option value={value} key={value}>{value}</option>)}</select></div><div className="timeline-list">{visible.length ? visible.map(event => <TimelineEventCard event={event} onOpenCompany={onOpenCompany} key={event.id} />) : <div className="empty-state compact">暂无招聘时间事件</div>}</div></>
+  const weekDays = Array.from({ length: 7 }, (_, index) => addDays(weekStart, index))
+  const weekStartKey = localDateKey(weekStart)
+  const weekEndKey = localDateKey(weekDays[6])
+  const weekEvents = visible.filter(event => {
+    if (!event.start_at) return false
+    const key = eventDateKey(event.start_at, event.timezone)
+    return key >= weekStartKey && key <= weekEndKey
+  })
+  const uncertainEvents = visible.filter(event => !event.start_at)
+  const sorted = (items: RecruitmentEvent[]) => [...items].sort((left, right) => {
+    if (!left.start_at) return 1
+    if (!right.start_at) return -1
+    return new Date(left.start_at).getTime() - new Date(right.start_at).getTime()
+  })
+  return <><PageHeader eyebrow="招聘日程" title="招聘时间轴" description="集中查看宣讲、网申截止、笔试、面试和其他招聘节点。"><div className="timeline-view-switch"><button className={`filter${viewMode === 'list' ? ' active-filter' : ''}`} onClick={() => setViewMode('list')}>列表</button><button className={`filter${viewMode === 'week' ? ' active-filter' : ''}`} onClick={() => setViewMode('week')}>周视图</button></div></PageHeader><div className="toolbar"><select className="filter" value={filter} onChange={event => setFilter(event.target.value)}><option value="">全部事件</option>{types.map(value => <option value={value} key={value}>{value}</option>)}</select>{viewMode === 'week' && <div className="timeline-week-controls"><button className="secondary" onClick={() => setWeekStart(addDays(weekStart, -7))}>上一周</button><button className="secondary" onClick={() => setWeekStart(startOfWeek(new Date()))}>本周</button><button className="secondary" onClick={() => setWeekStart(addDays(weekStart, 7))}>下一周</button><span>{formatWeekRange(weekStart, weekDays[6])}</span></div>}</div>{viewMode === 'list' ? <div className="timeline-list">{visible.length ? sorted(visible).map(event => <TimelineEventCard event={event} onOpenCompany={onOpenCompany} key={event.id} />) : <div className="empty-state compact">暂无招聘时间事件</div>}</div> : <>{weekEvents.length ? <div className="timeline-week">{weekDays.map((day, index) => { const key = localDateKey(day); const dayEvents = sorted(weekEvents.filter(event => eventDateKey(event.start_at, event.timezone) === key)); return <section className="timeline-day" key={key}><header><strong>{WEEKDAY_LABELS[index]}</strong><time>{formatShortDate(day)}</time></header>{dayEvents.length ? dayEvents.map(event => <TimelineEventCard event={event} onOpenCompany={onOpenCompany} key={event.id} />) : <div className="timeline-day-empty">暂无活动</div>}</section>})}</div> : <div className="empty-state compact">本周暂无明确时间事件</div>}{uncertainEvents.length > 0 && <section className="timeline-uncertain"><div className="section-title"><h2>时间待确认</h2><span>{uncertainEvents.length} 项</span></div><div className="timeline-list">{uncertainEvents.map(event => <TimelineEventCard event={event} onOpenCompany={onOpenCompany} key={event.id} />)}</div></section>}</>}</>
 }
 
 function ApplicationsPage({ applications, onState }: { applications: Application[]; onState: (id: string, state: string, favorite?: boolean) => void }) { const columns = [['interested', '感兴趣'], ['applied', '已投递'], ['interview', '面试中'], ['offer', 'Offer']] as const; return <><PageHeader eyebrow="我的行动" title="求职进度" description="把感兴趣的岗位，从看到变成投递和面试。" /><div className="kanban">{columns.map(([state, title]) => <ApplicationColumn key={state} title={title} state={state} jobs={applications.filter(job => job.state === state)} onState={onState} />)}</div>{!applications.length && <div className="empty-state compact"><div className="empty-icon">✓</div><h3>收藏岗位后，它们会出现在这里</h3><p>在企业详情中点击星标，即可开始记录求职进度。</p></div>}</> }

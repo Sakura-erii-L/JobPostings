@@ -971,16 +971,18 @@ def _process_company_consolidation(job: dict[str, Any]) -> dict[str, Any]:
             businesses = _merge_json_list(company_row["businesses_json"], profile.get("businesses"))
             highlights = _merge_json_list(company_row["highlights_json"], profile.get("highlights"))
             official_channels = _merge_json_list(company_row["official_channels_json"], profile.get("official_channels"))
+            major_requirements = _merge_json_list(company_row["major_requirements_json"], profile.get("major_requirements"))
             connection.execute(
                 """UPDATE companies SET display_name=COALESCE(NULLIF(?,''),display_name),legal_name=COALESCE(NULLIF(?,''),legal_name),
                    aliases_json=?,summary=?,primary_industry=COALESCE(?,primary_industry),secondary_industries_json=?,website=COALESCE(NULLIF(?,''),website),
                    company_nature=COALESCE(NULLIF(?,''),company_nature),founded_at=COALESCE(NULLIF(?,''),founded_at),company_size=COALESCE(NULLIF(?,''),company_size),
-                   headquarters=COALESCE(NULLIF(?,''),headquarters),businesses_json=?,highlights_json=?,official_channels_json=?,company_tags_json=?,last_consolidated_at=?,updated_at=? WHERE id=?""",
+                   headquarters=COALESCE(NULLIF(?,''),headquarters),businesses_json=?,highlights_json=?,official_channels_json=?,major_requirements_json=?,company_tags_json=?,last_consolidated_at=?,updated_at=? WHERE id=?""",
                 (profile.get("display_name"), profile.get("legal_name"), json.dumps(aliases, ensure_ascii=False), summary,
                   primary_industry, json.dumps(secondary_industries, ensure_ascii=False), profile.get("website"),
                   profile.get("company_nature"), profile.get("founded_at"), profile.get("company_size"), profile.get("headquarters"),
                   json.dumps(businesses, ensure_ascii=False), json.dumps(highlights, ensure_ascii=False),
-                  json.dumps(official_channels, ensure_ascii=False), json.dumps(tags, ensure_ascii=False), utc_now(), utc_now(), job["company_id"]),
+                  json.dumps(official_channels, ensure_ascii=False), json.dumps(major_requirements, ensure_ascii=False),
+                  json.dumps(tags, ensure_ascii=False), utc_now(), utc_now(), job["company_id"]),
             )
             apply_company_overrides(connection, job["company_id"], company_overrides(company_row["manual_overrides_json"]))
             deduplicate_company_jobs(connection, job["company_id"])

@@ -124,6 +124,78 @@ def _parse_explicit_datetime(value: Any, timezone_name: str = "Asia/Shanghai") -
     return parsed.astimezone(timezone.utc)
 
 
+def _event_zone(timezone_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone_name)
+    except Exception:
+        return SOURCE_TIMEZONE
+
+
+def _clock_parts(text: str) -> tuple[int, int, int] | None:
+    match = re.search(
+        r"(?P<ampm>上午|下午|早上|晚上|夜间)?\s*(?P<hour>\d{1,2})"
+        r"\s*(?:(?:[:：时点])\s*(?P<minute>\d{1,2}))?\s*(?:分)?",
+        text,
+    )
+    if not match:
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    ampm = match.group("ampm") or ""
+    if ampm in {"下午", "晚上", "夜间"} and hour < 12:
+        hour += 12
+    if ampm in {"上午", "早上"} and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute, 0
+
+
+def _parse_relative_datetime(value: Any, timezone_name: str, reference_at: str | None) -> datetime | None:
+    if not reference_at:
+        return None
+    text = str(value or "").strip()
+    match = re.search(r"今天|今日|当天|本日|明天|明日|次日|翌日|后天|后日|大后天", text)
+    if not match:
+        return None
+    reference = _parse_explicit_datetime(reference_at, timezone_name)
+    if reference is None:
+        return None
+    offsets = {
+        "今天": 0, "今日": 0, "当天": 0, "本日": 0,
+        "明天": 1, "明日": 1, "次日": 1, "翌日": 1,
+        "后天": 2, "后日": 2, "大后天": 3,
+    }
+    zone = _event_zone(timezone_name)
+    local_reference = reference.astimezone(zone)
+    target_date = local_reference.date() + timedelta(days=offsets[match.group(0)])
+    clock = _clock_parts(text[match.end():]) or (0, 0, 0)
+    return datetime(*target_date.timetuple()[:3], *clock, tzinfo=zone).astimezone(timezone.utc)
+
+
+def _parse_month_day_datetime(value: Any, timezone_name: str, reference_at: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    match = re.search(r"(?<!\d)(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*(?:日|号)", text)
+    if not match:
+        return None
+    reference = _parse_explicit_datetime(reference_at, timezone_name) if reference_at else None
+    zone = _event_zone(timezone_name)
+    local_reference = (reference or datetime.now(timezone.utc)).astimezone(zone)
+    clock = _clock_parts(text[match.end():]) or (0, 0, 0)
+    try:
+        return datetime(local_reference.year, int(match.group("month")), int(match.group("day")), *clock, tzinfo=zone).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_event_datetime(value: Any, timezone_name: str, reference_at: str | None) -> datetime | None:
+    return (
+        _parse_explicit_datetime(value, timezone_name)
+        or _parse_relative_datetime(value, timezone_name, reference_at)
+        or _parse_month_day_datetime(value, timezone_name, reference_at)
+    )
+
+
 def is_plausible_event_datetime(value: Any, reference_at: str | None = None, *, now: datetime | None = None) -> bool:
     """Reject dates that are implausibly far from the source message.
 
@@ -151,7 +223,7 @@ def is_plausible_event_datetime(value: Any, reference_at: str | None = None, *, 
 
 def normalize_event_datetime(value: Any, timezone_name: str = "Asia/Shanghai", reference_at: str | None = None) -> str | None:
     """Return a trusted event time in UTC ISO format, or None if implausible."""
-    parsed = _parse_explicit_datetime(value, timezone_name)
+    parsed = _parse_event_datetime(value, timezone_name, reference_at)
     if parsed is None:
         return None
     if not is_plausible_event_datetime(parsed.isoformat(), reference_at):
@@ -169,7 +241,7 @@ def extract_event_datetime_candidates(text: str, timezone_name: str = "Asia/Shan
         r"(?:(?P<ampm>上午|下午|早上|晚上|夜间)\s*)?(?P<hour>\d{1,2})?\s*(?:[:：时]\s*(?P<minute>\d{1,2}))?\s*(?:分\s*(?P<second>\d{1,2})\s*秒?)?"
     )
     month_day = re.compile(
-        r"(?<!\d)(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*日\s*"
+        r"(?<!\d)(?P<month>\d{1,2})\s*月\s*(?P<day>\d{1,2})\s*(?:日|号)\s*"
         r"(?:(?P<ampm>上午|下午|早上|晚上|夜间)\s*)?(?P<hour>\d{1,2})?\s*(?:[:：时]\s*(?P<minute>\d{1,2}))?"
     )
     reference = _parse_explicit_datetime(reference_at) if reference_at else None
@@ -201,7 +273,78 @@ def extract_event_datetime_candidates(text: str, timezone_name: str = "Asia/Shan
         add_match(match, int(match.group("year")))
     for match in month_day.finditer(text):
         add_match(match, reference_year)
+    for match in re.finditer(r"(?:今天|今日|当天|本日|明天|明日|次日|翌日|后天|后日|大后天)(?:\s*(?:上午|下午|早上|晚上|夜间)?\s*\d{1,2}(?:(?:[:：时点])\s*\d{1,2})?\s*(?:分)?)?", text):
+        normalized = normalize_event_datetime(match.group(0), timezone_name, reference_at)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
     return candidates
+
+
+def _catalog_section(text: str, heading_pattern: str) -> str:
+    lines = text.replace("\r", "").split("\n")
+    heading = re.compile(heading_pattern, re.IGNORECASE)
+    numbered_heading = re.compile(r"^\s*(?:[一二三四五六七八九十百]+|\d+)[、.．:：]\s*\S+")
+    start = None
+    for index, line in enumerate(lines):
+        if heading.search(line.strip()):
+            start = index + 1
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for index in range(start, len(lines)):
+        if numbered_heading.match(lines[index].strip()):
+            end = index
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+def _split_top_level(text: str, separators: str) -> list[str]:
+    values: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for character in text:
+        if character in "（(【[":
+            depth += 1
+        elif character in "）)】]" and depth:
+            depth -= 1
+        if character in separators and depth == 0:
+            value = re.sub(r"^[\s•·●▪■\-—]+|[\s。；;]+$", "", "".join(current)).strip()
+            if value:
+                values.append(value)
+            current = []
+        else:
+            current.append(character)
+    value = re.sub(r"^[\s•·●▪■\-—]+|[\s。；;]+$", "", "".join(current)).strip()
+    if value:
+        values.append(value)
+    return values
+
+
+def extract_recruitment_catalog(text: str) -> dict[str, list[str]]:
+    """Extract explicit job and major lists from a recruitment source."""
+    if not text:
+        return {"job_titles": [], "major_requirements": []}
+    job_section = _catalog_section(text, r"(?:招聘岗位|招聘职位|岗位需求|职位需求|招收岗位|招聘方向)")
+    major_section = _catalog_section(text, r"(?:需求专业|专业需求|专业要求|招聘专业|专业类别|需求学科|所需专业|面向专业|专业方向|岗位专业)")
+    job_titles: list[str] = []
+    for line in job_section.splitlines():
+        clean = re.sub(r"^\s*(?:[•·●▪■\-—]|\d+[.)、])\s*", "", line).strip()
+        if not clean:
+            continue
+        job_titles.extend(_split_top_level(clean, "、；;•·，"))
+    job_titles = list(dict.fromkeys(value for value in job_titles if 2 <= len(value) <= 120))
+
+    major_requirements: list[str] = []
+    for line in major_section.splitlines():
+        clean = re.sub(r"^\s*(?:[•·●▪■\-—]|\d+[.)、])\s*", "", line).strip()
+        if not clean or clean.replace("｜", "|") in {"专业类别|专业名称", "专业类别|专业方向"}:
+            continue
+        if re.fullmatch(r"(?:专业类别|专业名称|需求专业|专业要求)[:：]?", clean):
+            continue
+        major_requirements.append(clean.rstrip("。；;"))
+    major_requirements = list(dict.fromkeys(value for value in major_requirements if 2 <= len(value) <= 500))
+    return {"job_titles": job_titles, "major_requirements": major_requirements}
 
 
 class TextExtractor(HTMLParser):

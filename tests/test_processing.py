@@ -470,7 +470,7 @@ def test_classification_prompt_excludes_chat_metadata(tmp_path, monkeypatch):
         "metadata": {"name": "群成员姓名", "senderId": "member-id", "sessionId": "group-id"},
     }])
     prompt = json.loads(captured["messages"][1]["content"])
-    assert prompt["messages"] == [{"message_id": "item_1", "text": "招聘算法工程师"}]
+    assert prompt["messages"] == [{"message_id": "item_1", "text": "招聘算法工程师", "source_datetime": "2026-09-04T00:00:00+00:00"}]
     assert "群成员姓名" not in captured["messages"][1]["content"]
     assert "member-id" not in captured["messages"][1]["content"]
 

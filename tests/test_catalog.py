@@ -58,3 +58,81 @@ def test_catalog_evidence_uses_original_source_url(tmp_path, monkeypatch):
     )
     assert db.one("SELECT source_url FROM evidences WHERE raw_message_id=?", (raw_id,))["source_url"] == original_url
     assert db.one("SELECT source_url FROM company_claims WHERE company_id=(SELECT company_id FROM evidences WHERE raw_message_id=? LIMIT 1)", (raw_id,))["source_url"] == original_url
+
+
+def test_explicit_job_and_major_sections_are_saved_separately(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    source = """四、招聘岗位
+航空发动机总体设计（含混电、氢能等）、航空发动机部件设计、传动系统设计、发动机健康管理及数智化设计、发动机控制系统设计、机械系统设计（滑油、轴承、密封等）、结构强度设计及优化、发动机试验与测试、信息系统开发与运维、航空发动机装配工艺、发动机通用基础技术研究等。
+五、需求专业
+航空航天类：航空宇航推进理论与工程、航空宇航科学与技术、航空工程
+能源动力类：动力工程、工程热物理、动力机械及工程
+机械类：机械工程、机械设计制造及其自动化
+六、报名方式
+请在线报名
+"""
+    raw_id = ingest_message({"id": "hunan-source", "type": "普通文本", "text": source}, "manual", None)
+    assert raw_id
+    ids = apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "中国航发湖南动力机械研究所", "industry_codes": ["military_defense"]},
+            "batch": {"name": "2027 校招", "recruitment_type": "campus"},
+            "jobs": [{"title": "航空发动机总体设计等研发与技术岗位", "recruitment_type": "campus", "employment_type": "full_time"}],
+        },
+        raw_id,
+        "2026-09-04T00:00:00+00:00",
+    )
+    titles = [row["canonical_title"] for row in db.all_rows("SELECT canonical_title FROM jobs WHERE status<>'superseded'")]
+    company = db.one("SELECT major_requirements_json FROM companies WHERE display_name=?", ("中国航发湖南动力机械研究所",))
+    assert len(ids) == 11
+    assert set(titles) == {
+        "航空发动机总体设计（含混电、氢能等）", "航空发动机部件设计", "传动系统设计", "发动机健康管理及数智化设计",
+        "发动机控制系统设计", "机械系统设计（滑油、轴承、密封等）", "结构强度设计及优化", "发动机试验与测试",
+        "信息系统开发与运维", "航空发动机装配工艺", "发动机通用基础技术研究等",
+    }
+    assert json.loads(company["major_requirements_json"]) == [
+        "航空航天类：航空宇航推进理论与工程、航空宇航科学与技术、航空工程",
+        "能源动力类：动力工程、工程热物理、动力机械及工程",
+        "机械类：机械工程、机械设计制造及其自动化",
+    ]
+
+
+def test_event_title_company_overrides_context_company(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    apply_model_item({"is_recruitment": True, "company": {"display_name": "哈尔滨飞机工业集团有限责任公司"}, "jobs": []}, None, "2026-09-04T00:00:00+00:00")
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "哈尔滨飞机工业集团有限责任公司"},
+            "events": [{"title": "晓禾科技（武汉）有限公司空中宣讲会", "company_name": "哈尔滨飞机工业集团有限责任公司", "event_type": "presentation", "start_at": "2026-09-05T11:00:00+00:00", "timezone": "Asia/Shanghai"}],
+            "jobs": [],
+        },
+        None,
+        "2026-09-04T00:00:00+00:00",
+    )
+    event = db.one("SELECT company_id FROM recruitment_events")
+    target = db.one("SELECT id FROM companies WHERE display_name=?", ("晓禾科技（武汉）有限公司",))
+    assert target
+    assert event["company_id"] == target["id"]
+
+
+def test_duplicate_jobs_across_batches_are_hidden_but_departments_stay_separate(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    base = {"is_recruitment": True, "company": {"display_name": "去重测试科技"}, "jobs": [{"title": "软件工程师", "recruitment_type": "campus", "employment_type": "full_time", "department": "研发"}]}
+    apply_model_item({**base, "batch": {"name": "2026 校招", "recruitment_type": "campus"}}, None, "2026-09-04T00:00:00+00:00")
+    apply_model_item({**base, "batch": {"name": "2027 校招", "recruitment_type": "campus"}, "jobs": [{**base["jobs"][0], "employment_type": "part_time"}]}, None, "2026-09-05T00:00:00+00:00")
+    apply_model_item({**base, "batch": {"name": "2028 校招", "recruitment_type": "campus"}, "jobs": [{**base["jobs"][0], "department": "测试"}]}, None, "2026-09-06T00:00:00+00:00")
+    company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("去重测试科技",))["id"]
+    assert db.one("SELECT COUNT(*) AS n FROM jobs WHERE company_id=? AND status<>'superseded'", (company_id,))["n"] == 2
+    assert db.one("SELECT COUNT(*) AS n FROM jobs WHERE company_id=? AND status='superseded'", (company_id,))["n"] == 0
+    assert db.one("SELECT employment_type FROM jobs WHERE company_id=? AND department='研发'", (company_id,))["employment_type"] == "unknown"

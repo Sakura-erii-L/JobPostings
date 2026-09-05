@@ -24,7 +24,7 @@ from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
 from .exports import export_jobs
 from .company_research import ensure_company_research_jobs
-from .maintenance import repair_existing_catalog, repair_source_urls, reset_recruitment_data
+from .maintenance import repair_event_company_assignments, repair_existing_catalog, repair_source_urls, reset_recruitment_data
 from .local_storage import clear_cache, clear_chat_records, delete_local_database_backup, storage_snapshot
 from .parsers import is_file_message, is_image_message, parse_message_time
 from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
@@ -777,6 +777,12 @@ def trigger_company_research(body: CompanyResearchRequest | None = None, _: dict
     return {"status": "queued", **result}
 
 
+@app.post("/api/v1/admin/maintenance/event-companies")
+def repair_event_companies(_: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    """Explicitly repair historical event ownership after reviewing the scope."""
+    return {"status": "repaired", "events_reassigned": repair_event_company_assignments()}
+
+
 @app.get("/api/v1/admin/processing-queue")
 def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     allowed_statuses = {"pending", "running", "succeeded", "needs_review", "paused_quota", "failed", "canceled"}
@@ -981,7 +987,7 @@ async def import_file_endpoint(file: UploadFile = File(...), _: dict[str, Any] =
 @app.get("/api/v1/companies")
 def companies(q: str | None = None, industry: str | None = None, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> list[dict[str, Any]]:
     params: list[Any] = []
-    sql = "SELECT c.*, COUNT(j.id) AS job_count FROM companies c LEFT JOIN jobs j ON j.company_id=c.id WHERE 1=1"
+    sql = "SELECT c.*, COUNT(CASE WHEN j.status <> 'superseded' THEN j.id END) AS job_count FROM companies c LEFT JOIN jobs j ON j.company_id=c.id WHERE 1=1"
     if q:
         sql += " AND (c.display_name LIKE ? OR c.legal_name LIKE ?)"
         params += [f"%{q}%", f"%{q}%"]
@@ -996,6 +1002,7 @@ def companies(q: str | None = None, industry: str | None = None, _: dict[str, An
         value.pop("manual_overrides_json", None)
         value["aliases"] = json.loads(value.pop("aliases_json"))
         value["secondary_industries"] = json.loads(value.pop("secondary_industries_json"))
+        value["major_requirements"] = json.loads(value.pop("major_requirements_json", "[]") or "[]")
         value["tags"] = json.loads(value.pop("company_tags_json", "[]") or "[]")
         result.append(value)
     return result
@@ -1006,7 +1013,7 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
     company = one("SELECT * FROM companies WHERE id=?", (company_id,))
     if not company:
         raise HTTPException(404, "Company not found")
-    jobs = [dict(row) for row in all_rows("SELECT * FROM jobs WHERE company_id=? ORDER BY updated_at DESC", (company_id,))]
+    jobs = [dict(row) for row in all_rows("SELECT * FROM jobs WHERE company_id=? AND status<>'superseded' ORDER BY updated_at DESC", (company_id,))]
     for job in jobs:
         for key in list(job):
             if key.endswith("_json"):
@@ -1014,12 +1021,16 @@ def company_detail(company_id: str, _: dict[str, Any] = Depends(require_scope("c
                     job[key[:-5]] = json.loads(job.pop(key))
                 except json.JSONDecodeError:
                     pass
-    evidences = [dict(row) for row in all_rows("SELECT * FROM evidences WHERE company_id=? OR job_id IN (SELECT id FROM jobs WHERE company_id=?) ORDER BY observed_at DESC", (company_id, company_id))]
+    evidences = [dict(row) for row in all_rows("""SELECT * FROM evidences
+        WHERE company_id=? OR job_id IN (SELECT id FROM jobs WHERE company_id=?)
+        ORDER BY CASE WHEN source_type='wechat_group' OR lower(COALESCE(source_url,'')) LIKE '%weixin%' THEN 0 ELSE 1 END,
+                 observed_at DESC""", (company_id, company_id))]
     public_findings = [dict(row) for row in all_rows("SELECT id,finding_type,title,summary,source_title,source_url,resolved_url,published_at,severity,retrieved_at FROM company_public_findings WHERE company_id=? ORDER BY retrieved_at DESC", (company_id,))]
     result = dict(company)
     result.pop("manual_overrides_json", None)
     result["aliases"] = json.loads(result.pop("aliases_json"))
     result["secondary_industries"] = json.loads(result.pop("secondary_industries_json"))
+    result["major_requirements"] = json.loads(result.pop("major_requirements_json", "[]") or "[]")
     result["tags"] = json.loads(result.pop("company_tags_json", "[]") or "[]")
     for key in ("businesses_json", "highlights_json", "official_channels_json"):
         result[key[:-5]] = json.loads(result.pop(key) or "[]")
@@ -1148,7 +1159,7 @@ def recruitment_events(company_id: str | None = None, _: dict[str, Any] = Depend
 @app.get("/api/v1/jobs")
 def jobs(q: str | None = None, state: str | None = None, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> list[dict[str, Any]]:
     params: list[Any] = []
-    sql = "SELECT j.*, c.display_name AS company_name FROM jobs j JOIN companies c ON c.id=j.company_id WHERE 1=1"
+    sql = "SELECT j.*, c.display_name AS company_name FROM jobs j JOIN companies c ON c.id=j.company_id WHERE j.status <> 'superseded'"
     if q:
         sql += " AND (j.canonical_title LIKE ? OR j.requirements LIKE ? OR j.locations_json LIKE ?)"
         params += [f"%{q}%", f"%{q}%", f"%{q}%"]
