@@ -353,6 +353,62 @@ def repair_timeline_events() -> dict[str, int]:
     return result
 
 
+def repair_date_only_timeline_event_times() -> dict[str, int]:
+    """Move legacy date-only timeline events to local 14:00 with an explicit note."""
+    result = {"updated": 0}
+    with connect() as connection:
+        events = connection.execute(
+            "SELECT * FROM recruitment_events WHERE start_at IS NOT NULL ORDER BY start_at,id"
+        ).fetchall()
+        for event in events:
+            try:
+                event_zone = ZoneInfo(event["timezone"] or "Asia/Shanghai")
+            except Exception:
+                event_zone = ZoneInfo("Asia/Shanghai")
+            try:
+                local_start = datetime.fromisoformat(event["start_at"]).astimezone(event_zone)
+            except (TypeError, ValueError):
+                continue
+            if local_start.hour != 0 or local_start.minute != 0 or local_start.second != 0:
+                continue
+            new_start = local_start.replace(hour=14, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat(timespec="seconds")
+            notes = str(event["notes"] or "").strip()
+            if "未发具体时间" not in notes:
+                notes = f"{notes}\n未发具体时间".strip()
+            status = recruitment_event_state(
+                {"start_at": new_start, "end_at": event["end_at"], "timezone": event["timezone"] or "Asia/Shanghai"},
+                datetime.now(timezone.utc),
+            )
+            observed_at = utc_now()
+            connection.execute(
+                "UPDATE recruitment_events SET start_at=?,notes=?,status=?,updated_at=? WHERE id=?",
+                (new_start, notes, status, observed_at, event["id"]),
+            )
+            version = connection.execute(
+                "SELECT payload_json FROM recruitment_event_versions WHERE event_id=? ORDER BY observed_at DESC,id DESC LIMIT 1",
+                (event["id"],),
+            ).fetchone()
+            try:
+                payload = json.loads(version["payload_json"] or "{}") if version else {}
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.update({
+                "start_at": new_start,
+                "notes": notes,
+                "time_precision": "date_only",
+                "time_note": "未发具体时间",
+            })
+            connection.execute("UPDATE recruitment_event_versions SET is_current=0 WHERE event_id=?", (event["id"],))
+            connection.execute(
+                "INSERT INTO recruitment_event_versions(id,event_id,payload_json,observed_at,is_current) VALUES(?,?,?,?,?)",
+                (str(uuid4()), event["id"], json.dumps(payload, ensure_ascii=False), observed_at, 1),
+            )
+            result["updated"] += 1
+    return result
+
+
 def repair_event_company_assignments() -> int:
     """Move events whose title contains an explicit, distinct company name."""
     updated = 0

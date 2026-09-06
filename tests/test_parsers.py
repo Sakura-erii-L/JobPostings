@@ -3,7 +3,7 @@ import zipfile
 
 import pytest
 
-from app.parsers import _major_name_catalog, detect_file_suffix, detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, fetch_public_url, is_access_challenge_page, is_file_message, is_link_message, is_major_like_title, is_major_requirement_heading, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
+from app.parsers import _major_name_catalog, detect_file_suffix, detect_image_suffix, extract_event_datetime_candidates, extract_html, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, fetch_public_url, is_access_challenge_page, is_date_only_event_datetime, is_file_message, is_link_message, is_major_like_title, is_major_requirement_heading, is_system_message, normalize_event_datetime, parse_message_payload, parse_message_time, recover_original_source_url
 
 
 def test_html_extraction():
@@ -112,6 +112,14 @@ def test_relative_event_time_uses_source_message_date():
     assert normalize_event_datetime("明日19点", "Asia/Shanghai", reference) == "2026-09-05T11:00:00+00:00"
     assert normalize_event_datetime("次日晚上7:30", "Asia/Shanghai", reference) == "2026-09-05T11:30:00+00:00"
     assert "2026-09-05T11:00:00+00:00" in extract_event_datetime_candidates("说明会：明日19点", "Asia/Shanghai", reference)
+
+
+def test_date_only_event_defaults_to_local_1400_without_changing_explicit_clock():
+    reference = "2026-09-04T11:00:00+00:00"
+    assert is_date_only_event_datetime("2026-09-05")
+    assert not is_date_only_event_datetime("2026-09-05 10:30")
+    assert normalize_event_datetime("2026-09-05", "Asia/Shanghai", reference, date_only_default_hour=14) == "2026-09-05T06:00:00+00:00"
+    assert normalize_event_datetime("2026-09-05 10:30", "Asia/Shanghai", reference, date_only_default_hour=14) == "2026-09-05T02:30:00+00:00"
 
 
 def test_numeric_month_day_time_uses_source_year_and_clock():

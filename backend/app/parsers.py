@@ -205,6 +205,21 @@ def _parse_event_datetime(value: Any, timezone_name: str, reference_at: str | No
     )
 
 
+_EVENT_CLOCK_PATTERN = re.compile(
+    r"(?<!\d)\d{1,2}\s*[:：]\s*\d{2}"
+    r"|(?:上午|下午|早上|晚上|夜间|凌晨)\s*\d{1,2}"
+    r"|(?<!\d)\d{1,2}\s*(?:点|时)(?:\s*\d{1,2}\s*分?)?"
+)
+
+
+def is_date_only_event_datetime(value: Any) -> bool:
+    """Return whether an event value carries a date but no explicit clock time."""
+    if value is None or isinstance(value, datetime):
+        return False
+    text = str(value).strip()
+    return bool(text) and not _EVENT_CLOCK_PATTERN.search(text)
+
+
 def is_plausible_event_datetime(value: Any, reference_at: str | None = None, *, now: datetime | None = None) -> bool:
     """Reject dates that are implausibly far from the source message.
 
@@ -230,11 +245,27 @@ def is_plausible_event_datetime(value: Any, reference_at: str | None = None, *, 
     return True
 
 
-def normalize_event_datetime(value: Any, timezone_name: str = "Asia/Shanghai", reference_at: str | None = None) -> str | None:
+def normalize_event_datetime(
+    value: Any,
+    timezone_name: str = "Asia/Shanghai",
+    reference_at: str | None = None,
+    *,
+    date_only_default_hour: int | None = None,
+) -> str | None:
     """Return a trusted event time in UTC ISO format, or None if implausible."""
     parsed = _parse_event_datetime(value, timezone_name, reference_at)
     if parsed is None:
         return None
+    if date_only_default_hour is not None and is_date_only_event_datetime(value):
+        if not 0 <= date_only_default_hour <= 23:
+            raise ValueError("date_only_default_hour must be between 0 and 23")
+        local = parsed.astimezone(_event_zone(timezone_name)).replace(
+            hour=date_only_default_hour,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        parsed = local.astimezone(timezone.utc)
     if not is_plausible_event_datetime(parsed.isoformat(), reference_at):
         return None
     return parsed.isoformat(timespec="seconds")

@@ -10,7 +10,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from .db import connect, one, utc_now
-from .parsers import is_link_message, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
+from .parsers import is_date_only_event_datetime, is_link_message, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
 
 
 INDUSTRIES = {
@@ -230,6 +230,13 @@ def _normalize_event_payload(value: Any) -> dict[str, Any]:
     result["notes"] = normalize_text_value(source.get("notes"), preserve_newlines=True)
     result["job_titles"] = normalize_text_list(source.get("job_titles"))
     return result
+
+
+def _append_date_only_event_note(value: Any) -> str:
+    note = normalize_text_value(value, preserve_newlines=True) or ""
+    if "未发具体时间" in note:
+        return note
+    return f"{note}\n未发具体时间".strip()
 
 
 def normalize_recruitment_payload(value: Any) -> dict[str, Any]:
@@ -1228,8 +1235,11 @@ def _merge_event(
     timezone_name = event.get("timezone") or "Asia/Shanghai"
     start_value = event.get("start_at") or event.get("date")
     end_value = event.get("end_at") or event.get("end_date")
-    start_at = normalize_event_datetime(start_value, timezone_name, observed_at)
+    date_only_start = bool(start_value and is_date_only_event_datetime(start_value))
+    start_at = normalize_event_datetime(start_value, timezone_name, observed_at, date_only_default_hour=14)
     end_at = normalize_event_datetime(end_value, timezone_name, observed_at)
+    if date_only_start and start_at:
+        event["notes"] = _append_date_only_event_note(event.get("notes"))
     normalized_event = {**event, "start_at": start_at or "", "end_at": end_at or "", "timezone": timezone_name}
     location = event.get("location") or ""
     title = event.get("title") or event_type
@@ -1241,12 +1251,15 @@ def _merge_event(
     if existing:
         event_id = existing["id"]
         merged_jobs = _merge_list(existing["job_ids_json"], job_ids)
+        notes = event.get("notes") or None
+        if date_only_start and notes and existing["notes"] and notes not in existing["notes"]:
+            notes = f"{existing['notes']}\n{notes}"
         connection.execute(
             """UPDATE recruitment_events SET batch_id=COALESCE(batch_id,?),start_at=COALESCE(start_at,?),end_at=COALESCE(?,end_at),city=COALESCE(?,city),campus=COALESCE(?,campus),location=COALESCE(?,location),
                application_url=COALESCE(?,application_url),audience=COALESCE(?,audience),notes=COALESCE(?,notes),
                job_ids_json=?,updated_at=? WHERE id=?""",
             (batch_id, start_at, end_at, event.get("city") or None, event.get("campus") or None, event.get("location") or None,
-             event.get("application_url") or None, event.get("audience") or None, event.get("notes") or None,
+             event.get("application_url") or None, event.get("audience") or None, notes,
              json_text(merged_jobs, []), now, event_id),
         )
     else:

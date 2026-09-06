@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app import db
 from app.catalog import _make_job, _prepare_job_items, apply_model_item, is_location_like_title, normalize_company_tags, normalize_name, normalize_text_value, normalize_title, refresh_expiration
-from app.maintenance import migrate_major_jobs, repair_existing_catalog, repair_historical_semantic_duplicates, requeue_missing_job_sources
+from app.maintenance import migrate_major_jobs, repair_date_only_timeline_event_times, repair_existing_catalog, repair_historical_semantic_duplicates, requeue_missing_job_sources
 from app.main import company_detail, recruitment_events
 from app.model_provider import ModelResult
 from app.parsers import extract_recruitment_catalog
@@ -693,6 +693,59 @@ def test_event_identity_fills_missing_location_component(tmp_path, monkeypatch):
     assert event["campus"] == "南京理工大学"
     assert event["notes"] == "补充报名说明"
     assert db.one("SELECT COUNT(*) AS count FROM recruitment_event_evidences WHERE event_id=(SELECT id FROM recruitment_events WHERE company_id=?)", (company_id,))["count"] == 2
+
+
+def test_date_only_event_is_stored_at_1400_with_note(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "日期活动科技"},
+            "events": [{"title": "日期宣讲会", "event_type": "presentation", "start_at": "2026-09-12", "timezone": "Asia/Shanghai"}],
+        },
+        None,
+        "2026-09-06T00:00:00+00:00",
+    )
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "具体时间科技"},
+            "events": [{"title": "具体时间宣讲会", "event_type": "presentation", "start_at": "2026-09-12 10:30", "timezone": "Asia/Shanghai"}],
+        },
+        None,
+        "2026-09-06T00:00:00+00:00",
+    )
+    date_only = db.one("SELECT start_at,notes FROM recruitment_events WHERE title=?", ("日期宣讲会",))
+    explicit = db.one("SELECT start_at,notes FROM recruitment_events WHERE title=?", ("具体时间宣讲会",))
+    assert date_only["start_at"] == "2026-09-12T06:00:00+00:00"
+    assert "未发具体时间" in date_only["notes"]
+    assert explicit["start_at"] == "2026-09-12T02:30:00+00:00"
+    assert "未发具体时间" not in (explicit["notes"] or "")
+
+
+def test_date_only_timeline_migration_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "历史日期科技"},
+            "events": [{"title": "历史日期活动", "event_type": "presentation", "start_at": "2026-09-12T00:00:00+00:00", "timezone": "UTC"}],
+        },
+        None,
+        "2026-09-06T00:00:00+00:00",
+    )
+    assert repair_date_only_timeline_event_times() == {"updated": 1}
+    assert repair_date_only_timeline_event_times() == {"updated": 0}
+    event = db.one("SELECT start_at,notes FROM recruitment_events WHERE title=?", ("历史日期活动",))
+    assert event["start_at"] == "2026-09-12T14:00:00+00:00"
+    assert event["notes"] == "未发具体时间"
+    assert db.one("SELECT COUNT(*) AS count FROM recruitment_event_versions WHERE event_id=(SELECT id FROM recruitment_events WHERE title=?)", ("历史日期活动",))["count"] == 2
 
 
 def test_duplicate_jobs_across_batches_are_hidden_but_departments_stay_separate(tmp_path, monkeypatch):
