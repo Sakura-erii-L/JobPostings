@@ -9,6 +9,7 @@ from app.prompt_templates import PROMPT_TASKS, render_prompt_template
 EXPECTED_TASKS = {
     "recruitment_extract",
     "company_consolidation",
+    "company_merge_content",
     "source_text_extraction",
     "company_public_research",
     "connection_test",
@@ -20,6 +21,9 @@ REQUIRED_GUIDANCE = {
     ),
     "company_consolidation": (
         "decision=normal", "decision=abnormal", "conflicts", "unsupported_claims", "summary",
+    ),
+    "company_merge_content": (
+        "deterministic_content", "summary", "businesses", "highlights", "major_requirements",
     ),
     "source_text_extraction": ("岗位职责", "截止日期", "source_url", "notes"),
     "company_public_research": (

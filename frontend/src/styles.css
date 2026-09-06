@@ -118,3 +118,25 @@ button { cursor: pointer; }
 .shared-recruitment-detail .job-details { padding-left: 0; }
 .resolved-source { margin-top: 8px; color: #8994a8; font-size: 11px; }
 .resolved-source code { display: block; margin-top: 5px; white-space: pre-wrap; word-break: break-all; color: #65718d; }
+
+.company-management-bar { display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:12px; padding:12px 15px; border:1px solid #dfe6fa; border-radius:12px; background:#f7f9ff; color:#5f6f8e; font-size:12px; }
+.company-management-actions { display:flex; gap:8px; flex-wrap:wrap; }
+.company-management-actions .secondary { flex:0 0 auto; }
+.company-management-message { margin-bottom:12px; }
+.selected-company-card { border-color:#6e83e8; box-shadow:0 0 0 3px #e5eaff, 0 13px 28px #394b7822; }
+.company-select-indicator { display:flex; align-items:center; justify-content:center; min-width:25px; height:25px; padding:0 5px; border:1px solid #cbd4f4; border-radius:99px; color:#6075d8; background:#f1f4ff; font-size:12px; font-weight:800; }
+.selected-company-card .company-select-indicator { color:#fff; border-color:#6075d8; background:#6075d8; }
+.timeline-event.ongoing { border-color:#5e9f88; background:#f5fcf8; box-shadow:0 0 0 2px #d9f2e7; }
+.timeline-event.ongoing summary>time { color:#237c5c; }
+.timeline-event.ongoing summary strong { color:#205e49; }
+.timeline-event.historical { border-color:#eceef3; }
+.timeline-event.historical summary { color:#7b8496; }
+.timeline-event .status.ongoing { color:#176b4d; background:#d9f4e6; }
+.timeline-event .status.upcoming { color:#5269c8; background:#eef1ff; }
+.timeline-event .status.historical { color:#69758c; background:#edf0f5; }
+.timeline-event .status.uncertain { color:#8a6d35; background:#fff4dc; }
+.timeline-day.today { border-color:#7185e5; background:#f4f6ff; box-shadow:0 0 0 2px #e4e8ff; }
+.timeline-day.today header strong { color:#435bc0; }
+.timeline-today { color:#5269c8; font-size:10px; font-weight:700; }
+
+@media(max-width:680px){.company-management-bar{display:block}.company-management-actions{margin-top:10px}.company-management-actions .secondary{flex:1 1 auto}}

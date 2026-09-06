@@ -7,6 +7,7 @@ import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from .db import connect, one, utc_now
 from .parsers import is_link_message, is_wechat_public_url, normalize_event_datetime, recover_original_source_url
@@ -288,6 +289,66 @@ def _parse_reliable_datetime(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _parse_event_status_datetime(value: Any, timezone_name: Any = "Asia/Shanghai") -> datetime | None:
+    """Parse an event timestamp for display without trusting the stored status."""
+    text = normalize_text_value(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        try:
+            parsed = datetime.combine(date.fromisoformat(text), datetime.min.time())
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        try:
+            parsed = parsed.replace(tzinfo=ZoneInfo(str(timezone_name or "Asia/Shanghai")))
+        except Exception:
+            parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return parsed.astimezone(timezone.utc)
+
+
+def recruitment_event_state(event: Any, now: datetime | None = None) -> str:
+    """Return the single display state used by every recruitment timeline view."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    timezone_name = event.get("timezone") if isinstance(event, dict) else None
+    start_at = _parse_event_status_datetime(event.get("start_at"), timezone_name) if isinstance(event, dict) else None
+    end_at = _parse_event_status_datetime(event.get("end_at"), timezone_name) if isinstance(event, dict) else None
+    if start_at is None:
+        return "uncertain"
+    if end_at is not None and start_at <= current <= end_at:
+        return "ongoing"
+    if current < start_at:
+        return "upcoming"
+    return "historical"
+
+
+def recruitment_event_sort_key(event: Any, now: datetime | None = None) -> tuple[int, float, float, str]:
+    """Sort events as ongoing, upcoming, historical, then time-uncertain."""
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    timezone_name = event.get("timezone") if isinstance(event, dict) else None
+    start_at = _parse_event_status_datetime(event.get("start_at"), timezone_name) if isinstance(event, dict) else None
+    end_at = _parse_event_status_datetime(event.get("end_at"), timezone_name) if isinstance(event, dict) else None
+    state = recruitment_event_state(event, current)
+    start_timestamp = start_at.timestamp() if start_at is not None else float("inf")
+    end_timestamp = end_at.timestamp() if end_at is not None else float("inf")
+    event_id = str(event.get("id") or "") if isinstance(event, dict) else ""
+    if state == "ongoing":
+        return (0, 0 if end_at is not None else 1, end_timestamp, event_id)
+    if state == "upcoming":
+        return (1, start_timestamp, 0.0, event_id)
+    if state == "historical":
+        return (2, -(end_timestamp if end_at is not None else start_timestamp), 0.0, event_id)
+    return (3, float("inf"), 0.0, event_id)
 
 
 def _deadline_is_expired(value: Any) -> bool:
@@ -1147,8 +1208,10 @@ def _merge_event(
         )
     else:
         event_id = str(uuid4())
-        parsed_start = _parse_reliable_datetime(start_at)
-        status = "historical" if parsed_start is not None and parsed_start < _parse_reliable_datetime(now) else "upcoming"
+        status = recruitment_event_state(
+            {"start_at": start_at, "end_at": end_at, "timezone": timezone_name},
+            _parse_reliable_datetime(now),
+        )
         connection.execute(
             """INSERT INTO recruitment_events(id,company_id,batch_id,title,event_type,start_at,end_at,timezone,format,city,campus,location,
                application_url,audience,notes,job_ids_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -1228,6 +1291,7 @@ def _merge_job_into(connection: Any, keep: Any, duplicate: Any) -> None:
     updated_at = _choose_temporal_text([keep["updated_at"], duplicate["updated_at"]], latest=True) or utc_now()
     connection.execute(
         """UPDATE jobs SET department=?,employment_type=?,locations_json=?,headcount=?,education_json=?,majors_json=?,experience_requirement=?,
+           batch_id=COALESCE(batch_id,?),
            salary_json=?,responsibilities=?,requirements=?,benefits_json=?,application_methods_json=?,contacts_json=?,
            explicit_deadline=?,effective_posted_at=?,last_effective_posted_at=?,status=?,industry_codes_json=?,
            job_function_codes_json=?,confidence=?,updated_at=? WHERE id=?""",
@@ -1235,6 +1299,7 @@ def _merge_job_into(connection: Any, keep: Any, duplicate: Any) -> None:
             _merge_text(keep["department"], duplicate["department"]), employment_type, merged_lists["locations_json"],
             _merge_text(keep["headcount"], duplicate["headcount"]), merged_lists["education_json"],
             merged_lists["majors_json"], _merge_text(keep["experience_requirement"], duplicate["experience_requirement"]),
+            keep["batch_id"] or duplicate["batch_id"],
             _merge_json_object(keep["salary_json"], duplicate["salary_json"]),
             _merge_text(keep["responsibilities"], duplicate["responsibilities"]),
             _merge_text(keep["requirements"], duplicate["requirements"]), merged_lists["benefits_json"],
@@ -1319,6 +1384,769 @@ def deduplicate_company_jobs(connection: Any, company_id: str) -> int:
                 if refreshed:
                     keep = dict(refreshed)
     return removed
+
+
+class CompanyManagementValidationError(ValueError):
+    """Raised when a manual company operation has invalid input."""
+
+
+class CompanyManagementNotFound(CompanyManagementValidationError):
+    """Raised when a selected company no longer exists."""
+
+
+class CompanyManagementConflict(RuntimeError):
+    """Raised when a selected company is being modified by a worker."""
+
+
+_COMPANY_MANAGEMENT_SCALAR_FIELDS = (
+    "display_name", "legal_name", "summary", "primary_industry", "website",
+    "company_nature", "founded_at", "company_size", "headquarters",
+    "last_consolidated_at", "public_researched_at", "verification_status",
+)
+_COMPANY_MANAGEMENT_ARRAY_FIELDS = (
+    "aliases", "secondary_industries", "businesses", "highlights",
+    "official_channels", "major_requirements", "tags",
+)
+
+
+def _management_placeholders(values: list[str]) -> str:
+    return ",".join("?" for _ in values)
+
+
+def _management_company_ids(company_ids: Any) -> list[str]:
+    if not isinstance(company_ids, (list, tuple)):
+        raise CompanyManagementValidationError("company_ids must be a list")
+    result = list(dict.fromkeys(str(value).strip() for value in company_ids if str(value).strip()))
+    if not result:
+        raise CompanyManagementValidationError("至少选择一个企业")
+    return result
+
+
+def _management_company_rows(connection: Any, company_ids: list[str]) -> list[Any]:
+    placeholders = _management_placeholders(company_ids)
+    rows = connection.execute(
+        f"SELECT * FROM companies WHERE id IN ({placeholders})",
+        tuple(company_ids),
+    ).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    missing = [company_id for company_id in company_ids if company_id not in by_id]
+    if missing:
+        raise CompanyManagementNotFound(f"企业不存在：{', '.join(missing)}")
+    return [by_id[company_id] for company_id in company_ids]
+
+
+def _management_json_array(row: Any, field: str, overrides: dict[str, Any] | None = None) -> list[Any]:
+    if overrides is not None and field in overrides:
+        value = overrides[field]
+    else:
+        column = COMPANY_OVERRIDE_COLUMNS.get(field, f"{field}_json")
+        value = row[column]
+        if isinstance(value, str):
+            try:
+                value = json.loads(value or "[]")
+            except json.JSONDecodeError:
+                value = []
+    return value if isinstance(value, list) else []
+
+
+def _company_merge_content_candidates(rows: list[Any]) -> list[dict[str, Any]]:
+    overrides = [company_overrides(row["manual_overrides_json"]) for row in rows]
+    summaries = [
+        _management_effective_scalar(row, "summary", company_overrides(row["manual_overrides_json"]))
+        for row in rows
+    ]
+    summary_owner = next((index for index, value in enumerate(summaries) if _management_non_empty(value)), None)
+    merged_arrays = {
+        field: _management_stable_list([
+            value
+            for row, row_overrides in zip(rows, overrides)
+            for value in _management_json_array(row, field, row_overrides)
+        ])
+        for field in ("businesses", "highlights", "major_requirements")
+    }
+    candidates: list[dict[str, Any]] = []
+    for index, (row, row_overrides) in enumerate(zip(rows, overrides)):
+        candidates.append({
+            "company_id": row["id"],
+            "role": "primary" if index == 0 else "supplementary",
+            "display_name": row["display_name"],
+            "content": {
+                "summary": str(summaries[index] or "") if index == summary_owner else "",
+                "businesses": _management_stable_list(_management_json_array(row, "businesses", row_overrides)),
+                "highlights": _management_stable_list(_management_json_array(row, "highlights", row_overrides)),
+                "major_requirements": _management_stable_list(_management_json_array(row, "major_requirements", row_overrides)),
+            },
+        })
+    candidates.append({
+        "deterministic_content": {
+            "summary": str(summaries[summary_owner] or "") if summary_owner is not None else "",
+            **merged_arrays,
+        },
+    })
+    return candidates
+
+
+def _polish_company_merge_content(rows: list[Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    try:
+        from .model_provider import polish_company_merge_content
+
+        result = polish_company_merge_content(_company_merge_content_candidates(rows), f"manual-merge-{uuid4()}")
+        payload = dict(result.payload)
+        if payload.get("status") != "complete":
+            return None, {
+                "status": "uncertain",
+                "reason": str(payload.get("reason") or "Codex 无法安全整理合并内容"),
+            }
+        return payload, {
+            "status": "applied",
+            "processor": f"{result.provider}:{result.model}",
+        }
+    except Exception as exc:
+        return None, {
+            "status": "fallback",
+            "reason": "Codex 内容整理不可用，已保留确定性合并结果",
+            "error_type": type(exc).__name__,
+        }
+
+
+def _management_non_empty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _management_stable_list(values: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        try:
+            key = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except TypeError:
+            key = repr(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def _management_effective_scalar(row: Any, field: str, overrides: dict[str, Any]) -> Any:
+    if field in overrides:
+        return overrides[field]
+    return row[COMPANY_OVERRIDE_COLUMNS.get(field, field)]
+
+
+def _merge_company_profile(
+    connection: Any,
+    primary: Any,
+    supplements: list[Any],
+    now: str,
+    content_polish: dict[str, Any] | None = None,
+) -> None:
+    primary_overrides = company_overrides(primary["manual_overrides_json"])
+    supplement_overrides = [company_overrides(row["manual_overrides_json"]) for row in supplements]
+    merged_overrides = dict(primary_overrides)
+    merged_scalars: dict[str, Any] = {}
+    for field in _COMPANY_MANAGEMENT_SCALAR_FIELDS:
+        value = _management_effective_scalar(primary, field, primary_overrides)
+        if not _management_non_empty(value):
+            for row, overrides in zip(supplements, supplement_overrides):
+                candidate = _management_effective_scalar(row, field, overrides)
+                if _management_non_empty(candidate):
+                    value = candidate
+                    if field not in primary_overrides and field in overrides:
+                        merged_overrides[field] = candidate
+                    break
+        merged_scalars[field] = value
+
+    merged_arrays: dict[str, list[Any]] = {}
+    for field in _COMPANY_MANAGEMENT_ARRAY_FIELDS:
+        primary_values = _management_json_array(primary, field, primary_overrides)
+        values = list(primary_values)
+        for row, overrides in zip(supplements, supplement_overrides):
+            values.extend(_management_json_array(row, field, overrides))
+        if field == "aliases":
+            for row, overrides in zip(supplements, supplement_overrides):
+                values.extend([
+                    row["display_name"],
+                    row["legal_name"],
+                    *_management_json_array(row, "aliases", overrides),
+                ])
+        merged_arrays[field] = _management_stable_list(values)
+        if field in primary_overrides:
+            merged_overrides[field] = merged_arrays[field]
+        if not primary_values and field not in primary_overrides:
+            for overrides in supplement_overrides:
+                if field in overrides:
+                    merged_overrides[field] = merged_arrays[field]
+                    break
+
+    if content_polish and content_polish.get("status") == "complete":
+        if "summary" not in primary_overrides and not primary["summary_locked"]:
+            polished_summary = normalize_text_value(content_polish.get("summary"), preserve_newlines=True)
+            if polished_summary:
+                merged_scalars["summary"] = polished_summary
+        for field in ("businesses", "highlights", "major_requirements"):
+            if field in primary_overrides:
+                continue
+            polished_values = content_polish.get(field)
+            if not isinstance(polished_values, list):
+                continue
+            polished_values = normalize_text_list(polished_values, preserve_newlines=True)
+            if polished_values or not merged_arrays[field]:
+                merged_arrays[field] = _management_stable_list(polished_values)
+        for field in _COMPANY_MANAGEMENT_ARRAY_FIELDS:
+            if field in primary_overrides or field in merged_overrides:
+                merged_overrides[field] = merged_arrays[field]
+
+    updates: dict[str, Any] = {
+        COMPANY_OVERRIDE_COLUMNS.get(field, field): merged_scalars[field]
+        for field in _COMPANY_MANAGEMENT_SCALAR_FIELDS
+    }
+    updates.update({
+        COMPANY_OVERRIDE_COLUMNS.get(field, f"{field}_json"): json_text(merged_arrays[field], [])
+        for field in _COMPANY_MANAGEMENT_ARRAY_FIELDS
+    })
+    updates["manual_overrides_json"] = json.dumps(merged_overrides, ensure_ascii=False)
+    updates["summary_locked"] = int(bool(primary["summary_locked"]) or "summary" in primary_overrides or "summary" in merged_overrides)
+    updates["updated_at"] = now
+    assignments = ",".join(f"{column}=?" for column in updates)
+    connection.execute(
+        f"UPDATE companies SET {assignments} WHERE id=?",
+        (*updates.values(), primary["id"]),
+    )
+    profile = {
+        **merged_scalars,
+        **merged_arrays,
+        "merged_company_ids": [row["id"] for row in supplements],
+    }
+    connection.execute(
+        "INSERT INTO company_versions(id,company_id,profile_json,decision,reason,processor,created_at) VALUES(?,?,?,?,?,?,?)",
+        (
+            str(uuid4()), primary["id"], json.dumps(profile, ensure_ascii=False),
+            "manual_merge", "管理员手动合并企业", "admin:manual", now,
+        ),
+    )
+
+
+def _merge_batch_records(connection: Any, keep_id: str, duplicate_id: str, now: str) -> None:
+    keep = connection.execute("SELECT confidence,updated_at FROM recruitment_batches WHERE id=?", (keep_id,)).fetchone()
+    duplicate = connection.execute("SELECT confidence,updated_at FROM recruitment_batches WHERE id=?", (duplicate_id,)).fetchone()
+    if not keep or not duplicate:
+        return
+    connection.execute("UPDATE jobs SET batch_id=? WHERE batch_id=?", (keep_id, duplicate_id))
+    connection.execute("UPDATE recruitment_shared_details SET batch_id=? WHERE batch_id=?", (keep_id, duplicate_id))
+    connection.execute("UPDATE recruitment_events SET batch_id=? WHERE batch_id=?", (keep_id, duplicate_id))
+    updated_at = _choose_temporal_text([keep["updated_at"], duplicate["updated_at"], now], latest=True) or now
+    connection.execute(
+        "UPDATE recruitment_batches SET confidence=?,updated_at=? WHERE id=?",
+        (max(float(keep["confidence"] or 0), float(duplicate["confidence"] or 0)), updated_at, keep_id),
+    )
+    connection.execute("DELETE FROM recruitment_batches WHERE id=?", (duplicate_id,))
+
+
+def _deduplicate_company_batches(connection: Any, company_id: str, now: str) -> int:
+    rows = connection.execute(
+        "SELECT * FROM recruitment_batches WHERE company_id=? ORDER BY created_at,id",
+        (company_id,),
+    ).fetchall()
+    kept: dict[tuple[Any, ...], str] = {}
+    removed = 0
+    for row in rows:
+        identity = (row["name"], row["year"], row["season"], row["recruitment_type"])
+        keep_id = kept.get(identity)
+        if keep_id is None:
+            kept[identity] = row["id"]
+            continue
+        _merge_batch_records(connection, keep_id, row["id"], now)
+        removed += 1
+    return removed
+
+
+def _remap_company_relations(connection: Any, company_ids: list[str], primary_id: str) -> None:
+    mapping = {company_id: primary_id for company_id in company_ids}
+    placeholders = _management_placeholders(company_ids)
+    rows = connection.execute(
+        f"SELECT id,parent_company_id,child_company_id,relation_type FROM company_relations WHERE parent_company_id IN ({placeholders}) OR child_company_id IN ({placeholders}) ORDER BY id",
+        tuple(company_ids) * 2,
+    ).fetchall()
+    for row in rows:
+        parent_id = mapping.get(row["parent_company_id"], row["parent_company_id"])
+        child_id = mapping.get(row["child_company_id"], row["child_company_id"])
+        if parent_id == child_id:
+            connection.execute("DELETE FROM company_relations WHERE id=?", (row["id"],))
+            continue
+        duplicate = connection.execute(
+            "SELECT id FROM company_relations WHERE parent_company_id=? AND child_company_id=? AND relation_type=? AND id<>? LIMIT 1",
+            (parent_id, child_id, row["relation_type"], row["id"]),
+        ).fetchone()
+        if duplicate:
+            connection.execute("DELETE FROM company_relations WHERE id=?", (row["id"],))
+        else:
+            connection.execute(
+                "UPDATE company_relations SET parent_company_id=?,child_company_id=? WHERE id=?",
+                (parent_id, child_id, row["id"]),
+            )
+
+
+def _remap_company_merge_rules(connection: Any, company_ids: list[str], primary_id: str) -> None:
+    mapping = {company_id: primary_id for company_id in company_ids}
+    placeholders = _management_placeholders(company_ids)
+    rows = connection.execute(
+        f"SELECT id,left_company_id,right_company_id FROM company_merge_rules WHERE left_company_id IN ({placeholders}) OR right_company_id IN ({placeholders}) ORDER BY id",
+        tuple(company_ids) * 2,
+    ).fetchall()
+    for row in rows:
+        left_id = mapping.get(row["left_company_id"], row["left_company_id"])
+        right_id = mapping.get(row["right_company_id"], row["right_company_id"])
+        if left_id == right_id:
+            connection.execute("DELETE FROM company_merge_rules WHERE id=?", (row["id"],))
+            continue
+        duplicate = connection.execute(
+            "SELECT id FROM company_merge_rules WHERE left_company_id=? AND right_company_id=? AND id<>? LIMIT 1",
+            (left_id, right_id, row["id"]),
+        ).fetchone()
+        if duplicate:
+            connection.execute("DELETE FROM company_merge_rules WHERE id=?", (row["id"],))
+        else:
+            connection.execute(
+                "UPDATE company_merge_rules SET left_company_id=?,right_company_id=? WHERE id=?",
+                (left_id, right_id, row["id"]),
+            )
+
+
+def _remap_company_follows(connection: Any, supplement_ids: list[str], primary_id: str) -> None:
+    placeholders = _management_placeholders(supplement_ids)
+    rows = connection.execute(
+        f"SELECT user_id,company_id,created_at FROM user_follows WHERE company_id IN ({placeholders}) ORDER BY company_id,user_id",
+        tuple(supplement_ids),
+    ).fetchall()
+    for row in rows:
+        connection.execute(
+            "INSERT OR IGNORE INTO user_follows(user_id,company_id,created_at) VALUES(?,?,?)",
+            (row["user_id"], primary_id, row["created_at"]),
+        )
+        connection.execute(
+            "DELETE FROM user_follows WHERE user_id=? AND company_id=?",
+            (row["user_id"], row["company_id"]),
+        )
+
+
+def _rebuild_company_search_index(connection: Any, primary_id: str, company_ids: list[str], job_ids: list[str]) -> None:
+    company_placeholders = _management_placeholders(company_ids)
+    connection.execute(
+        f"DELETE FROM search_index WHERE entity_type='company' AND entity_id IN ({company_placeholders})",
+        tuple(company_ids),
+    )
+    if job_ids:
+        job_placeholders = _management_placeholders(job_ids)
+        connection.execute(
+            f"DELETE FROM search_index WHERE entity_type='job' AND entity_id IN ({job_placeholders})",
+            tuple(job_ids),
+        )
+    company = connection.execute("SELECT display_name,summary FROM companies WHERE id=?", (primary_id,)).fetchone()
+    if not company:
+        return
+    connection.execute(
+        "INSERT INTO search_index(entity_type,entity_id,title,body) VALUES('company',?,?,?)",
+        (primary_id, company["display_name"], f"{company['display_name']} {company['summary'] or ''}".strip()),
+    )
+    for job in connection.execute(
+        "SELECT id,canonical_title,requirements,responsibilities FROM jobs WHERE company_id=?",
+        (primary_id,),
+    ).fetchall():
+        connection.execute(
+            "INSERT INTO search_index(entity_type,entity_id,title,body) VALUES('job',?,?,?)",
+            (
+                job["id"], job["canonical_title"],
+                f"{job['canonical_title']} {job['requirements'] or ''} {job['responsibilities'] or ''}".strip(),
+            ),
+        )
+
+
+def _management_running_jobs(connection: Any, company_ids: list[str]) -> list[dict[str, Any]]:
+    placeholders = _management_placeholders(company_ids)
+    return [
+        dict(row)
+        for row in connection.execute(
+            f"SELECT id,kind,company_id FROM processing_jobs WHERE status='running' AND company_id IN ({placeholders}) ORDER BY created_at,id",
+            tuple(company_ids),
+        ).fetchall()
+    ]
+
+
+def _ensure_company_management_unlocked(connection: Any, company_ids: list[str]) -> None:
+    running = _management_running_jobs(connection, company_ids)
+    if running:
+        raise CompanyManagementConflict("参与操作的企业存在正在运行的后台任务，请等待任务结束后重试")
+
+
+def _management_count_by_ids(connection: Any, table: str, column: str, company_ids: list[str]) -> int:
+    if not company_ids:
+        return 0
+    placeholders = _management_placeholders(company_ids)
+    row = connection.execute(
+        f"SELECT COUNT(*) AS count FROM {table} WHERE {column} IN ({placeholders})",
+        tuple(company_ids),
+    ).fetchone()
+    return int(row["count"] if row else 0)
+
+
+def _company_management_impact(connection: Any, company_ids: list[str], operation: str, rows: list[Any] | None = None) -> dict[str, Any]:
+    if operation not in {"merge", "delete"}:
+        raise CompanyManagementValidationError("operation must be merge or delete")
+    if operation == "merge" and len(company_ids) < 2:
+        raise CompanyManagementValidationError("合并至少需要选择两个企业")
+    rows = rows or _management_company_rows(connection, company_ids)
+    target_ids = company_ids[1:] if operation == "merge" else company_ids
+    target_placeholders = _management_placeholders(target_ids)
+    job_rows = connection.execute(
+        f"SELECT id FROM jobs WHERE company_id IN ({target_placeholders})",
+        tuple(target_ids),
+    ).fetchall() if target_ids else []
+    job_ids = [row["id"] for row in job_rows]
+    evidence_conditions = [f"company_id IN ({target_placeholders})"]
+    evidence_params: list[Any] = list(target_ids)
+    if job_ids:
+        job_placeholders = _management_placeholders(job_ids)
+        evidence_conditions.append(f"job_id IN ({job_placeholders})")
+        evidence_params.extend(job_ids)
+    evidence_row = connection.execute(
+        f"SELECT COUNT(*) AS count FROM evidences WHERE {' OR '.join(evidence_conditions)}",
+        tuple(evidence_params),
+    ).fetchone()
+    index_conditions = [f"(entity_type='company' AND entity_id IN ({target_placeholders}))"]
+    index_params: list[Any] = list(target_ids)
+    if job_ids:
+        job_placeholders = _management_placeholders(job_ids)
+        index_conditions.append(f"(entity_type='job' AND entity_id IN ({job_placeholders}))")
+        index_params.extend(job_ids)
+    index_row = connection.execute(
+        f"SELECT COUNT(*) AS count FROM search_index WHERE {' OR '.join(index_conditions)}",
+        tuple(index_params),
+    ).fetchone()
+    relation_row = connection.execute(
+        f"SELECT COUNT(*) AS count FROM company_relations WHERE parent_company_id IN ({target_placeholders}) OR child_company_id IN ({target_placeholders})",
+        tuple(target_ids) * 2,
+    ).fetchone()
+    merge_rule_row = connection.execute(
+        f"SELECT COUNT(*) AS count FROM company_merge_rules WHERE left_company_id IN ({target_placeholders}) OR right_company_id IN ({target_placeholders})",
+        tuple(target_ids) * 2,
+    ).fetchone()
+    counts = {
+        "companies": len(target_ids),
+        "jobs": len(job_ids),
+        "recruitment_batches": _management_count_by_ids(connection, "recruitment_batches", "company_id", target_ids),
+        "recruitment_shared_details": _management_count_by_ids(connection, "recruitment_shared_details", "company_id", target_ids),
+        "recruitment_events": _management_count_by_ids(connection, "recruitment_events", "company_id", target_ids),
+        "evidences": int(evidence_row["count"] if evidence_row else 0),
+        "company_versions": _management_count_by_ids(connection, "company_versions", "company_id", target_ids),
+        "company_claims": _management_count_by_ids(connection, "company_claims", "company_id", target_ids),
+        "company_public_findings": _management_count_by_ids(connection, "company_public_findings", "company_id", target_ids),
+        "company_relations": int(relation_row["count"] if relation_row else 0),
+        "company_merge_rules": int(merge_rule_row["count"] if merge_rule_row else 0),
+        "user_follows": _management_count_by_ids(connection, "user_follows", "company_id", target_ids),
+        "processing_jobs": _management_count_by_ids(connection, "processing_jobs", "company_id", target_ids),
+        "review_items": 0,
+        "search_index": int(index_row["count"] if index_row else 0),
+    }
+    review_row = connection.execute(
+        f"SELECT COUNT(*) AS count FROM review_items WHERE entity_type='company' AND entity_id IN ({target_placeholders})",
+        tuple(target_ids),
+    ).fetchone()
+    counts["review_items"] = int(review_row["count"] if review_row else 0)
+    running = _management_running_jobs(connection, company_ids)
+    result: dict[str, Any] = {
+        "operation": operation,
+        "primary_company": {"id": rows[0]["id"], "display_name": rows[0]["display_name"]} if operation == "merge" else None,
+        "supplementary_companies": [
+            {"id": row["id"], "display_name": row["display_name"]}
+            for row in rows[1:]
+        ] if operation == "merge" else [],
+        "selected_companies": [
+            {"id": row["id"], "display_name": row["display_name"]}
+            for row in rows
+        ],
+        "counts": counts,
+        "running_jobs": running,
+        "blocked": bool(running),
+    }
+    return result
+
+
+def company_management_impact(company_ids: Any, operation: str) -> dict[str, Any]:
+    ids = _management_company_ids(company_ids)
+    with connect() as connection:
+        return _company_management_impact(connection, ids, operation)
+
+
+def merge_company_records(company_ids: Any) -> dict[str, Any]:
+    ids = _management_company_ids(company_ids)
+    if len(ids) < 2:
+        raise CompanyManagementValidationError("合并至少需要选择两个企业")
+    with connect() as snapshot_connection:
+        snapshot_rows = [dict(row) for row in _management_company_rows(snapshot_connection, ids)]
+        _ensure_company_management_unlocked(snapshot_connection, ids)
+    snapshot_updated_at = {row["id"]: row["updated_at"] for row in snapshot_rows}
+    content_polish, content_polish_result = _polish_company_merge_content(snapshot_rows)
+    now = utc_now()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = _management_company_rows(connection, ids)
+        if any(row["updated_at"] != snapshot_updated_at.get(row["id"]) for row in rows):
+            raise CompanyManagementConflict("企业资料在 Codex 整理期间发生变化，请重试")
+        _ensure_company_management_unlocked(connection, ids)
+        impact = _company_management_impact(connection, ids, "merge", rows)
+        primary_id = ids[0]
+        supplement_ids = ids[1:]
+        all_job_ids = [
+            row["id"]
+            for row in connection.execute(
+                f"SELECT id FROM jobs WHERE company_id IN ({_management_placeholders(ids)})",
+                tuple(ids),
+            ).fetchall()
+        ]
+        _merge_company_profile(connection, rows[0], rows[1:], now, content_polish)
+        supplement_placeholders = _management_placeholders(supplement_ids)
+        connection.execute(
+            f"UPDATE recruitment_batches SET company_id=? WHERE company_id IN ({supplement_placeholders})",
+            (primary_id, *supplement_ids),
+        )
+        _deduplicate_company_batches(connection, primary_id, now)
+        connection.execute(
+            f"UPDATE recruitment_shared_details SET company_id=? WHERE company_id IN ({supplement_placeholders})",
+            (primary_id, *supplement_ids),
+        )
+        connection.execute(
+            f"UPDATE recruitment_events SET company_id=? WHERE company_id IN ({supplement_placeholders})",
+            (primary_id, *supplement_ids),
+        )
+        connection.execute(
+            f"UPDATE evidences SET company_id=? WHERE company_id IN ({supplement_placeholders})",
+            (primary_id, *supplement_ids),
+        )
+        for table in ("company_versions", "company_claims"):
+            connection.execute(
+                f"UPDATE {table} SET company_id=? WHERE company_id IN ({supplement_placeholders})",
+                (primary_id, *supplement_ids),
+            )
+        duplicate_findings = connection.execute(
+            f"SELECT id,content_hash FROM company_public_findings WHERE company_id IN ({supplement_placeholders}) ORDER BY company_id,id",
+            tuple(supplement_ids),
+        ).fetchall()
+        for finding in duplicate_findings:
+            existing = connection.execute(
+                "SELECT id FROM company_public_findings WHERE company_id=? AND content_hash=? LIMIT 1",
+                (primary_id, finding["content_hash"]),
+            ).fetchone()
+            if existing:
+                connection.execute("DELETE FROM company_public_findings WHERE id=?", (finding["id"],))
+            else:
+                connection.execute(
+                    "UPDATE company_public_findings SET company_id=? WHERE id=?",
+                    (primary_id, finding["id"]),
+                )
+        _remap_company_relations(connection, ids, primary_id)
+        _remap_company_merge_rules(connection, ids, primary_id)
+        _remap_company_follows(connection, supplement_ids, primary_id)
+        connection.execute(
+            f"UPDATE processing_jobs SET company_id=? WHERE company_id IN ({supplement_placeholders})",
+            (primary_id, *supplement_ids),
+        )
+        connection.execute(
+            f"UPDATE review_items SET entity_id=? WHERE entity_type='company' AND entity_id IN ({supplement_placeholders})",
+            (primary_id, *supplement_ids),
+        )
+        connection.execute(
+            f"UPDATE jobs SET company_id=? WHERE company_id IN ({supplement_placeholders})",
+            (primary_id, *supplement_ids),
+        )
+        deduplicated_jobs = deduplicate_company_jobs(connection, primary_id)
+        connection.execute(
+            f"DELETE FROM search_index WHERE entity_type='company' AND entity_id IN ({supplement_placeholders})",
+            tuple(supplement_ids),
+        )
+        connection.execute(
+            f"DELETE FROM companies WHERE id IN ({supplement_placeholders})",
+            tuple(supplement_ids),
+        )
+        _rebuild_company_search_index(connection, primary_id, ids, all_job_ids)
+        return {
+            "status": "merged",
+            "primary_company_id": primary_id,
+            "merged_company_ids": supplement_ids,
+            "counts": impact["counts"],
+            "deduplicated_jobs": deduplicated_jobs,
+            "content_polish": content_polish_result,
+        }
+
+
+def delete_company_records(company_ids: Any) -> dict[str, Any]:
+    ids = _management_company_ids(company_ids)
+    now = utc_now()
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = _management_company_rows(connection, ids)
+        _ensure_company_management_unlocked(connection, ids)
+        impact = _company_management_impact(connection, ids, "delete", rows)
+        company_placeholders = _management_placeholders(ids)
+        job_ids = [
+            row["id"]
+            for row in connection.execute(
+                f"SELECT id FROM jobs WHERE company_id IN ({company_placeholders})",
+                tuple(ids),
+            ).fetchall()
+        ]
+        event_ids = [
+            row["id"]
+            for row in connection.execute(
+                f"SELECT id FROM recruitment_events WHERE company_id IN ({company_placeholders})",
+                tuple(ids),
+            ).fetchall()
+        ]
+        processing_job_rows = connection.execute(
+            f"SELECT id,raw_message_id FROM processing_jobs WHERE company_id IN ({company_placeholders})",
+            tuple(ids),
+        ).fetchall()
+        processing_job_ids = [row["id"] for row in processing_job_rows]
+        processing_raw_message_ids = list(dict.fromkeys(
+            row["raw_message_id"] for row in processing_job_rows if row["raw_message_id"]
+        ))
+        evidence_conditions = [f"company_id IN ({company_placeholders})"]
+        evidence_params: list[Any] = list(ids)
+        if job_ids:
+            job_placeholders = _management_placeholders(job_ids)
+            evidence_conditions.append(f"job_id IN ({job_placeholders})")
+            evidence_params.extend(job_ids)
+        evidence_ids = [
+            row["id"]
+            for row in connection.execute(
+                f"SELECT id FROM evidences WHERE {' OR '.join(evidence_conditions)}",
+                tuple(evidence_params),
+            ).fetchall()
+        ]
+        if event_ids or evidence_ids:
+            event_conditions: list[str] = []
+            event_params: list[Any] = []
+            if event_ids:
+                event_placeholders = _management_placeholders(event_ids)
+                event_conditions.append(f"event_id IN ({event_placeholders})")
+                event_params.extend(event_ids)
+            if evidence_ids:
+                evidence_placeholders = _management_placeholders(evidence_ids)
+                event_conditions.append(f"evidence_id IN ({evidence_placeholders})")
+                event_params.extend(evidence_ids)
+            connection.execute(
+                f"DELETE FROM recruitment_event_evidences WHERE {' OR '.join(event_conditions)}",
+                tuple(event_params),
+            )
+        if event_ids:
+            event_placeholders = _management_placeholders(event_ids)
+            connection.execute(
+                f"DELETE FROM recruitment_event_versions WHERE event_id IN ({event_placeholders})",
+                tuple(event_ids),
+            )
+            connection.execute(
+                f"DELETE FROM recruitment_events WHERE id IN ({event_placeholders})",
+                tuple(event_ids),
+            )
+        connection.execute(
+            f"DELETE FROM recruitment_shared_details WHERE company_id IN ({company_placeholders})",
+            tuple(ids),
+        )
+        if evidence_ids:
+            evidence_placeholders = _management_placeholders(evidence_ids)
+            connection.execute(
+                f"DELETE FROM evidences WHERE id IN ({evidence_placeholders})",
+                tuple(evidence_ids),
+            )
+        if job_ids:
+            job_placeholders = _management_placeholders(job_ids)
+            for table in ("job_versions", "user_job_states", "application_events", "user_notes", "job_tag_links"):
+                column = "job_id"
+                connection.execute(
+                    f"DELETE FROM {table} WHERE {column} IN ({job_placeholders})",
+                    tuple(job_ids),
+                )
+            connection.execute(
+                f"DELETE FROM jobs WHERE id IN ({job_placeholders})",
+                tuple(job_ids),
+            )
+        connection.execute(
+            f"DELETE FROM recruitment_batches WHERE company_id IN ({company_placeholders})",
+            tuple(ids),
+        )
+        for table in ("company_versions", "company_claims", "company_public_findings"):
+            connection.execute(
+                f"DELETE FROM {table} WHERE company_id IN ({company_placeholders})",
+                tuple(ids),
+            )
+        connection.execute(
+            f"DELETE FROM company_relations WHERE parent_company_id IN ({company_placeholders}) OR child_company_id IN ({company_placeholders})",
+            tuple(ids) * 2,
+        )
+        connection.execute(
+            f"DELETE FROM company_merge_rules WHERE left_company_id IN ({company_placeholders}) OR right_company_id IN ({company_placeholders})",
+            tuple(ids) * 2,
+        )
+        connection.execute(
+            f"DELETE FROM user_follows WHERE company_id IN ({company_placeholders})",
+            tuple(ids),
+        )
+        connection.execute(
+            f"DELETE FROM processing_jobs WHERE company_id IN ({company_placeholders})",
+            tuple(ids),
+        )
+        review_conditions: list[str] = []
+        review_params: list[Any] = []
+        if processing_job_ids:
+            processing_job_placeholders = _management_placeholders(processing_job_ids)
+            review_conditions.append(f"entity_id IN ({processing_job_placeholders})")
+            review_params.extend(processing_job_ids)
+        if processing_raw_message_ids:
+            raw_message_placeholders = _management_placeholders(processing_raw_message_ids)
+            review_conditions.append(
+                f"(entity_id IN ({raw_message_placeholders}) AND NOT EXISTS "
+                f"(SELECT 1 FROM processing_jobs survivor WHERE survivor.raw_message_id=review_items.entity_id "
+                f"AND (survivor.company_id IS NULL OR survivor.company_id NOT IN ({company_placeholders}))))"
+            )
+            review_params.extend(processing_raw_message_ids)
+            review_params.extend(ids)
+        if review_conditions:
+            connection.execute(
+                f"DELETE FROM review_items WHERE entity_type='processing_job' AND ({' OR '.join(review_conditions)})",
+                tuple(review_params),
+            )
+        connection.execute(
+            f"DELETE FROM review_items WHERE entity_type='company' AND entity_id IN ({company_placeholders})",
+            tuple(ids),
+        )
+        if job_ids:
+            job_placeholders = _management_placeholders(job_ids)
+            connection.execute(
+                f"DELETE FROM search_index WHERE entity_type='job' AND entity_id IN ({job_placeholders})",
+                tuple(job_ids),
+            )
+        connection.execute(
+            f"DELETE FROM search_index WHERE entity_type='company' AND entity_id IN ({company_placeholders})",
+            tuple(ids),
+        )
+        connection.execute(
+            f"DELETE FROM companies WHERE id IN ({company_placeholders})",
+            tuple(ids),
+        )
+        return {
+            "status": "deleted",
+            "deleted_company_ids": ids,
+            "counts": impact["counts"],
+            "deleted_at": now,
+        }
 
 
 def refresh_expiration() -> int:

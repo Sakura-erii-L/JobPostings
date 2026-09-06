@@ -431,6 +431,14 @@ COMPANY_OUTPUT_SCHEMA: dict[str, Any] = _strict_object({
     "unsupported_claims": _STRING_LIST,
     "profile": _COMPANY_PROFILE_SCHEMA,
 })
+COMPANY_MERGE_CONTENT_SCHEMA: dict[str, Any] = _strict_object({
+    "status": {"type": "string", "enum": ["complete", "uncertain"]},
+    "reason": _STRING,
+    "summary": _STRING,
+    "businesses": _STRING_LIST,
+    "highlights": _STRING_LIST,
+    "major_requirements": _STRING_LIST,
+})
 
 _PUBLIC_FACT_SCHEMA = _strict_object({
     "fact": _STRING,
@@ -614,6 +622,42 @@ def consolidate_company_profile(company: dict[str, Any], sources: list[dict[str,
         COMPANY_OUTPUT_SCHEMA,
         job_id=job_id,
     )
+
+
+def polish_company_merge_content(candidates: list[dict[str, Any]], job_id: str) -> ModelResult:
+    """Use the local Codex path only for deterministic merge-content editing."""
+    prompt = {
+        "content_candidates": candidates,
+        "output_shape": {
+            "status": "complete|uncertain",
+            "reason": "",
+            "summary": "",
+            "businesses": [],
+            "highlights": [],
+            "major_requirements": [],
+        },
+    }
+    from .codex_agent import run_codex_json
+
+    payload = run_codex_json(
+        "company_merge_content",
+        prompt,
+        COMPANY_MERGE_CONTENT_SCHEMA,
+        job_id=job_id,
+        enable_web=False,
+        timeout_seconds=300,
+    )
+    validate_schema_payload(payload, COMPANY_MERGE_CONTENT_SCHEMA)
+    result = ModelResult(
+        payload,
+        estimate_tokens(json.dumps(prompt, ensure_ascii=False)),
+        estimate_tokens(json.dumps(payload, ensure_ascii=False)),
+        True,
+        "local_codex",
+        "gpt-5.6-luna",
+    )
+    record_model_usage(result, "company_merge_content")
+    return result
 
 
 def _public_company_identity(company: dict[str, Any]) -> dict[str, Any]:

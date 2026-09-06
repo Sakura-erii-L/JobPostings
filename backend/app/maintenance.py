@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 from .config import config
-from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, _store_recruitment_shared_details, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title
+from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, _store_recruitment_shared_details, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title, recruitment_event_state
 from .db import connect, utc_now
 from .parsers import extract_event_datetime_candidates, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, is_file_message, is_major_like_title, is_major_requirement_heading, is_wechat_public_url, normalize_file_filename, normalize_event_datetime, parse_message_time, recover_original_source_url
 
@@ -302,9 +302,11 @@ def repair_timeline_events() -> dict[str, int]:
             if event["end_at"] and not current_end:
                 current_end = _nearest_candidate(timed_candidates or candidates, reference_at, current_start)
                 recovered = recovered or bool(current_end)
-            new_status = event["status"]
-            if current_start:
-                new_status = "historical" if current_start < utc_now() else "upcoming"
+            new_status = recruitment_event_state({
+                "start_at": current_start,
+                "end_at": current_end,
+                "timezone": event["timezone"] or "Asia/Shanghai",
+            }, datetime.now(timezone.utc))
             changed = current_start != event["start_at"] or current_end != event["end_at"] or new_status != event["status"]
             if not changed:
                 continue

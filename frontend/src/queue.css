@@ -4,11 +4,13 @@
 .queue-item { margin-bottom: 0; }
 .queue-item-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
 .queue-item-head > div:first-of-type { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.queue-item-head > div:first-of-type { flex: 1 1 auto; }
 .queue-selector { align-self: center; display: inline-flex; flex: 0 0 auto; }
 .queue-select-all { display: inline-flex; align-items: center; gap: 7px; color: #65718b; font-size: 12px; }
 .queue-item-head strong { color: #35415d; font-size: 14px; }
 .queue-item-head span:not(.status) { color: #8994a8; font-size: 11px; }
 .queue-item-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.queue-item-actions { flex: 0 0 auto; max-width: 100%; }
 .queue-item-actions .secondary { padding: 7px 10px; font-size: 12px; }
 .queue-status.pending { color: #4e70e7; background: #e8edff; }
 .queue-status.running { color: #815ddd; background: #f0eaff; }
@@ -18,6 +20,12 @@
 .queue-status.canceled { color: #6f7891; background: #edf0f5; }
 .secondary.danger { color:#b4314e; background:#fff0f3; }
 .queue-preview { color: #52607c; line-height: 1.7; font-size: 13px; margin: 16px 0 12px; white-space: pre-wrap; word-break: break-word; }
+.queue-original { margin: 16px 0 12px; border: 1px solid #e2e7f2; border-radius: 11px; background: #fbfcff; overflow: hidden; }
+.queue-original summary { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; cursor:pointer; list-style:none; color:#43516d; }
+.queue-original summary::-webkit-details-marker { display:none; }
+.queue-original summary strong { font-size:12px; }
+.queue-original summary span { color:#8994a8; font-size:11px; text-align:right; }
+.queue-original pre { max-height:230px; overflow:auto; margin:0; padding:0 12px 12px; color:#52607c; font:inherit; font-size:13px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
 .queue-error { margin: 0 0 12px; padding: 10px 12px; border-radius: 9px; background: #fff6f7; color: #a8334b; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
 .queue-current-step { display:flex; align-items:center; gap:9px; margin:14px 0 2px; padding:10px 12px; border-radius:10px; background:#f4f6ff; color:#5369ca; }
 .queue-current-step span { font-size:11px; color:#8994a8; }
@@ -28,6 +36,7 @@
 .queue-meta { display: flex; gap: 12px; flex-wrap: wrap; color: #8994a8; font-size: 11px; }
 .queue-id { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .processing-log { margin-top:14px; border-top:1px solid #edf0f6; padding-top:10px; }
+.queue-log { min-width:0; overflow:hidden; }
 .log-line { display:grid; grid-template-columns:145px 120px 1fr; gap:8px; align-items:start; padding:8px 0; color:#65718b; font-size:11px; }
 .log-line time { color:#929db1; }
 .log-line strong { color:#485671; }
@@ -39,7 +48,10 @@
   .queue-toolbar { align-items: flex-start; }
   .queue-total { padding: 10px 0; }
   .queue-item-head { display: block; }
+  .queue-item-head > div:first-of-type { width: 100%; }
   .queue-item-actions { margin-top: 12px; }
+  .queue-original summary { align-items: flex-start; }
+  .queue-original summary span { text-align: left; }
   .log-line { grid-template-columns:1fr; }
   .log-line pre { grid-column:auto; }
 }

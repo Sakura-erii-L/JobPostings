@@ -9,6 +9,7 @@ _RUNTIME_INPUT_PLACEHOLDER = "{{RUNTIME_INPUT}}"
 _PROMPT_FILES = {
     "recruitment_extract": "recruitment_extract.md",
     "company_consolidation": "company_consolidation.md",
+    "company_merge_content": "company_merge_content.md",
     "source_text_extraction": "source_text_extraction.md",
     "company_public_research": "company_public_research.md",
     "connection_test": "connection_test.md",

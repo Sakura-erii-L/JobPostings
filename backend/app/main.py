@@ -18,7 +18,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from .auth import authenticate_password, create_session, initial_admin_password_required, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_initial_admin_password, set_user_password, verify_code
 from .backups import WebDAVClient, _backup_credentials, create_backup, list_backups, validate_remote_backup
-from .catalog import COMPANY_OVERRIDE_COLUMNS, INDUSTRIES, _parse_reliable_datetime, apply_company_overrides, company_overrides, refresh_expiration
+from .catalog import COMPANY_OVERRIDE_COLUMNS, INDUSTRIES, CompanyManagementConflict, CompanyManagementNotFound, CompanyManagementValidationError, _parse_reliable_datetime, apply_company_overrides, company_management_impact, company_overrides, delete_company_records, merge_company_records, recruitment_event_sort_key, recruitment_event_state, refresh_expiration
 from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
@@ -109,6 +109,14 @@ class CompanyUpdate(BaseModel):
     businesses: list[str] | None = Field(default=None, max_length=100)
     highlights: list[str] | None = Field(default=None, max_length=100)
     official_channels: list[str] | None = Field(default=None, max_length=100)
+
+
+class CompanySelectionRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class CompanyManagementPreviewRequest(CompanySelectionRequest):
+    operation: str
 
 
 class JobStateRequest(BaseModel):
@@ -1011,6 +1019,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
                p.cancel_requested,p.processor,p.error,p.result_json,p.created_at,p.updated_at,p.started_at,p.finished_at,
                r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,r.recognition_status,r.recognized_at,r.recognition_error,
+               r.text_content,r.metadata_json,
                substr(COALESCE(r.text_content,''),1,240) AS text_preview,
                sg.name AS source_group_name
         FROM processing_jobs p
@@ -1044,6 +1053,17 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     items: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        current_text = item.pop("text_content", None)
+        metadata_json = item.pop("metadata_json", None)
+        if item["kind"] == "classify":
+            try:
+                metadata = json.loads(metadata_json or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            original_text = metadata.get("_original_text_content") if isinstance(metadata, dict) else None
+            item["original_text"] = original_text if isinstance(original_text, str) else current_text or ""
+        else:
+            item["original_text"] = None
         raw_result = item.get("result_json")
         if raw_result:
             try:
@@ -1229,6 +1249,44 @@ async def import_file_endpoint(file: UploadFile = File(...), _: dict[str, Any] =
         return import_file(file.filename or "upload.bin", data, file.content_type)
     except Exception as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/v1/admin/companies/impact")
+def company_management_impact_endpoint(body: CompanyManagementPreviewRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        return company_management_impact(body.ids, body.operation)
+    except CompanyManagementNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except CompanyManagementValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/v1/admin/companies/merge")
+async def merge_companies_endpoint(body: CompanySelectionRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        result = merge_company_records(body.ids)
+    except CompanyManagementConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except CompanyManagementNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except CompanyManagementValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await events.publish("company.updated", {"company_id": result["primary_company_id"], "merged_company_ids": result["merged_company_ids"]})
+    return result
+
+
+@app.delete("/api/v1/admin/companies")
+async def delete_companies_endpoint(body: CompanySelectionRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        result = delete_company_records(body.ids)
+    except CompanyManagementConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except CompanyManagementNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except CompanyManagementValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await events.publish("company.updated", {"deleted_company_ids": result["deleted_company_ids"]})
+    return result
 
 
 @app.get("/api/v1/companies")
@@ -1433,11 +1491,12 @@ def artifact_download(artifact_id: str, _: dict[str, Any] = Depends(require_scop
 def recruitment_events(company_id: str | None = None, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> list[dict[str, Any]]:
     params: tuple[Any, ...] = (company_id,) if company_id else ()
     where = "WHERE e.company_id=?" if company_id else ""
+    now = datetime.now(timezone.utc)
     rows = all_rows(
         f"""SELECT e.*,c.display_name AS company_name,b.name AS batch_name
             FROM recruitment_events e JOIN companies c ON c.id=e.company_id
             LEFT JOIN recruitment_batches b ON b.id=e.batch_id {where}
-            ORDER BY CASE WHEN e.start_at IS NULL THEN 1 ELSE 0 END,e.start_at""",
+            ORDER BY e.updated_at DESC,e.id""",
         params,
     )
     result = []
@@ -1445,8 +1504,9 @@ def recruitment_events(company_id: str | None = None, _: dict[str, Any] = Depend
         value = dict(row)
         value["job_ids"] = json.loads(value.pop("job_ids_json") or "[]")
         value["evidence_ids"] = [item["evidence_id"] for item in all_rows("SELECT evidence_id FROM recruitment_event_evidences WHERE event_id=?", (row["id"],))]
+        value["status"] = recruitment_event_state(value, now)
         result.append(value)
-    return result
+    return sorted(result, key=lambda event: recruitment_event_sort_key(event, now))
 
 
 @app.get("/api/v1/jobs")
