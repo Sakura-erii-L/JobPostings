@@ -1092,17 +1092,30 @@ def _historical_candidate_pairs(entity_type: str) -> list[list[dict[str, Any]]]:
                 groups.setdefault((row["company_id"], row["normalized_title"], row["recruitment_type"]), []).append(row)
             return [[_job_semantic_candidate(left), _job_semantic_candidate(right)] for group in groups.values() for index, left in enumerate(group) for right in group[index + 1:]]
         rows = connection.execute("SELECT * FROM recruitment_events ORDER BY company_id,created_at,id").fetchall()
-        groups: dict[tuple[str, str, str], list[Any]] = {}
+        timed_groups: dict[tuple[str, str, str], list[Any]] = {}
+        unknown_groups: dict[tuple[str, str, str], list[Any]] = {}
         for row in rows:
-            key = (row["company_id"], _event_identity_text(row["event_type"]), _event_identity_text(row["title"], title=True))
-            groups.setdefault(key, []).append(row)
-        return [
+            event_type = _event_identity_text(row["event_type"])
+            if row["start_at"]:
+                key = (row["company_id"], event_type, row["start_at"])
+                timed_groups.setdefault(key, []).append(row)
+            else:
+                key = (row["company_id"], event_type, _event_identity_text(row["title"], title=True))
+                unknown_groups.setdefault(key, []).append(row)
+        timed_pairs = [
             [_event_semantic_candidate(connection, left), _event_semantic_candidate(connection, right)]
-            for group in groups.values()
+            for group in timed_groups.values()
+            for index, left in enumerate(group)
+            for right in group[index + 1:]
+        ]
+        unknown_pairs = [
+            [_event_semantic_candidate(connection, left), _event_semantic_candidate(connection, right)]
+            for group in unknown_groups.values()
             for index, left in enumerate(group)
             for right in group[index + 1:]
             if _event_identity_matches(left, right)
         ]
+        return [*timed_pairs, *unknown_pairs]
 
 
 def _event_pair_has_conflicting_time(record_ids: list[str]) -> bool:
@@ -1169,7 +1182,7 @@ def repair_historical_semantic_duplicates() -> dict[str, int]:
                     elif entity_type == "job":
                         merge_job_records_with_payload(ordered_ids, operation["merged"])
                     else:
-                        merge_event_records_with_payload(ordered_ids, operation["merged"])
+                        merge_event_records_with_payload(ordered_ids, operation["merged"], semantic_identity=True)
                 except Exception as exc:
                     operation["action"] = "review"
                     operation["reason"] = f"程序执行语义合并时遇到冲突：{exc}"

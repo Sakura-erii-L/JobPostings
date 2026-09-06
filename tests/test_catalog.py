@@ -530,6 +530,80 @@ def test_historical_semantic_repair_uses_codex_and_manual_override_survivor(tmp_
     assert second["semantic_decisions"] == 0
 
 
+def test_historical_semantic_event_repair_accepts_title_and_location_variants(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    events = [
+        {
+            "title": "航空工业沈飞2027届校园招聘",
+            "event_type": "宣讲会",
+            "city": "南京",
+            "campus": "南京理工大学",
+            "location": "南京校区第四教学楼A107",
+            "start_at": "2026-09-06T11:00:00+00:00",
+            "end_at": "2026-09-06T13:00:00+00:00",
+            "timezone": "Asia/Shanghai",
+        },
+        {
+            "title": "航空工业沈飞2027届校园招聘",
+            "event_type": "宣讲会",
+            "city": "南京",
+            "campus": "南京校区",
+            "location": "第四教学楼A107",
+            "start_at": "2026-09-06T11:00:00+00:00",
+            "end_at": "2026-09-06T13:00:00+00:00",
+            "timezone": "Asia/Shanghai",
+        },
+        {
+            "title": "沈阳飞机工业(集团)有限公司宣讲会",
+            "event_type": "宣讲会",
+            "city": "南京",
+            "campus": "南京校区",
+            "location": "南京校区第四教学楼A107",
+            "start_at": "2026-09-06T11:00:00+00:00",
+            "end_at": "2026-09-06T13:00:00+00:00",
+            "timezone": "Asia/Shanghai",
+            "notes": "无需预约",
+        },
+    ]
+    for event in events:
+        apply_model_item(
+            {"is_recruitment": True, "company": {"display_name": "沈飞语义去重测试"}, "events": [event]},
+            None,
+            "2026-09-06T00:00:00+00:00",
+        )
+    calls = []
+
+    def fake_deduplicate(entity_type, candidates, job_id):
+        calls.append((entity_type, candidates, job_id))
+        ids = [candidate["id"] for candidate in candidates]
+        merged = {
+            "title": "航空工业沈飞2027届校园招聘",
+            "event_type": "宣讲会",
+            "start_at": "2026-09-06T11:00:00+00:00",
+            "end_at": "2026-09-06T13:00:00+00:00",
+            "timezone": "Asia/Shanghai",
+            "format": "unknown",
+            "city": "南京",
+            "campus": "南京理工大学",
+            "location": "南京校区第四教学楼A107",
+            "application_url": None,
+            "audience": None,
+            "notes": "无需预约",
+            "job_titles": [],
+        }
+        return ModelResult({"action": "merge", "record_ids": ids, "reason": "同一时间地点的企业名称和地点为表述差异", "evidence": ["同一企业、同一活动时间、同一教室"], "merged": merged}, 1, 1, True, "fake", "fake")
+
+    monkeypatch.setattr("app.model_provider.deduplicate_entity_candidates", fake_deduplicate)
+    result = repair_historical_semantic_duplicates()
+
+    assert result["semantic_merged"] >= 1
+    assert calls and all(call[0] == "event" for call in calls)
+    assert db.one("SELECT COUNT(*) AS count FROM recruitment_events WHERE company_id=(SELECT id FROM companies WHERE display_name=?)", ("沈飞语义去重测试",))["count"] == 1
+
+
 def test_event_summary_does_not_create_venue_company_and_keeps_time(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(db.config, "db_path", db_path)

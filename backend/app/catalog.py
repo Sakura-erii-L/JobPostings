@@ -1738,7 +1738,12 @@ def _apply_semantic_event_payload(connection: Any, event_id: str, payload: dict[
     connection.execute("UPDATE recruitment_event_versions SET is_current=0 WHERE event_id=? AND id NOT IN (SELECT id FROM recruitment_event_versions WHERE event_id=? ORDER BY observed_at DESC,id DESC LIMIT 1)", (event_id, event_id))
 
 
-def merge_event_records_with_payload(event_ids: list[str], payload: dict[str, Any]) -> dict[str, Any]:
+def merge_event_records_with_payload(
+    event_ids: list[str],
+    payload: dict[str, Any],
+    *,
+    semantic_identity: bool = False,
+) -> dict[str, Any]:
     ids = list(dict.fromkeys(str(value).strip() for value in event_ids if str(value).strip()))
     if len(ids) < 2:
         raise CompanyManagementValidationError("活动语义合并至少需要两个记录")
@@ -1746,7 +1751,9 @@ def merge_event_records_with_payload(event_ids: list[str], payload: dict[str, An
         connection.execute("BEGIN IMMEDIATE")
         rows = _management_event_rows(connection, ids)
         first = rows[0]
-        if len({row["company_id"] for row in rows}) != 1 or any(not _event_identity_matches(first, row) for row in rows[1:]):
+        if len({row["company_id"] for row in rows}) != 1 or (
+            not semantic_identity and any(not _event_identity_matches(first, row) for row in rows[1:])
+        ):
             raise CompanyManagementConflict("活动身份字段不一致，不能语义合并")
         keep = rows[0]
         for duplicate in rows[1:]:
