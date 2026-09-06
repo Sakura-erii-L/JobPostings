@@ -8,8 +8,10 @@ from typing import Any
 _RUNTIME_INPUT_PLACEHOLDER = "{{RUNTIME_INPUT}}"
 _PROMPT_FILES = {
     "recruitment_extract": "recruitment_extract.md",
+    "recruitment_source_consolidation": "recruitment_source_consolidation.md",
     "company_consolidation": "company_consolidation.md",
     "company_merge_content": "company_merge_content.md",
+    "historical_entity_dedup": "historical_entity_dedup.md",
     "source_text_extraction": "source_text_extraction.md",
     "company_public_research": "company_public_research.md",
     "connection_test": "connection_test.md",

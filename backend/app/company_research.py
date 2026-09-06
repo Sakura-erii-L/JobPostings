@@ -263,7 +263,7 @@ def execute_company_research(company_id: str, job_id: str, is_active: Any | None
     if not search_settings.get("enabled", True):
         return {"status": "disabled", "company_id": company_id, "job_id": job_id}
     company = dict(company_row)
-    hints = _source_hints(company) if str(get_setting("processing_engine", "codex") or "codex") == "generic" else []
+    hints = _source_hints(company) if str(get_setting("processing_engine", "codex") or "codex") in {"generic", "generic_llm"} else []
     model_result = research_company_overview(company, hints, job_id)
     if is_active is not None and not is_active():
         return {"status": "canceled", "company_id": company_id, "job_id": job_id}

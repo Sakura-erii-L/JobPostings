@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import db
-from app.catalog import _make_job, _prepare_job_items, apply_model_item, is_location_like_title, normalize_name, normalize_text_value, normalize_title, refresh_expiration
-from app.maintenance import migrate_major_jobs, repair_existing_catalog, requeue_missing_job_sources
-from app.main import company_detail
+from app.catalog import _make_job, _prepare_job_items, apply_model_item, is_location_like_title, normalize_company_tags, normalize_name, normalize_text_value, normalize_title, refresh_expiration
+from app.maintenance import migrate_major_jobs, repair_existing_catalog, repair_historical_semantic_duplicates, requeue_missing_job_sources
+from app.main import company_detail, recruitment_events
+from app.model_provider import ModelResult
 from app.parsers import extract_recruitment_catalog
 from app.processing import ingest_message
 
@@ -245,6 +246,40 @@ def test_structured_fields_are_mechanically_cleaned_without_dropping_subject_ter
     assert json.loads(job["locations_json"]) == ["南京"]
 
 
+def test_company_identity_uses_unique_alias_and_rejects_ambiguous_or_conflicting_matches(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    with db.connect() as connection:
+        now = db.utc_now()
+        connection.execute("INSERT INTO companies(id,display_name,legal_name,aliases_json,created_at,updated_at) VALUES(?,?,?,?,?,?)", ("unique-company", "唯一企业", "唯一企业有限公司", json.dumps(["唯一别名"], ensure_ascii=False), now, now))
+        connection.execute("INSERT INTO companies(id,display_name,legal_name,aliases_json,created_at,updated_at) VALUES(?,?,?,?,?,?)", ("ambiguous-a", "企业甲", None, json.dumps(["共享别名"], ensure_ascii=False), now, now))
+        connection.execute("INSERT INTO companies(id,display_name,legal_name,aliases_json,created_at,updated_at) VALUES(?,?,?,?,?,?)", ("ambiguous-b", "企业乙", None, json.dumps(["共享别名"], ensure_ascii=False), now, now))
+
+    unique = apply_model_item({"is_recruitment": True, "company": {"display_name": "唯一别名"}, "jobs": []}, None, db.utc_now())
+    assert unique["company_ids"] == ["unique-company"]
+    ambiguous = apply_model_item({"is_recruitment": True, "company": {"display_name": "共享别名"}, "jobs": []}, None, db.utc_now())
+    assert ambiguous["company_ids"] == []
+    assert ambiguous["invalid_company_entries"][0]["reason"] == "identity_conflict"
+    conflict = apply_model_item({"is_recruitment": True, "company": {"display_name": "唯一企业", "legal_name": "另一个法律主体"}, "jobs": []}, None, db.utc_now())
+    assert conflict["company_ids"] == []
+    assert conflict["invalid_company_entries"][0]["reason"] == "identity_conflict"
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 3
+
+
+def test_attribute_tags_with_same_label_are_visible_once_even_when_codes_differ():
+    tags = normalize_company_tags([
+        {"category": "attribute", "code": "fortune500", "label": "世界500强"},
+        {"category": "attribute", "code": "fortune_500", "label": " 世界500强 "},
+        {"category": "industry", "code": "ai_data", "label": "人工智能/数据"},
+    ])
+    assert tags == [
+        {"category": "attribute", "code": "fortune500", "label": "世界500强"},
+        {"category": "industry", "code": "ai_data", "label": "人工智能/数据"},
+    ]
+
+
 def test_successful_source_with_job_clues_and_no_jobs_is_requeued(tmp_path, monkeypatch):
     db_path = tmp_path / "test.db"
     monkeypatch.setattr(db.config, "db_path", db_path)
@@ -440,7 +475,59 @@ def test_repair_existing_catalog_upgrades_v3_marker(tmp_path, monkeypatch):
     assert result["status"] == "repaired"
     assert result["jobs_created"] == 0
     assert result["major_jobs_migrated"] == 0
-    assert db.one("SELECT value FROM schema_meta WHERE key=?", ("historical_catalog_repair_v6",))["value"]
+    assert db.one("SELECT value FROM schema_meta WHERE key=?", ("historical_catalog_repair_v7",))["value"]
+
+
+def test_historical_semantic_repair_uses_codex_and_manual_override_survivor(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO companies(id,display_name,legal_name,aliases_json,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("company-old", "旧企业名称", "统一企业有限公司", json.dumps(["共享简称"], ensure_ascii=False), "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO companies(id,display_name,legal_name,aliases_json,manual_overrides_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            ("company-manual", "管理员企业名称", "统一企业有限公司", json.dumps(["共享简称"], ensure_ascii=False), json.dumps({"summary": "锁定摘要"}, ensure_ascii=False), "2026-02-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00"),
+        )
+    calls = []
+
+    def fake_deduplicate(entity_type, candidates, job_id):
+        calls.append((entity_type, candidates, job_id))
+        ids = [candidate["id"] for candidate in candidates]
+        return ModelResult(
+            {
+                "action": "merge",
+                "record_ids": ids,
+                "reason": "正文证据确认同一企业",
+                "evidence": ["共享简称与统一法定名"],
+                "merged": {"display_name": "统一企业", "legal_name": "统一企业有限公司", "aliases": ["共享简称"], "summary": "统一摘要"},
+            },
+            1,
+            1,
+            True,
+            "fake",
+            "fake",
+        )
+
+    monkeypatch.setattr("app.model_provider.deduplicate_entity_candidates", fake_deduplicate)
+    result = repair_historical_semantic_duplicates()
+
+    assert result["semantic_decisions"] == 1
+    assert result["semantic_merged"] == 1
+    assert calls[0][0] == "company"
+    assert db.one("SELECT id FROM companies WHERE id='company-manual'")
+    assert db.one("SELECT id FROM companies WHERE id='company-old'") is None
+    decision = db.one("SELECT action,status FROM semantic_merge_decisions WHERE entity_type='company'")
+    assert dict(decision) == {"action": "merge", "status": "applied"}
+    version = db.one("SELECT decision,processor FROM company_versions WHERE company_id='company-manual'")
+    assert dict(version) == {"decision": "semantic_merge", "processor": "codex:historical_entity_dedup"}
+
+    monkeypatch.setattr("app.model_provider.deduplicate_entity_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unchanged merged records must not be re-evaluated")))
+    second = repair_historical_semantic_duplicates()
+    assert second["semantic_decisions"] == 0
 
 
 def test_event_summary_does_not_create_venue_company_and_keeps_time(tmp_path, monkeypatch):
@@ -531,6 +618,81 @@ def test_event_title_company_overrides_context_company(tmp_path, monkeypatch):
     event = db.one("SELECT company_id FROM recruitment_events")
     assert db.one("SELECT COUNT(*) AS n FROM companies")["n"] == 1
     assert event["company_id"] == db.one("SELECT id FROM companies WHERE display_name=?", ("哈尔滨飞机工业集团有限责任公司",))["id"]
+
+
+def test_event_identity_ignores_batch_and_handles_unknown_or_conflicting_time(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+
+    def payload(company_name, batch_name, event):
+        return {
+            "is_recruitment": True,
+            "companies": [{
+                "company": {"display_name": company_name},
+                "recruitment": {
+                    "batch": {"name": batch_name, "recruitment_type": "campus"},
+                    "shared_details": {"locations": [], "salary": None},
+                    "jobs": [],
+                    "events": [event],
+                },
+            }],
+        }
+
+    identity = {"title": "南京理工大学宣讲会", "event_type": "presentation", "city": "南京", "campus": "南京理工大学", "location": "第四教学楼A106"}
+    first = apply_model_item(payload("活动去重科技", "2026 春招", identity), None, "2026-09-05T00:00:00+00:00")
+    company_id = first["company_ids"][0]
+    apply_model_item(payload("活动去重科技", "2026 暑期实习", {**identity, "start_at": "2026-09-10T10:00:00+00:00"}), None, "2026-09-06T00:00:00+00:00")
+    apply_model_item(payload("活动去重科技", "2026 秋招", {**identity, "start_at": "2026-09-11T10:00:00+00:00"}), None, "2026-09-07T00:00:00+00:00")
+
+    events = db.all_rows("SELECT start_at,batch_id FROM recruitment_events WHERE company_id=? ORDER BY start_at", (company_id,))
+    assert len(events) == 2
+    assert events[0]["start_at"] == "2026-09-10T10:00:00+00:00"
+    assert events[1]["start_at"] == "2026-09-11T10:00:00+00:00"
+    assert db.one("SELECT COUNT(*) AS count FROM review_items WHERE kind='event_time_conflict'")["count"] == 1
+
+    unknown = apply_model_item(payload("未知时间活动科技", "2026 招聘", identity), None, "2026-09-07T00:00:00+00:00")
+    unknown_company_id = unknown["company_ids"][0]
+    detail = company_detail(unknown_company_id, {})
+    assert len(detail["events"]) == 1
+    assert detail["events"][0]["start_at"] is None
+    assert all(event["company_id"] != unknown_company_id for event in recruitment_events(_={}))
+
+
+def test_event_identity_fills_missing_location_component(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.db"
+    monkeypatch.setattr(db.config, "db_path", db_path)
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    db.init_db()
+    base_event = {
+        "title": "地点补全宣讲会",
+        "event_type": "presentation",
+        "city": "南京",
+        "campus": "南京理工大学",
+        "location": "第四教学楼A106",
+        "start_at": "2026-09-12T10:00:00+00:00",
+    }
+    apply_model_item(
+        {"is_recruitment": True, "company": {"display_name": "地点补全科技"}, "events": [base_event]},
+        None,
+        "2026-09-06T00:00:00+00:00",
+    )
+    apply_model_item(
+        {
+            "is_recruitment": True,
+            "company": {"display_name": "地点补全科技"},
+            "events": [{**base_event, "campus": None, "notes": "补充报名说明"}],
+        },
+        None,
+        "2026-09-06T01:00:00+00:00",
+    )
+    company_id = db.one("SELECT id FROM companies WHERE display_name=?", ("地点补全科技",))["id"]
+    event = db.one("SELECT campus,notes FROM recruitment_events WHERE company_id=?", (company_id,))
+    assert db.one("SELECT COUNT(*) AS count FROM recruitment_events WHERE company_id=?", (company_id,))["count"] == 1
+    assert event["campus"] == "南京理工大学"
+    assert event["notes"] == "补充报名说明"
+    assert db.one("SELECT COUNT(*) AS count FROM recruitment_event_evidences WHERE event_id=(SELECT id FROM recruitment_events WHERE company_id=?)", (company_id,))["count"] == 2
 
 
 def test_duplicate_jobs_across_batches_are_hidden_but_departments_stay_separate(tmp_path, monkeypatch):

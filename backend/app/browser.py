@@ -9,9 +9,6 @@ from urllib.parse import urljoin, urlparse
 from .parsers import validate_public_url
 
 
-MAX_BROWSER_IMAGES = 24
-
-
 def _browser_executable() -> Path | None:
     configured = str(os.getenv("JOBPOSTINGS_BROWSER_EXECUTABLE") or "").strip()
     if configured:
@@ -148,10 +145,10 @@ def fetch_public_browser(url: str) -> dict[str, Any]:
             return {
                 "url": page_url,
                 "title": page.title()[:300],
-                "text": text[:2_000_000],
+                "text": text,
                 "content_type": content_type,
                 "links": list(dict.fromkeys(urljoin(page_url, str(link)) for link in links))[:100],
-                "images": image_urls[:MAX_BROWSER_IMAGES],
+                "images": image_urls,
                 "image_data": [],
                 "screenshot_data": screenshot_data,
                 "browser_rendered": True,

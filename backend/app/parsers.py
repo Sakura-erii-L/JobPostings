@@ -602,9 +602,9 @@ def extract_html(html: str) -> dict[str, Any]:
     title = parser.parts[0] if parser.parts else ""
     return {
         "title": title[:300],
-        "text": text[:2_000_000],
-        "links": list(dict.fromkeys(parser.links))[:100],
-        "images": list(dict.fromkeys(parser.images))[:50],
+        "text": text,
+        "links": list(dict.fromkeys(parser.links)),
+        "images": list(dict.fromkeys(parser.images)),
     }
 
 
@@ -718,7 +718,7 @@ def _extract_legacy_doc(filename: str, data: bytes) -> dict[str, Any]:
                 )
                 if result.returncode == 0 and result.stdout:
                     return {
-                        "text": result.stdout.decode("utf-8", errors="replace")[:2_000_000],
+                        "text": result.stdout.decode("utf-8", errors="replace"),
                         "metadata": {"format": "doc", "converter": command},
                     }
                 errors.append(f"{command} exit code {result.returncode}")
@@ -738,7 +738,7 @@ def _extract_legacy_doc(filename: str, data: bytes) -> dict[str, Any]:
                 converted = Path(temp_dir) / f"{source.stem}.txt"
                 if result.returncode == 0 and converted.exists():
                     return {
-                        "text": converted.read_text(encoding="utf-8", errors="replace")[:2_000_000],
+                        "text": converted.read_text(encoding="utf-8", errors="replace"),
                         "metadata": {"format": "doc", "converter": command},
                     }
                 errors.append(f"{command} exit code {result.returncode}")
@@ -766,7 +766,7 @@ def _extract_legacy_xls(filename: str, data: bytes) -> dict[str, Any]:
             converted = Path(temp_dir) / f"{source.stem}.csv"
             if result.returncode == 0 and converted.exists():
                 return {
-                    "text": converted.read_text(encoding="utf-8", errors="replace")[:2_000_000],
+                    "text": converted.read_text(encoding="utf-8", errors="replace"),
                     "metadata": {"format": "xls", "converter": Path(executable).name},
                 }
             return {"text": "", "metadata": {"format": "xls", "error": f"{Path(executable).name} exit code {result.returncode}"}}
@@ -781,9 +781,9 @@ def extract_file(filename: str, data: bytes, *, mime_type: str | None = None, lo
         text = _safe_decode(data)
         if suffix in {".csv", ".tsv"}:
             delimiter = "\t" if suffix == ".tsv" else ","
-            rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))[:20_000]
+            rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
             text = "\n".join(" | ".join(row) for row in rows)
-        return {"text": text[:2_000_000], "metadata": {"format": suffix[1:]}}
+        return {"text": text, "metadata": {"format": suffix[1:]}}
     if suffix == ".doc":
         return _extract_legacy_doc(filename, data)
     if suffix == ".xls":
@@ -798,7 +798,7 @@ def extract_file(filename: str, data: bytes, *, mime_type: str | None = None, lo
             for table in document.tables:
                 for row in table.rows:
                     tables.append(" | ".join(cell.text for cell in row.cells))
-            return {"text": "\n".join(paragraphs + tables)[:2_000_000], "metadata": {"format": "docx"}}
+            return {"text": "\n".join(paragraphs + tables), "metadata": {"format": "docx"}}
         except Exception as exc:
             return {"text": "", "metadata": {"format": "docx", "error": str(exc)}}
     if suffix == ".xlsx":
@@ -807,13 +807,13 @@ def extract_file(filename: str, data: bytes, *, mime_type: str | None = None, lo
 
             workbook = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
             lines: list[str] = []
-            for sheet in workbook.worksheets[:20]:
+            for sheet in workbook.worksheets:
                 lines.append(f"[工作表: {sheet.title}]")
-                for row in list(sheet.iter_rows(values_only=True))[:20_000]:
+                for row in sheet.iter_rows(values_only=True):
                     values = [str(value) for value in row if value is not None]
                     if values:
                         lines.append(" | ".join(values))
-            return {"text": "\n".join(lines)[:2_000_000], "metadata": {"format": "xlsx"}}
+            return {"text": "\n".join(lines), "metadata": {"format": "xlsx"}}
         except Exception as exc:
             return {"text": "", "metadata": {"format": "xlsx", "error": str(exc)}}
     if suffix == ".pdf":
@@ -822,9 +822,9 @@ def extract_file(filename: str, data: bytes, *, mime_type: str | None = None, lo
 
             document = fitz.open(stream=data, filetype="pdf")
             lines = []
-            for page in list(document)[:200]:
+            for page in document:
                 lines.append(page.get_text("text"))
-            return {"text": "\n".join(lines)[:2_000_000], "metadata": {"format": "pdf", "pages": len(document)}}
+            return {"text": "\n".join(lines), "metadata": {"format": "pdf", "pages": len(document)}}
         except Exception as exc:
             return {"text": "", "metadata": {"format": "pdf", "error": str(exc)}}
     if suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}:
@@ -873,7 +873,7 @@ def process_image(data: bytes, image_format: str, *, local_ocr: bool = False) ->
         if ocr_error:
             metadata["ocr_error"] = ocr_error
         return {
-            "text": "\n".join(ocr_lines)[:2_000_000],
+            "text": "\n".join(ocr_lines),
             "metadata": metadata,
             "qr_values": list(dict.fromkeys(qr_values)),
         }
@@ -991,7 +991,7 @@ def fetch_public_url(url: str) -> dict[str, Any]:
             "access_error": "微信返回环境验证页面",
         }
     if "html" not in content_type and not response.text.lstrip().startswith("<"):
-        return {"url": str(response.url), "text": response.text[:2_000_000], "content_type": content_type}
+        return {"url": str(response.url), "text": response.text, "content_type": content_type}
     result = extract_html(response.text)
     result["links"] = [urljoin(str(response.url), link) for link in result.get("links", []) if link]
     result["images"] = [urljoin(str(response.url), image) for image in result.get("images", []) if image]

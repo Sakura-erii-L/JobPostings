@@ -85,6 +85,7 @@ class OpenAICompatibleProvider:
         if not self.base_url or not self.model:
             raise RuntimeError("LLM provider is not configured")
         prompt_text = "\n".join(str(item.get("content", "")) for item in messages)
+        timeout_seconds = float(self.profile.get("timeout_seconds", 120))
         body: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
@@ -100,7 +101,10 @@ class OpenAICompatibleProvider:
             url = self.base_url if self.base_url.endswith("/responses") else self.base_url + "/responses"
         else:
             url = self.base_url if self.base_url.endswith("/chat/completions") else self.base_url + "/chat/completions"
-        response = httpx.post(url, headers=self._headers(), json=body, timeout=float(self.profile.get("timeout_seconds", 120)))
+        try:
+            response = httpx.post(url, headers=self._headers(), json=body, timeout=timeout_seconds)
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(f"Generic LLM timed out after {timeout_seconds:g} seconds") from exc
         response.raise_for_status()
         data = response.json()
         if self.api_style == "responses":
@@ -440,6 +444,27 @@ COMPANY_MERGE_CONTENT_SCHEMA: dict[str, Any] = _strict_object({
     "major_requirements": _STRING_LIST,
 })
 
+
+def _semantic_operation_schema(merged_schema: dict[str, Any]) -> dict[str, Any]:
+    nullable_merged_schema = {
+        "type": ["object", "null"],
+        "properties": merged_schema.get("properties", {}),
+        "required": merged_schema.get("required", []),
+        "additionalProperties": merged_schema.get("additionalProperties", False),
+    }
+    return _strict_object({
+        "action": {"type": "string", "enum": ["merge", "keep_separate", "review"]},
+        "record_ids": _STRING_LIST,
+        "reason": _STRING,
+        "evidence": _STRING_LIST,
+        "merged": nullable_merged_schema,
+    })
+
+
+COMPANY_DEDUP_OPERATION_SCHEMA = _semantic_operation_schema(_COMPANY_SCHEMA)
+JOB_DEDUP_OPERATION_SCHEMA = _semantic_operation_schema(_JOB_SCHEMA)
+EVENT_DEDUP_OPERATION_SCHEMA = _semantic_operation_schema(_EVENT_SCHEMA)
+
 _PUBLIC_FACT_SCHEMA = _strict_object({
     "fact": _STRING,
     "source_title": _STRING,
@@ -481,7 +506,7 @@ def _call_processing_engine(
     job_id: str,
 ) -> ModelResult:
     engine = str(get_setting("processing_engine", "codex") or "codex")
-    if engine == "generic":
+    if engine in {"generic", "generic_llm"}:
         result = _call_model(messages, task_type)
         validate_schema_payload(result.payload, schema)
         return result
@@ -509,19 +534,31 @@ def _redact_structure(value: Any, index_key: bytes) -> Any:
 
 def classify_messages(messages: list[dict[str, Any]], job_id: str = "") -> ModelResult:
     engine = str(get_setting("processing_engine", "codex") or "codex")
-    if engine == "generic" and not provider_profile().get("enabled"):
+    if engine in {"generic", "generic_llm"} and not provider_profile().get("enabled"):
         raise RuntimeError("LLM provider is disabled")
     redaction_enabled = bool(get_setting("redaction_enabled", False))
     index_key = b"jobpostings-redaction-index"
     items = []
-    for item in messages:
-        text = str(item.get("text", ""))
-        source_datetime = item.get("sent_at")
+    for source_item in messages:
+        text = str(source_item.get("text", ""))
+        source_datetime = source_item.get("sent_at")
         if redaction_enabled:
             text = redact_text(text, index_key)
         item = {"message_id": f"item_{len(items) + 1}", "text": text}
         if source_datetime:
             item["source_datetime"] = str(source_datetime)
+        safe_metadata = source_item.get("metadata") if isinstance(source_item.get("metadata"), dict) else None
+        if safe_metadata:
+            allowed_metadata = {
+                key: str(safe_metadata[key]).strip()
+                for key in ("title", "source_url", "resolved_url", "filename", "web_access_status")
+                if safe_metadata.get(key) not in (None, "")
+            }
+            if allowed_metadata:
+                item["source_metadata"] = allowed_metadata
+        message_type = str(source_item.get("message_type") or "").strip()
+        if message_type:
+            item["message_type"] = message_type
         items.append(item)
     user_prompt = {
         "industry_codes": ["internet_software", "ai_data", "electronics_semiconductor", "telecommunications", "manufacturing_automation", "automotive_transport_equipment", "energy_chemical_materials", "construction_real_estate", "finance", "consumer_retail_ecommerce", "healthcare_biopharma", "education_research", "media_culture_entertainment", "logistics_transportation", "professional_services", "government_public_nonprofit", "agriculture", "military_defense", "other"],
@@ -624,8 +661,77 @@ def consolidate_company_profile(company: dict[str, Any], sources: list[dict[str,
     )
 
 
+def consolidate_recruitment_source(
+    source_text: str,
+    candidates: dict[str, Any],
+    metadata: dict[str, Any] | None,
+    job_id: str,
+) -> ModelResult:
+    """Reconcile one complete source with the first structured extraction."""
+    redaction_enabled = bool(get_setting("redaction_enabled", False))
+    index_key = b"jobpostings-redaction-index"
+    safe_metadata = {
+        key: value
+        for key, value in (metadata or {}).items()
+        if key in {"title", "source_url", "resolved_url", "filename", "web_access_status", "message_type", "sent_at"}
+        and value not in (None, "")
+    }
+    prompt = {
+        "source_text": redact_text(str(source_text or ""), index_key) if redaction_enabled else str(source_text or ""),
+        "source_metadata": _redact_structure(safe_metadata, index_key) if redaction_enabled else safe_metadata,
+        "structured_candidates": _redact_structure(candidates, index_key) if redaction_enabled else candidates,
+        "output_shape": {
+            "is_recruitment": True,
+            "decision_reason": "",
+            "companies": [],
+        },
+    }
+    return _call_processing_engine(
+        [
+            {"role": "system", "content": render_prompt_template("recruitment_source_consolidation")},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "recruitment_source_consolidation",
+        MODEL_OUTPUT_SCHEMA,
+        job_id=job_id,
+    )
+
+
+def deduplicate_entity_candidates(entity_type: str, candidates: list[dict[str, Any]], job_id: str) -> ModelResult:
+    """Ask the selected processing engine for one historical entity decision."""
+    schemas = {
+        "company": COMPANY_DEDUP_OPERATION_SCHEMA,
+        "job": JOB_DEDUP_OPERATION_SCHEMA,
+        "event": EVENT_DEDUP_OPERATION_SCHEMA,
+    }
+    schema = schemas.get(entity_type)
+    if schema is None:
+        raise ValueError(f"Unsupported semantic entity type: {entity_type}")
+    prompt = {
+        "entity_type": entity_type,
+        "record_ids": [str(item.get("id") or "") for item in candidates],
+        "candidates": candidates,
+        "output_shape": {
+            "action": "merge|keep_separate|review",
+            "record_ids": [str(item.get("id") or "") for item in candidates],
+            "reason": "",
+            "evidence": [],
+            "merged": None,
+        },
+    }
+    return _call_processing_engine(
+        [
+            {"role": "system", "content": render_prompt_template("historical_entity_dedup")},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "historical_entity_dedup",
+        schema,
+        job_id=job_id,
+    )
+
+
 def polish_company_merge_content(candidates: list[dict[str, Any]], job_id: str) -> ModelResult:
-    """Use the local Codex path only for deterministic merge-content editing."""
+    """Polish manual merge content through the configured processing engine."""
     prompt = {
         "content_candidates": candidates,
         "output_shape": {
@@ -637,27 +743,15 @@ def polish_company_merge_content(candidates: list[dict[str, Any]], job_id: str) 
             "major_requirements": [],
         },
     }
-    from .codex_agent import run_codex_json
-
-    payload = run_codex_json(
+    return _call_processing_engine(
+        [
+            {"role": "system", "content": render_prompt_template("company_merge_content")},
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
         "company_merge_content",
-        prompt,
         COMPANY_MERGE_CONTENT_SCHEMA,
         job_id=job_id,
-        enable_web=False,
-        timeout_seconds=300,
     )
-    validate_schema_payload(payload, COMPANY_MERGE_CONTENT_SCHEMA)
-    result = ModelResult(
-        payload,
-        estimate_tokens(json.dumps(prompt, ensure_ascii=False)),
-        estimate_tokens(json.dumps(payload, ensure_ascii=False)),
-        True,
-        "local_codex",
-        "gpt-5.6-luna",
-    )
-    record_model_usage(result, "company_merge_content")
-    return result
 
 
 def _public_company_identity(company: dict[str, Any]) -> dict[str, Any]:
@@ -683,7 +777,7 @@ def _public_company_identity(company: dict[str, Any]) -> dict[str, Any]:
 def research_company_overview(company: dict[str, Any], sources: list[dict[str, Any]], job_id: str) -> ModelResult:
     """Research public company information with source URLs and risk findings."""
     engine = str(get_setting("processing_engine", "codex") or "codex")
-    if engine == "generic" and not provider_profile().get("enabled"):
+    if engine in {"generic", "generic_llm"} and not provider_profile().get("enabled"):
         raise RuntimeError("LLM provider is disabled")
     prompt = {
         "retrieved_at": utc_now(),
@@ -716,7 +810,7 @@ def research_company_overview(company: dict[str, Any], sources: list[dict[str, A
             "sources_checked": [{"title": "", "url": "", "resolved_url": "", "excerpt": ""}],
         },
     }
-    if engine == "generic":
+    if engine in {"generic", "generic_llm"}:
         return _call_model(
             [
                 {"role": "system", "content": render_prompt_template("company_public_research")},

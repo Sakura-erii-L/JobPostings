@@ -270,6 +270,20 @@ CREATE TABLE IF NOT EXISTS company_merge_rules (
   created_at TEXT NOT NULL,
   UNIQUE(left_company_id, right_company_id)
 );
+CREATE TABLE IF NOT EXISTS semantic_merge_decisions (
+  id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL,
+  record_ids_json TEXT NOT NULL,
+  action TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  merged_json TEXT,
+  input_fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(entity_type, input_fingerprint)
+);
 CREATE TABLE IF NOT EXISTS recruitment_batches (
   id TEXT PRIMARY KEY,
   company_id TEXT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
@@ -492,6 +506,7 @@ CREATE INDEX IF NOT EXISTS idx_shared_details_company ON recruitment_shared_deta
 CREATE INDEX IF NOT EXISTS idx_claims_company ON company_claims(company_id);
 CREATE INDEX IF NOT EXISTS idx_public_findings_company ON company_public_findings(company_id, retrieved_at);
 CREATE INDEX IF NOT EXISTS idx_recruitment_events_time ON recruitment_events(start_at, company_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_merge_decisions_entity ON semantic_merge_decisions(entity_type, status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at);
 """
 

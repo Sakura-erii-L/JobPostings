@@ -5,6 +5,8 @@ import json
 import mimetypes
 import re
 import sqlite3
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -15,7 +17,7 @@ from .browser import fetch_public_browser
 from .catalog import INDUSTRIES, apply_company_overrides, apply_model_item, company_overrides, deduplicate_company_jobs, delete_company_records, merge_company_records, normalize_company_tags, normalize_recruitment_payload, normalize_text_value
 from .company_research import execute_company_research
 from .db import connect, one, utc_now
-from .model_provider import RecruitmentPayloadValidationError, classify_messages, consolidate_company_profile, get_setting, validate_recruitment_payload
+from .model_provider import RecruitmentPayloadValidationError, classify_messages, consolidate_company_profile, consolidate_recruitment_source, get_setting, validate_recruitment_payload
 from .parsers import (
     extract_file,
     fetch_public_http,
@@ -32,6 +34,60 @@ from .parsers import (
     recover_original_source_url,
     sha256_bytes,
 )
+
+
+class ModelOutputFailure(RuntimeError):
+    """Raised when a model result contradicts the required processing contract."""
+
+
+_active_job_condition = threading.Condition()
+_active_job_ids: set[str] = set()
+
+
+def _register_active_job(job_id: str) -> None:
+    with _active_job_condition:
+        _active_job_ids.add(job_id)
+        _active_job_condition.notify_all()
+
+
+def _unregister_active_job(job_id: str) -> None:
+    with _active_job_condition:
+        _active_job_ids.discard(job_id)
+        _active_job_condition.notify_all()
+
+
+def wait_for_processing_job(job_id: str, timeout_seconds: float = 10.0) -> bool:
+    """Wait until the worker handling a job has left its task block."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    with _active_job_condition:
+        while job_id in _active_job_ids:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            _active_job_condition.wait(timeout=remaining)
+    return True
+
+
+def mark_processing_timeout(job_id: str, error: str) -> bool:
+    """Expose a timeout state while the underlying model process may still run."""
+    changed = False
+    with connect() as connection:
+        row = connection.execute("SELECT status,cancel_requested,kind,raw_message_id FROM processing_jobs WHERE id=?", (job_id,)).fetchone()
+        if row and row["status"] == "running" and not row["cancel_requested"]:
+            now = utc_now()
+            connection.execute(
+                "UPDATE processing_jobs SET status='timeout',stage='timeout',lease_until=NULL,error=?,updated_at=? WHERE id=?",
+                (error, now, job_id),
+            )
+            if row["kind"] == "classify" and row["raw_message_id"]:
+                connection.execute(
+                    "UPDATE raw_messages SET recognition_status='timeout',recognized_at=NULL,recognition_error=? WHERE id=?",
+                    (error, row["raw_message_id"]),
+                )
+            changed = True
+    if changed:
+        log_processing(job_id, "timeout", "模型调用已超时，等待手动中断或重试；原处理进程可能仍在运行", "warning", {"error": error})
+    return changed
 
 
 def message_hash(connector_id: str | None, group_id: str | None, message: dict[str, Any]) -> str:
@@ -96,7 +152,7 @@ def _increment_ingest_stat(stats: dict[str, int] | None, key: str) -> None:
 
 def _queue_classification(connection: Any, raw_id: str) -> None:
     connection.execute(
-        "UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL WHERE id=? AND recognition_status NOT IN ('running')",
+        "UPDATE raw_messages SET recognition_status='pending',recognized_at=NULL,recognition_error=NULL WHERE id=? AND recognition_status NOT IN ('running','timeout')",
         (raw_id,),
     )
     job = connection.execute(
@@ -109,7 +165,7 @@ def _queue_classification(connection: Any, raw_id: str) -> None:
             (str(uuid4()), "classify", raw_id, "pending", utc_now(), utc_now()),
         )
         return
-    if job["status"] != "running":
+    if job["status"] not in {"running", "timeout"}:
         connection.execute(
             """UPDATE processing_jobs
                SET status='pending',stage='queued',attempts=0,cancel_requested=0,lease_until=NULL,
@@ -346,7 +402,7 @@ def _claim_one(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
 
 def _still_active(job_id: str) -> bool:
     row = one("SELECT status,cancel_requested FROM processing_jobs WHERE id=?", (job_id,))
-    return bool(row and row["status"] == "running" and not row["cancel_requested"])
+    return bool(row and row["status"] in {"running", "timeout"} and not row["cancel_requested"])
 
 
 def _stage(job_id: str, stage: str, message: str, processor: str | None = None) -> None:
@@ -667,7 +723,7 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
                 downloaded += 1
             except Exception as exc:
                 log_processing(job["id"], "extracting", "网页本身为图片，但图片提取失败", "warning", {"error": str(exc)})
-        for index, image in enumerate(browser_image_data[:24], start=1):
+        for index, image in enumerate(browser_image_data, start=1):
             image_url = str(image.get("url") or "")
             try:
                 artifact = attach_artifact(
@@ -684,7 +740,7 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
             except Exception as exc:
                 log_processing(job["id"], "extracting", "浏览器图片提取失败", "warning", {"url": image_url, "error": str(exc)})
         image_urls = list(dict.fromkeys([*image_urls, *(str(image.get("url") or "") for image in browser_image_data if image.get("url"))]))
-        for index, image_url in enumerate(image_urls[:24], start=1):
+        for index, image_url in enumerate(image_urls, start=1):
             if image_url in processed_image_urls:
                 continue
             try:
@@ -707,7 +763,7 @@ def _extract_link_images(job: dict[str, Any], raw: dict[str, Any], parsed: dict[
             except Exception as exc:
                 log_processing(job["id"], "extracting", "网页图片提取失败", "warning", {"url": image_url, "error": str(exc)})
     if image_urls:
-        metadata["linked_image_urls"] = image_urls[:24]
+        metadata["linked_image_urls"] = image_urls
     screenshot_data = parsed.get("screenshot_data")
     if isinstance(screenshot_data, bytes) and screenshot_data:
         try:
@@ -928,6 +984,18 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
     if not current or current["status"] == "canceled" or current["cancel_requested"]:
         _set_recognition_status(job.get("raw_message_id"), "canceled")
         return {"status": "canceled", "id": job["id"]}
+    if current["status"] == "timeout":
+        with connect() as connection:
+            connection.execute(
+                "UPDATE processing_jobs SET stage='timeout',lease_until=NULL,error=?,updated_at=? WHERE id=? AND status='timeout'",
+                (error, utc_now(), job["id"]),
+            )
+        _set_recognition_status(job.get("raw_message_id"), "timeout", error)
+        log_processing(job["id"], "timeout", "超时后的原处理进程返回错误；等待手动中断或重试", "error", {"error": error})
+        return {"status": "timeout", "id": job["id"], "error": error}
+    if isinstance(exc, TimeoutError):
+        mark_processing_timeout(job["id"], error)
+        return {"status": "timeout", "id": job["id"], "error": error}
     attempts = int(current["attempts"])
     delays = [10, 30, 90]
     retry_at: str | None = None
@@ -960,46 +1028,6 @@ def _fail(job: dict[str, Any], exc: Exception) -> dict[str, Any]:
     return {"status": status, "id": job["id"], "error": error}
 
 
-def _split_text(text: str, limit: int = 50_000) -> list[str]:
-    if len(text) <= limit:
-        return [text]
-    paragraph_parts = re.split(r"(\n\s*\n+)", text)
-    units: list[str] = []
-    for index in range(0, len(paragraph_parts), 2):
-        paragraph = paragraph_parts[index]
-        separator = paragraph_parts[index + 1] if index + 1 < len(paragraph_parts) else ""
-        segment = paragraph + separator
-        if not segment:
-            continue
-        if len(segment) <= limit:
-            units.append(segment)
-            continue
-        lines = segment.splitlines(keepends=True)
-        units.extend(lines if lines else [segment])
-    chunks: list[str] = []
-    current = ""
-    for unit in units:
-        if len(unit) > limit:
-            if current:
-                chunks.append(current)
-                current = ""
-            start = 0
-            while start < len(unit):
-                end = min(len(unit), start + limit)
-                chunks.append(unit[start:end])
-                if end == len(unit):
-                    break
-                start = end
-            continue
-        if current and len(current) + len(unit) > limit:
-            chunks.append(current)
-            current = ""
-        current += unit
-    if current:
-        chunks.append(current)
-    return chunks or [text]
-
-
 def _unique_dicts(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1026,110 +1054,51 @@ def _merge_json_list(old_value: Any, new_value: Any) -> list[Any]:
 
 
 def _merge_extracted_items(items: list[dict[str, Any]]) -> dict[str, Any]:
-    """Merge chunk results without interpreting source text."""
-    recruitment = [item for item in items if item.get("is_recruitment")]
-    invalid_non_recruitment_entries = [
-        entry
-        for item in items
-        if not item.get("is_recruitment")
-        for entry in item.get("companies") or []
-        if isinstance(entry, dict)
-    ]
-    if invalid_non_recruitment_entries:
-        return {
-            "is_recruitment": False,
-            "decision_reason": "；".join(dict.fromkeys(
-                str(item.get("decision_reason") or "").strip()
-                for item in items
-                if str(item.get("decision_reason") or "").strip()
-            )),
-            "companies": invalid_non_recruitment_entries,
-        }
-    if not recruitment:
-        return {"is_recruitment": False, "decision_reason": "；".join(dict.fromkeys(
-            str(item.get("decision_reason") or "").strip() for item in items if str(item.get("decision_reason") or "").strip()
-        )), "companies": []}
-    companies: list[dict[str, Any]] = []
-    by_name: dict[str, dict[str, Any]] = {}
-    anonymous_entries: list[dict[str, Any]] = []
-
-    def merge_entry(target: dict[str, Any], entry: dict[str, Any]) -> None:
-        company = entry.get("company") if isinstance(entry.get("company"), dict) else {}
-        for field, value in company.items():
-            if isinstance(value, list):
-                target["company"][field] = list(dict.fromkeys([*(target["company"].get(field) or []), *value]))
-            elif value not in (None, "", {}, []) and target["company"].get(field) in (None, "", {}, []):
-                target["company"][field] = value
-        incoming_recruitment = entry.get("recruitment") if isinstance(entry.get("recruitment"), dict) else {}
-        for section in ("batch", "shared_details"):
-            target_section = target["recruitment"].setdefault(section, {})
-            for field, value in (incoming_recruitment.get(section) or {}).items():
-                if isinstance(value, list):
-                    target_section[field] = list(dict.fromkeys([*(target_section.get(field) or []), *value]))
-                elif value not in (None, "", {}, []) and target_section.get(field) in (None, "", {}, []):
-                    target_section[field] = value
-        target["recruitment"]["jobs"] = _unique_dicts([
-            *(target["recruitment"].get("jobs") or []), *(incoming_recruitment.get("jobs") or []),
-        ])
-        target["recruitment"]["events"] = _unique_dicts([
-            *(target["recruitment"].get("events") or []), *(incoming_recruitment.get("events") or []),
-        ])
-
-    for item in recruitment:
-        for entry in item.get("companies") or []:
-            if not isinstance(entry, dict):
-                continue
-            company = dict(entry.get("company") or {})
-            key = (normalize_text_value(company.get("display_name") or company.get("legal_name")) or "").casefold()
-            target = by_name.get(key) if key else None
-            if target is None:
-                if not key:
-                    anonymous_entries.append(entry)
-                    continue
-                target = {"company": company, "recruitment": dict(entry.get("recruitment") or {})}
-                target["recruitment"].setdefault("batch", {})
-                target["recruitment"].setdefault("shared_details", {})
-                target["recruitment"].setdefault("jobs", [])
-                target["recruitment"].setdefault("events", [])
-                companies.append(target)
-                if key:
-                    by_name[key] = target
-                continue
-            merge_entry(target, entry)
-    if anonymous_entries:
-        if len(companies) == 1:
-            for entry in anonymous_entries:
-                merge_entry(companies[0], entry)
-        else:
-            companies.extend(
-                {"company": dict(entry.get("company") or {}), "recruitment": dict(entry.get("recruitment") or {})}
-                for entry in anonymous_entries
-            )
-    reasons = [str(item.get("decision_reason") or "").strip() for item in recruitment]
-    return {"is_recruitment": True, "decision_reason": "；".join(dict.fromkeys(value for value in reasons if value)), "companies": companies}
+    """Keep one model result intact; semantic reconciliation belongs to Codex."""
+    if len(items) != 1:
+        raise ModelOutputFailure("正常分类不允许把多个文本块拼接为一个模型结果")
+    return items[0]
 
 
 def _classify_source(job: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
-    chunks = _split_text(str(message.get("text") or ""))
-    extracted: list[dict[str, Any]] = []
-    for index, chunk in enumerate(chunks, start=1):
-        if not _still_active(job["id"]):
-            return {"is_recruitment": False, "decision_reason": "canceled", "companies": []}
-        if len(chunks) > 1:
-            log_processing(job["id"], "classifying", f"识别长文本分段 {index}/{len(chunks)}", details={"characters": len(chunk)})
-        part = {**message, "text": chunk, "metadata": {**(message.get("metadata") or {}), "chunk": index, "chunk_count": len(chunks)}}
+    if not _still_active(job["id"]):
+        return {"is_recruitment": False, "decision_reason": "canceled", "companies": []}
+    full_source = str(message.get("text") or "")
+    part = {**message, "text": full_source}
+    try:
+        result = classify_messages([part], job_id=job["id"])
+    except TypeError as exc:
+        if "job_id" not in str(exc):
+            raise
+        result = classify_messages([part])
+    if not isinstance(result.payload, dict) or "companies" not in result.payload:
+        raise ModelOutputFailure("Model response did not contain the required Schema")
+    extracted = normalize_recruitment_payload(result.payload)
+    validate_recruitment_payload(extracted)
+    company_count = len(extracted.get("companies") or [])
+    job_count = sum(len((entry.get("recruitment") or {}).get("jobs") or []) for entry in extracted.get("companies") or [])
+    event_count = sum(len((entry.get("recruitment") or {}).get("events") or []) for entry in extracted.get("companies") or [])
+    if extracted.get("is_recruitment") and (company_count > 1 or job_count > 1 or event_count > 1):
+        _stage(job["id"], "consolidating_source", "整条原文存在多个候选实体，交由模型统一复核去重")
+        consolidation_metadata = {
+            **(message.get("metadata") if isinstance(message.get("metadata"), dict) else {}),
+            "message_type": message.get("message_type"),
+            "sent_at": message.get("sent_at"),
+        }
         try:
-            result = classify_messages([part], job_id=job["id"])
+            consolidated = consolidate_recruitment_source(full_source, extracted, consolidation_metadata, job["id"])
         except TypeError as exc:
             if "job_id" not in str(exc):
                 raise
-            result = classify_messages([part])
-        if not isinstance(result.payload, dict) or "companies" not in result.payload:
-            raise ValueError(f"Model response did not contain the required Schema for chunk {index}")
-        extracted.append(result.payload)
-    merged = normalize_recruitment_payload(_merge_extracted_items(extracted))
-    validate_recruitment_payload(merged)
-    return merged
+            consolidated = consolidate_recruitment_source(full_source, extracted, consolidation_metadata)
+        if not isinstance(consolidated.payload, dict) or "companies" not in consolidated.payload:
+            raise ModelOutputFailure("整源合并结果没有包含要求的 Schema")
+        merged = normalize_recruitment_payload(consolidated.payload)
+        if merged.get("is_recruitment") is False and not merged.get("companies"):
+            raise ModelOutputFailure("初次提取为招聘信息，但整源合并结果变为非招聘且没有企业")
+        validate_recruitment_payload(merged)
+        return merged
+    return extracted
 
 
 def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
@@ -1208,7 +1177,7 @@ def _process_classify(job: dict[str, Any]) -> dict[str, Any]:
             "warning",
             {"invalid_company_entries": persistence_result["invalid_company_entries"]},
         )
-    if not persistence_result.get("company_ids"):
+    if persistence_result.get("invalid_company_entries") or not persistence_result.get("company_ids"):
         return _mark_classification_needs_review(job, item, persistence_result)
     result = {
         "is_recruitment": True,
@@ -1364,6 +1333,7 @@ def process_one_job(*, prefer_enrichment: bool = False) -> dict[str, Any] | None
     job = _claim_one(prefer_enrichment=prefer_enrichment)
     if not job:
         return None
+    _register_active_job(job["id"])
     log_processing(job["id"], "starting", "任务已开始", details={"kind": job["kind"], "attempt": job["attempts"]})
     try:
         if job["kind"] == "classify":
@@ -1377,6 +1347,8 @@ def process_one_job(*, prefer_enrichment: bool = False) -> dict[str, Any] | None
         raise RuntimeError(f"Unknown processing job kind: {job['kind']}")
     except Exception as exc:
         return _fail(job, exc)
+    finally:
+        _unregister_active_job(job["id"])
 
 
 def process_one_batch(limit: int = 1, *, prefer_enrichment: bool = False) -> dict[str, Any] | None:

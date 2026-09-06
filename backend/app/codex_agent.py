@@ -61,12 +61,35 @@ def _release_slot() -> None:
         _condition.notify_all()
 
 
-def cancel_codex_job(job_id: str) -> bool:
+def cancel_codex_job(job_id: str, wait_seconds: float = 5.0) -> bool:
     with _condition:
         process = _processes.get(job_id)
     if not process or process.poll() is not None:
         return False
     process.terminate()
+    force_terminated = False
+    try:
+        process.wait(timeout=max(0.1, wait_seconds))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        force_terminated = True
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    if force_terminated:
+        try:
+            from .processing import log_processing
+
+            log_processing(
+                job_id,
+                "canceling",
+                "显式中断或重试等待超时，已强制终止本地 Codex 进程",
+                "error",
+                {"force_terminated": True, "wait_seconds": wait_seconds},
+            )
+        except Exception:
+            pass
     return True
 
 
@@ -160,12 +183,18 @@ def run_codex_json(
             try:
                 _, stderr = process.communicate(prompt, timeout=max(30, timeout_seconds))
             except subprocess.TimeoutExpired as exc:
-                process.terminate()
+                timeout_error = f"Local Codex timed out after {timeout_seconds} seconds"
                 try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                raise TimeoutError(f"Local Codex timed out after {timeout_seconds} seconds") from exc
+                    from .processing import mark_processing_timeout
+
+                    mark_processing_timeout(job_id, timeout_error)
+                except Exception:
+                    # The task remains governed by the process result even if
+                    # the status update cannot be written from this thread.
+                    pass
+                # Do not terminate here.  An explicit API interrupt/retry can
+                # terminate this same process through cancel_codex_job().
+                _, stderr = process.communicate()
             finally:
                 with _condition:
                     _processes.pop(job_id, None)

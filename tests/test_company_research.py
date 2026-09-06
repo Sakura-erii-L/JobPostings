@@ -30,7 +30,7 @@ def test_model_company_tags_keep_taxonomy_labels_and_allow_supported_attributes(
     }
 
 
-def test_company_names_stay_independent_but_same_company_jobs_are_merged(tmp_path, monkeypatch):
+def test_company_names_reuse_exact_legal_identity_and_keep_batches(tmp_path, monkeypatch):
     configure_test_db(tmp_path, monkeypatch)
     apply_model_item(
         {
@@ -94,20 +94,22 @@ def test_company_names_stay_independent_but_same_company_jobs_are_merged(tmp_pat
     )
 
     companies = db.all_rows("SELECT * FROM companies ORDER BY display_name")
-    assert [company["display_name"] for company in companies] == ["合并科技", "合并科技有限公司"]
-    first = next(company for company in companies if company["display_name"] == "合并科技")
-    second = next(company for company in companies if company["display_name"] == "合并科技有限公司")
-    assert "合并科技招聘品牌" not in json.loads(first["aliases_json"])
-    assert "合并科技招聘品牌" in json.loads(second["aliases_json"])
+    assert [company["display_name"] for company in companies] == ["合并科技"]
+    first = companies[0]
+    assert first["legal_name"] == "合并科技有限公司"
+    assert "合并科技招聘品牌" in json.loads(first["aliases_json"])
     tags = json.loads(first["company_tags_json"])
     assert {tag["code"] for tag in tags} >= {"private", "electronics_semiconductor"}
     first_jobs = db.all_rows("SELECT * FROM jobs WHERE company_id=?", (first["id"],))
-    second_jobs = db.all_rows("SELECT * FROM jobs WHERE company_id=?", (second["id"],))
     assert len(first_jobs) == 1
-    assert len(second_jobs) == 1
     assert set(json.loads(first_jobs[0]["locations_json"])) == {"南京", "上海"}
     assert "底层开发" in first_jobs[0]["responsibilities"]
     assert "芯片驱动开发" in first_jobs[0]["responsibilities"]
+    batches = db.all_rows(
+        "SELECT name FROM recruitment_batches WHERE company_id=? ORDER BY name",
+        (first["id"],),
+    )
+    assert [batch["name"] for batch in batches] == ["2027 春招", "2027 校招"]
 
 
 def test_public_research_persists_summary_tags_and_original_sources(tmp_path, monkeypatch):

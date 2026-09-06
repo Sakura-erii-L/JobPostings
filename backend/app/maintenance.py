@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,7 +11,27 @@ from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 from .config import config
-from .catalog import _batch_for, _job_identity_matches, _make_job, _raw_source_text, _store_recruitment_shared_details, deduplicate_company_jobs, event_company_for_title, is_aggregate_job_title, normalize_company_tags, normalize_employment_type, normalize_title, recruitment_event_state
+from .catalog import (
+    _batch_for,
+    _event_identity_text,
+    _event_identity_matches,
+    _event_times_compatible,
+    _job_identity_matches,
+    _make_job,
+    _raw_source_text,
+    _store_recruitment_shared_details,
+    deduplicate_company_jobs,
+    event_company_for_title,
+    is_aggregate_job_title,
+    merge_company_records,
+    merge_event_records_with_payload,
+    merge_job_records_with_payload,
+    normalize_company_tags,
+    normalize_name,
+    normalize_employment_type,
+    normalize_title,
+    recruitment_event_state,
+)
 from .db import connect, utc_now
 from .parsers import extract_event_datetime_candidates, extract_file, extract_recruitment_catalog, extract_recruitment_shared_details, is_file_message, is_major_like_title, is_major_requirement_heading, is_wechat_public_url, normalize_file_filename, normalize_event_datetime, parse_message_time, recover_original_source_url
 
@@ -35,6 +55,7 @@ _RECRUITMENT_TABLES = (
     "company_claims",
     "company_relations",
     "company_merge_rules",
+    "semantic_merge_decisions",
     "recruitment_batches",
     "recruitment_events",
     "companies",
@@ -84,26 +105,26 @@ def _create_safety_backup() -> str:
 def reset_recruitment_data() -> dict[str, Any]:
     """Clear imported recruitment data after creating a recoverable backup."""
     from .codex_agent import cancel_codex_job
+    from .processing import wait_for_processing_job
 
     backup_path = _create_safety_backup()
     now = utc_now()
     with connect() as connection:
-        running_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status='running'").fetchall()]
+        running_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status IN ('running','timeout')").fetchall()]
         connection.execute("UPDATE queue_control SET state='paused',updated_at=? WHERE id=1", (now,))
         connection.execute(
             """UPDATE processing_jobs
                SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,
                    finished_at=?,updated_at=?
-               WHERE status IN ('pending','running','needs_review','paused_quota','failed')""",
+               WHERE status IN ('pending','running','timeout','needs_review','paused_quota','failed')""",
             (now, now),
         )
 
     for job_id in running_ids:
         cancel_codex_job(job_id)
+        wait_for_processing_job(job_id, 10)
 
-    # Let a terminated local process release its handles before deleting rows.
     # The status guard prevents late model results from being persisted.
-    time.sleep(0.2)
 
     deleted: dict[str, int] = {}
     with connect() as connection:
@@ -817,86 +838,338 @@ def repair_tracememo_file_attachments() -> dict[str, Any]:
     return result
 
 
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, str):
+        return []
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _json_object(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _company_semantic_candidate(row: Any) -> dict[str, Any]:
+    secondary = [str(value) for value in _json_list(row["secondary_industries_json"]) if str(value).strip()]
+    primary = str(row["primary_industry"] or "other")
+    return {
+        "id": row["id"],
+        "display_name": str(row["display_name"] or ""),
+        "legal_name": row["legal_name"],
+        "aliases": [str(value) for value in _json_list(row["aliases_json"]) if str(value).strip()],
+        "company_nature": row["company_nature"],
+        "primary_industry": primary,
+        "secondary_industries": secondary,
+        "industry_codes": list(dict.fromkeys([primary, *secondary])),
+        "businesses": _json_list(row["businesses_json"]),
+        "headquarters": row["headquarters"],
+        "founded_at": row["founded_at"],
+        "company_size": row["company_size"],
+        "website": row["website"],
+        "official_channels": _json_list(row["official_channels_json"]),
+        "highlights": _json_list(row["highlights_json"]),
+        "tags": _json_list(row["company_tags_json"]),
+        "relationship": {"type": "", "related_company_name": ""},
+    }
+
+
+def _job_text_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [line.strip() for line in str(value or "").splitlines() if line.strip()]
+
+
+def _job_semantic_candidate(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "title": row["canonical_title"],
+        "department": row["department"],
+        "locations": _json_list(row["locations_json"]),
+        "recruitment_type": row["recruitment_type"] or "unknown",
+        "employment_type": row["employment_type"] or "unknown",
+        "headcount": row["headcount"],
+        "salary": _json_object(row["salary_json"]),
+        "education_requirements": _json_list(row["education_json"]),
+        "major_requirements": _json_list(row["majors_json"]),
+        "experience_requirement": row["experience_requirement"],
+        "responsibilities": _job_text_list(row["responsibilities"]),
+        "requirements": _job_text_list(row["requirements"]),
+        "benefits": _json_list(row["benefits_json"]),
+        "application_methods": _json_list(row["application_methods_json"]),
+        "contacts": _json_list(row["contacts_json"]),
+        "deadline": row["explicit_deadline"],
+    }
+
+
+def _event_semantic_candidate(connection: Any, row: Any) -> dict[str, Any]:
+    job_titles: list[str] = []
+    for job_id in _json_list(row["job_ids_json"]):
+        job = connection.execute("SELECT canonical_title FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job and job["canonical_title"]:
+            job_titles.append(job["canonical_title"])
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "event_type": row["event_type"],
+        "start_at": row["start_at"],
+        "end_at": row["end_at"],
+        "timezone": row["timezone"],
+        "format": row["format"],
+        "city": row["city"],
+        "campus": row["campus"],
+        "location": row["location"],
+        "application_url": row["application_url"],
+        "audience": row["audience"],
+        "notes": row["notes"],
+        "job_titles": list(dict.fromkeys(job_titles)),
+    }
+
+
+def _semantic_fingerprint(entity_type: str, candidates: list[dict[str, Any]]) -> str:
+    encoded = json.dumps({"entity_type": entity_type, "candidates": candidates}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _existing_semantic_decision(entity_type: str, fingerprint: str) -> Any | None:
+    with connect() as connection:
+        return connection.execute(
+            "SELECT * FROM semantic_merge_decisions WHERE entity_type=? AND input_fingerprint=? LIMIT 1",
+            (entity_type, fingerprint),
+        ).fetchone()
+
+
+def _save_semantic_decision(
+    entity_type: str,
+    record_ids: list[str],
+    action: str,
+    reason: str,
+    evidence: list[str],
+    merged: dict[str, Any] | None,
+    fingerprint: str,
+    status: str,
+) -> None:
+    now = utc_now()
+    with connect() as connection:
+        connection.execute(
+            """INSERT OR REPLACE INTO semantic_merge_decisions(
+               id,entity_type,record_ids_json,action,reason,evidence_json,merged_json,input_fingerprint,status,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                str(uuid4()), entity_type, json.dumps(record_ids, ensure_ascii=False), action, reason,
+                json.dumps(evidence, ensure_ascii=False), json.dumps(merged, ensure_ascii=False) if merged is not None else None,
+                fingerprint, status, now, now,
+            ),
+        )
+
+
+def _save_semantic_review(entity_type: str, record_ids: list[str], operation: dict[str, Any], candidates: list[dict[str, Any]], fingerprint: str) -> None:
+    _save_semantic_decision(
+        entity_type, record_ids, "review", str(operation.get("reason") or "需要人工审核"),
+        [str(value) for value in operation.get("evidence") or []], None, fingerprint, "open",
+    )
+    now = utc_now()
+    with connect() as connection:
+        existing_rows = connection.execute(
+            "SELECT id,payload_json FROM review_items WHERE kind='semantic_dedup_review' AND entity_type=? AND entity_id=? AND status='open' ORDER BY created_at,id",
+            (entity_type, record_ids[0] if record_ids else ""),
+        ).fetchall()
+        payload = {"entity_type": entity_type, "record_ids": record_ids, "operation": operation, "candidates": candidates, "input_fingerprint": fingerprint}
+        for existing in existing_rows:
+            try:
+                existing_payload = json.loads(existing["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                existing_payload = {}
+            if [str(value) for value in existing_payload.get("record_ids") or []] == record_ids:
+                connection.execute(
+                    "UPDATE review_items SET payload_json=? WHERE id=?",
+                    (json.dumps(payload, ensure_ascii=False), existing["id"]),
+                )
+                return
+        connection.execute(
+            "INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+            (str(uuid4()), "semantic_dedup_review", entity_type, record_ids[0] if record_ids else None, json.dumps(payload, ensure_ascii=False), now),
+        )
+
+
+def _company_survivor_order(record_ids: list[str]) -> list[str]:
+    with connect() as connection:
+        rows = connection.execute(
+            f"SELECT id,manual_overrides_json,created_at FROM companies WHERE id IN ({','.join('?' for _ in record_ids)})",
+            tuple(record_ids),
+        ).fetchall()
+    def key(row: Any) -> tuple[int, str, str]:
+        overrides = _json_object(row["manual_overrides_json"]) or {}
+        return (0 if overrides else 1, str(row["created_at"] or ""), str(row["id"]))
+    return [row["id"] for row in sorted(rows, key=key)]
+
+
+def _historical_candidate_pairs(entity_type: str) -> list[list[dict[str, Any]]]:
+    with connect() as connection:
+        if entity_type == "company":
+            rows = connection.execute("SELECT * FROM companies ORDER BY created_at,id").fetchall()
+            candidates = [_company_semantic_candidate(row) for row in rows]
+            pairs = []
+            for index, left in enumerate(candidates):
+                left_names = {normalize_name(str(value)) for value in [left["display_name"], left["legal_name"], *left["aliases"]] if value}
+                for right in candidates[index + 1:]:
+                    right_names = {normalize_name(str(value)) for value in [right["display_name"], right["legal_name"], *right["aliases"]] if value}
+                    if left_names.intersection(right_names):
+                        pairs.append([left, right])
+            return pairs
+        if entity_type == "job":
+            rows = connection.execute("SELECT * FROM jobs WHERE status<>'superseded' ORDER BY company_id,created_at,id").fetchall()
+            groups: dict[tuple[str, str, str], list[Any]] = {}
+            for row in rows:
+                groups.setdefault((row["company_id"], row["normalized_title"], row["recruitment_type"]), []).append(row)
+            return [[_job_semantic_candidate(left), _job_semantic_candidate(right)] for group in groups.values() for index, left in enumerate(group) for right in group[index + 1:]]
+        rows = connection.execute("SELECT * FROM recruitment_events ORDER BY company_id,created_at,id").fetchall()
+        groups: dict[tuple[str, str, str], list[Any]] = {}
+        for row in rows:
+            key = (row["company_id"], _event_identity_text(row["event_type"]), _event_identity_text(row["title"], title=True))
+            groups.setdefault(key, []).append(row)
+        return [
+            [_event_semantic_candidate(connection, left), _event_semantic_candidate(connection, right)]
+            for group in groups.values()
+            for index, left in enumerate(group)
+            for right in group[index + 1:]
+            if _event_identity_matches(left, right)
+        ]
+
+
+def _event_pair_has_conflicting_time(record_ids: list[str]) -> bool:
+    with connect() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM recruitment_events WHERE id IN ({','.join('?' for _ in record_ids)})",
+            tuple(record_ids),
+        ).fetchall()
+    return any(not _event_times_compatible(left, right["start_at"], right["end_at"]) for index, left in enumerate(rows) for right in rows[index + 1:])
+
+
+def repair_historical_semantic_duplicates() -> dict[str, int]:
+    """Use Codex decisions for exact candidate pairs and persist each decision."""
+    from .model_provider import deduplicate_entity_candidates
+
+    result = {
+        "semantic_decisions": 0,
+        "semantic_merged": 0,
+        "semantic_kept_separate": 0,
+        "semantic_review": 0,
+    }
+    for entity_type in ("company", "job", "event"):
+        progress = True
+        while progress:
+            progress = False
+            pairs = _historical_candidate_pairs(entity_type)
+            for candidates in pairs:
+                record_ids = [str(item["id"]) for item in candidates]
+                fingerprint = _semantic_fingerprint(entity_type, candidates)
+                existing = _existing_semantic_decision(entity_type, fingerprint)
+                if existing and existing["action"] in {"keep_separate", "merge"}:
+                    continue
+                model_result = deduplicate_entity_candidates(entity_type, candidates, f"historical-{entity_type}-{uuid4()}")
+                operation = dict(model_result.payload)
+                returned_ids = [str(value) for value in operation.get("record_ids") or []]
+                if set(returned_ids) != set(record_ids) or len(returned_ids) != len(set(returned_ids)):
+                    operation = {
+                        "action": "review",
+                        "record_ids": record_ids,
+                        "reason": "模型返回的 record_ids 与候选记录不一致",
+                        "evidence": [],
+                        "merged": None,
+                    }
+                result["semantic_decisions"] += 1
+                action = operation.get("action")
+                if action == "keep_separate":
+                    _save_semantic_decision(entity_type, record_ids, "keep_separate", str(operation.get("reason") or "保留独立记录"), [str(value) for value in operation.get("evidence") or []], None, fingerprint, "active")
+                    result["semantic_kept_separate"] += 1
+                    continue
+                if action != "merge" or not isinstance(operation.get("merged"), dict):
+                    _save_semantic_review(entity_type, record_ids, operation, candidates, fingerprint)
+                    result["semantic_review"] += 1
+                    continue
+                if entity_type == "event" and _event_pair_has_conflicting_time(record_ids):
+                    operation["action"] = "review"
+                    operation["reason"] = "双方都有明确但不同的活动时间，按边界不得合并"
+                    _save_semantic_review(entity_type, record_ids, operation, candidates, fingerprint)
+                    result["semantic_review"] += 1
+                    continue
+                try:
+                    ordered_ids = _company_survivor_order(record_ids) if entity_type == "company" else record_ids
+                    if entity_type == "company":
+                        merge_company_records(ordered_ids, semantic_company=operation["merged"])
+                    elif entity_type == "job":
+                        merge_job_records_with_payload(ordered_ids, operation["merged"])
+                    else:
+                        merge_event_records_with_payload(ordered_ids, operation["merged"])
+                except Exception as exc:
+                    operation["action"] = "review"
+                    operation["reason"] = f"程序执行语义合并时遇到冲突：{exc}"
+                    _save_semantic_review(entity_type, record_ids, operation, candidates, fingerprint)
+                    result["semantic_review"] += 1
+                    continue
+                _save_semantic_decision(entity_type, record_ids, "merge", str(operation.get("reason") or "Codex 判定为同一实体"), [str(value) for value in operation.get("evidence") or []], operation["merged"], fingerprint, "applied")
+                result["semantic_merged"] += 1
+                progress = True
+    return result
+
+
+def _complete_historical_repair(base: dict[str, Any], backup_path: str | None) -> dict[str, Any]:
+    semantic = repair_historical_semantic_duplicates()
+    with connect() as connection:
+        connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", ("historical_catalog_repair_v7", utc_now()))
+    return {**base, "backup_path": backup_path, **semantic}
+
+
 def repair_existing_catalog() -> dict[str, Any]:
-    """Run the one-time historical repair behind a recoverable database backup."""
-    marker = "historical_catalog_repair_v6"
+    """Run legacy migrations followed by the one-time historical semantic repair."""
+    marker = "historical_catalog_repair_v7"
     with connect() as connection:
         if connection.execute("SELECT 1 FROM schema_meta WHERE key=?", (marker,)).fetchone():
-            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "events_reassigned": 0, "jobs_created": 0, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": 0, "major_jobs_migrated": 0, "job_majors_cleared": 0, "shared_details_updated": 0, "jobs_requeued": 0}
+            return {"status": "already_repaired", "backup_path": None, "timeline": {}, "events_reassigned": 0, "jobs_created": 0, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": 0, "major_jobs_migrated": 0, "job_majors_cleared": 0, "shared_details_updated": 0, "jobs_requeued": 0, "semantic_decisions": 0, "semantic_merged": 0, "semantic_kept_separate": 0, "semantic_review": 0}
+        has_legacy_v6 = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v6",)).fetchone())
         has_previous_catalog_repair = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v5",)).fetchone())
         has_major_job_migration = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v4",)).fetchone())
         has_previous_repair = bool(connection.execute("SELECT 1 FROM schema_meta WHERE key=?", ("historical_catalog_repair_v3",)).fetchone())
-        counts = {
-            "events": connection.execute("SELECT COUNT(*) AS count FROM recruitment_events").fetchone()["count"],
-            "jobs": connection.execute("SELECT COUNT(*) AS count FROM jobs").fetchone()["count"],
-            "companies": connection.execute("SELECT COUNT(*) AS count FROM companies").fetchone()["count"],
-        }
+        counts = {"events": connection.execute("SELECT COUNT(*) AS count FROM recruitment_events").fetchone()["count"], "jobs": connection.execute("SELECT COUNT(*) AS count FROM jobs").fetchone()["count"], "companies": connection.execute("SELECT COUNT(*) AS count FROM companies").fetchone()["count"]}
     backup_path = _create_safety_backup() if any(counts.values()) else None
-    if has_previous_catalog_repair:
-        jobs_created = split_existing_job_lists()
-        shared_details_updated = backfill_recruitment_shared_details()
-        major_requirements_updated = backfill_major_requirements()
-        jobs_requeued = requeue_missing_job_sources()
-        with connect() as connection:
-            connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
-        return {
-            "status": "repaired", "backup_path": backup_path, "timeline": {}, "events_reassigned": 0,
-            "jobs_created": jobs_created, "jobs_superseded": 0, "tags_updated": 0,
-            "major_requirements_updated": major_requirements_updated, "major_jobs_migrated": 0,
-            "job_majors_cleared": 0, "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued,
-        }
+    if has_legacy_v6 or has_previous_catalog_repair:
+        jobs_created = 0 if has_legacy_v6 else split_existing_job_lists()
+        shared_details_updated = 0 if has_legacy_v6 else backfill_recruitment_shared_details()
+        major_requirements_updated = 0 if has_legacy_v6 else backfill_major_requirements()
+        jobs_requeued = 0 if has_legacy_v6 else requeue_missing_job_sources()
+        return _complete_historical_repair({"status": "repaired", "timeline": {}, "events_reassigned": 0, "jobs_created": jobs_created, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": major_requirements_updated, "major_jobs_migrated": 0, "job_majors_cleared": 0, "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued}, backup_path)
     if has_major_job_migration:
         jobs_created = split_existing_job_lists()
         shared_details_updated = backfill_recruitment_shared_details()
         major_requirements_updated = backfill_major_requirements()
         jobs_requeued = requeue_missing_job_sources()
-        with connect() as connection:
-            connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
-        return {
-            "status": "repaired",
-            "backup_path": backup_path,
-            "timeline": {},
-            "events_reassigned": 0,
-            "jobs_created": jobs_created,
-            "jobs_superseded": 0,
-            "tags_updated": 0,
-            "major_requirements_updated": major_requirements_updated,
-            "major_jobs_migrated": 0,
-            "job_majors_cleared": 0,
-            "shared_details_updated": shared_details_updated,
-            "jobs_requeued": jobs_requeued,
-        }
+        return _complete_historical_repair({"status": "repaired", "timeline": {}, "events_reassigned": 0, "jobs_created": jobs_created, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": major_requirements_updated, "major_jobs_migrated": 0, "job_majors_cleared": 0, "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued}, backup_path)
     if has_previous_repair:
         jobs_created = split_existing_job_lists()
         shared_details_updated = backfill_recruitment_shared_details()
         major_migration = migrate_major_jobs()
         major_requirements_updated = backfill_major_requirements()
         jobs_requeued = requeue_missing_job_sources()
-        with connect() as connection:
-            connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
-        return {
-            "status": "repaired",
-            "backup_path": backup_path,
-            "timeline": {},
-            "events_reassigned": 0,
-            "jobs_created": jobs_created,
-            "jobs_superseded": 0,
-            "tags_updated": 0,
-            "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"],
-            "major_jobs_migrated": major_migration["jobs_migrated"],
-            "job_majors_cleared": major_migration["job_majors_cleared"],
-            "shared_details_updated": shared_details_updated,
-            "jobs_requeued": jobs_requeued,
-        }
+        return _complete_historical_repair({"status": "repaired", "timeline": {}, "events_reassigned": 0, "jobs_created": jobs_created, "jobs_superseded": 0, "tags_updated": 0, "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"], "major_jobs_migrated": major_migration["jobs_migrated"], "job_majors_cleared": major_migration["job_majors_cleared"], "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued}, backup_path)
     events_reassigned = repair_event_company_assignments()
     jobs_created = split_existing_job_lists()
     shared_details_updated = backfill_recruitment_shared_details()
     major_migration = migrate_major_jobs()
     major_requirements_updated = backfill_major_requirements()
     timeline = repair_timeline_events()
-    jobs_superseded = supersede_duplicate_jobs()
     tags_updated = backfill_company_tags()
     jobs_requeued = requeue_missing_job_sources()
-    with connect() as connection:
-        connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?,?)", (marker, utc_now()))
-    return {"status": "repaired", "backup_path": backup_path, "timeline": timeline, "events_reassigned": events_reassigned, "jobs_created": jobs_created, "jobs_superseded": jobs_superseded, "tags_updated": tags_updated, "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"], "major_jobs_migrated": major_migration["jobs_migrated"], "job_majors_cleared": major_migration["job_majors_cleared"], "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued}
+    return _complete_historical_repair({"status": "repaired", "timeline": timeline, "events_reassigned": events_reassigned, "jobs_created": jobs_created, "jobs_superseded": 0, "tags_updated": tags_updated, "major_requirements_updated": major_requirements_updated + major_migration["major_requirements_updated"], "major_jobs_migrated": major_migration["jobs_migrated"], "job_majors_cleared": major_migration["job_majors_cleared"], "shared_details_updated": shared_details_updated, "jobs_requeued": jobs_requeued}, backup_path)

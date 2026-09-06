@@ -116,6 +116,46 @@ def test_manual_merge_migrates_history_and_deduplicates_jobs(tmp_path, monkeypat
         assert db.one(f"SELECT COUNT(*) AS count FROM {table} WHERE {column}=?", (supplement_id,))["count"] == 0
 
 
+def test_manual_merge_deduplicates_compatible_events_after_a_time_conflict(tmp_path, monkeypatch):
+    configure_test_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(catalog, "_polish_company_merge_content", lambda rows: (None, {"status": "fallback", "reason": "test"}))
+    results = []
+    for index, start_at in enumerate(("2026-09-20T10:00:00+00:00", "2026-09-21T10:00:00+00:00", "2026-09-21T10:00:00+00:00"), start=1):
+        results.append(
+            apply_model_item(
+                {
+                    "is_recruitment": True,
+                    "companies": [{
+                        "company": {"display_name": f"活动企业{index}", "legal_name": f"活动企业{index}有限公司"},
+                        "recruitment": {
+                            "batch": {"name": "2026校园招聘", "year": 2026, "season": "秋季", "recruitment_type": "campus"},
+                            "shared_details": {"locations": [], "salary": None},
+                            "jobs": [],
+                            "events": [{
+                                "title": "同一场宣讲会",
+                                "event_type": "presentation",
+                                "city": "南京",
+                                "campus": "南京校区",
+                                "location": "报告厅",
+                                "start_at": start_at,
+                                "timezone": "Asia/Shanghai",
+                            }],
+                        },
+                    }],
+                },
+                None,
+                "2026-09-06T00:00:00+00:00",
+            )
+        )
+    company_ids = [result["company_ids"][0] for result in results]
+    result = merge_company_records(company_ids)
+    assert result["deduplicated_events"] == 1
+    events = db.all_rows("SELECT id,start_at FROM recruitment_events WHERE company_id=? ORDER BY start_at", (company_ids[0],))
+    assert [event["start_at"] for event in events] == ["2026-09-20T10:00:00+00:00", "2026-09-21T10:00:00+00:00"]
+    assert db.one("SELECT COUNT(*) AS count FROM recruitment_event_evidences WHERE event_id=?", (events[1]["id"],))["count"] == 2
+    assert db.one("SELECT COUNT(*) AS count FROM review_items WHERE kind='event_time_conflict'")["count"] == 1
+
+
 def test_manual_merge_uses_codex_for_content_polish_without_overriding_manual_fields(tmp_path, monkeypatch):
     configure_test_db(tmp_path, monkeypatch)
     primary_id = "company-primary"

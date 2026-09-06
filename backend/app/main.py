@@ -27,7 +27,7 @@ from .company_research import ensure_company_research_jobs
 from .maintenance import repair_event_company_assignments, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from .local_storage import clear_cache, clear_chat_records, delete_local_database_backup, storage_snapshot
 from .parsers import is_file_message, is_image_message, parse_message_time
-from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running
+from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running, wait_for_processing_job
 from .security import SecretVault, hash_password, hash_value, token
 from .tracememo import TraceMemoClient, normalize_group, tracememo_filename, tracememo_inline_media, tracememo_local_media, tracememo_media_references
 from .tracememo_cache import has_cached_group, load_cached_messages, store_messages
@@ -1023,7 +1023,7 @@ def _queue_original_text(current_text: Any, metadata_json: Any) -> str:
 
 @app.get("/api/v1/admin/processing-queue")
 def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
-    allowed_statuses = {"pending", "running", "succeeded", "needs_review", "paused_quota", "failed", "canceled"}
+    allowed_statuses = {"pending", "running", "timeout", "succeeded", "needs_review", "paused_quota", "failed", "canceled"}
     if status and status not in allowed_statuses:
         raise HTTPException(400, f"Unknown processing status: {status}")
     limit = min(max(limit, 1), 200)
@@ -1192,10 +1192,10 @@ def control_processing_queue(body: QueueControlRequest, _: dict[str, Any] = Depe
         running_ids: list[str] = []
         canceled_ids: list[str] = []
         if body.action == "cancel_all":
-            running_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status='running'").fetchall()]
-            canceled_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status IN ('pending','running','needs_review','paused_quota','failed')").fetchall()]
+            running_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status IN ('running','timeout')").fetchall()]
+            canceled_ids = [row["id"] for row in connection.execute("SELECT id FROM processing_jobs WHERE status IN ('pending','running','timeout','needs_review','paused_quota','failed')").fetchall()]
             connection.execute(
-                "UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE status IN ('pending','running','needs_review','paused_quota','failed')",
+                "UPDATE processing_jobs SET status='canceled',stage='canceled',cancel_requested=1,lease_until=NULL,finished_at=?,updated_at=? WHERE status IN ('pending','running','timeout','needs_review','paused_quota','failed')",
                 (utc_now(), utc_now()),
             )
             if canceled_ids:
@@ -1213,7 +1213,9 @@ def control_processing_queue(body: QueueControlRequest, _: dict[str, Any] = Depe
         for job_id in canceled_ids:
             log_processing(job_id, "canceled", "管理员取消了任务", "warning")
         for job_id in running_ids:
-            cancel_codex_job(job_id)
+            terminated = cancel_codex_job(job_id)
+            if not wait_for_processing_job(job_id, 10):
+                log_processing(job_id, "canceled", "管理员取消后任务块未在有界等待内退出", "error", {"force_terminated": terminated})
     return {"state": state, "action": body.action, "canceled": len(canceled_ids) if body.action == "cancel_all" else 0}
 
 
@@ -1227,7 +1229,7 @@ def cancel_processing_jobs(body: QueueBulkRequest, _: dict[str, Any] = Depends(r
             tuple(ids),
         ).fetchall()
         cancellable = [row["id"] for row in rows if row["status"] not in {"succeeded", "canceled"}]
-        running_ids = [row["id"] for row in rows if row["status"] == "running"]
+        running_ids = [row["id"] for row in rows if row["status"] in {"running", "timeout"}]
         if cancellable:
             cancellable_placeholders = ",".join("?" for _ in cancellable)
             connection.execute(
@@ -1247,7 +1249,9 @@ def cancel_processing_jobs(body: QueueBulkRequest, _: dict[str, Any] = Depends(r
     for job_id in cancellable:
         log_processing(job_id, "canceled", "管理员批量取消了任务", "warning")
     for job_id in running_ids:
-        cancel_codex_job(job_id)
+        terminated = cancel_codex_job(job_id)
+        if not wait_for_processing_job(job_id, 10):
+            log_processing(job_id, "canceled", "管理员批量取消后任务块未在有界等待内退出", "error", {"force_terminated": terminated})
     return {"canceled": len(cancellable), "ids": cancellable}
 
 
@@ -1270,7 +1274,9 @@ def cancel_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin
         )
     from .codex_agent import cancel_codex_job
 
-    cancel_codex_job(job_id)
+    terminated = cancel_codex_job(job_id)
+    if not wait_for_processing_job(job_id, 10):
+        log_processing(job_id, "canceled", "管理员取消后任务块未在有界等待内退出", "error", {"force_terminated": terminated})
     log_processing(job_id, "canceled", "管理员取消了任务", "warning")
     return {"id": job_id, "status": "canceled"}
 
@@ -1307,8 +1313,20 @@ def retry_processing_job(job_id: str, _: dict[str, Any] = Depends(require_admin)
     job = one("SELECT id,status FROM processing_jobs WHERE id=?", (job_id,))
     if not job:
         raise HTTPException(404, "Processing job not found")
-    if job["status"] not in {"needs_review", "paused_quota", "failed", "canceled"}:
-        raise HTTPException(409, "Only failed processing jobs can be retried")
+    if job["status"] not in {"needs_review", "paused_quota", "failed", "canceled", "timeout"}:
+        raise HTTPException(409, "Only failed or timed out processing jobs can be retried")
+    if job["status"] == "timeout":
+        with connect() as connection:
+            connection.execute(
+                "UPDATE processing_jobs SET status='canceled',stage='canceling',cancel_requested=1,lease_until=NULL,updated_at=? WHERE id=? AND status='timeout'",
+                (utc_now(), job_id),
+            )
+        from .codex_agent import cancel_codex_job
+
+        terminated = cancel_codex_job(job_id)
+        if not wait_for_processing_job(job_id, 10):
+            log_processing(job_id, "canceling", "超时任务重试前未在有界等待内退出", "error", {"force_terminated": terminated})
+            raise HTTPException(409, "原超时任务仍未退出，暂不能复用任务；请稍后再次重试")
     with connect() as connection:
         connection.execute(
             "UPDATE processing_jobs SET status='pending',stage='queued',attempts=0,cancel_requested=0,lease_until=NULL,next_attempt_at=NULL,processor=NULL,result_json=NULL,started_at=NULL,finished_at=NULL,error=NULL,updated_at=? WHERE id=?",
@@ -1586,7 +1604,7 @@ def artifact_download(artifact_id: str, _: dict[str, Any] = Depends(require_scop
 @app.get("/api/v1/recruitment-events")
 def recruitment_events(company_id: str | None = None, _: dict[str, Any] = Depends(require_scope("catalog:read"))) -> list[dict[str, Any]]:
     params: tuple[Any, ...] = (company_id,) if company_id else ()
-    where = "WHERE e.company_id=?" if company_id else ""
+    where = "WHERE e.company_id=?" if company_id else "WHERE e.start_at IS NOT NULL"
     now = datetime.now(timezone.utc)
     rows = all_rows(
         f"""SELECT e.*,c.display_name AS company_name,b.name AS batch_name

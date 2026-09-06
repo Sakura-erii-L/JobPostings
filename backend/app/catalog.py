@@ -498,6 +498,7 @@ def normalize_company_tags(value: Any, company_nature: Any = None, industries: l
     candidates = value if isinstance(value, list) else []
     result: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
+    seen_attribute_labels: set[str] = set()
 
     def add(category: str, code: str, label: str | None = None) -> None:
         if category == "company_type":
@@ -510,13 +511,19 @@ def normalize_company_tags(value: Any, company_nature: Any = None, industries: l
             resolved_label = INDUSTRY_LABELS[code]
         elif category == "attribute":
             code = re.sub(r"\s+", "_", code)[:80]
-            label = re.sub(r"[\r\n]+", " ", label or code).strip()[:80]
+            label = normalize_text_value(label or code) or ""
+            label = label[:80]
             if not code or not label:
                 return
             resolved_label = label
         else:
             return
         key = (category, code)
+        if category == "attribute":
+            label_key = re.sub(r"\s+", " ", label or resolved_label).strip().casefold()
+            if label_key in seen_attribute_labels:
+                return
+            seen_attribute_labels.add(label_key)
         if key in seen:
             return
         seen.add(key)
@@ -781,6 +788,19 @@ def event_company_for_title(connection: Any, fallback_company_id: str | None, ev
     return fallback_company_id
 
 
+class CompanyIdentityConflict(RuntimeError):
+    """Raised when an incoming company cannot be safely bound to one record."""
+
+
+def _company_names(row: Any) -> set[str]:
+    names = [row["display_name"], row["legal_name"]]
+    try:
+        names.extend(json.loads(row["aliases_json"] or "[]"))
+    except (TypeError, json.JSONDecodeError):
+        pass
+    return {normalize_name(normalize_text_value(value) or "") for value in names if normalize_text_value(value)}
+
+
 def _company_for(connection, company_data: dict[str, Any]) -> str:
     company_data = normalize_company_payload(company_data)
     display_name = company_data.get("display_name") or ""
@@ -788,19 +808,31 @@ def _company_for(connection, company_data: dict[str, Any]) -> str:
     aliases = company_data.get("aliases") or []
     if not display_name:
         display_name = legal_name or f"未识别企业-{uuid4().hex[:8]}"
-    existing = None
+    incoming_names = {
+        normalize_name(normalize_text_value(value) or "")
+        for value in [display_name, legal_name, *aliases]
+        if normalize_text_value(value)
+    }
     matched_company_id = str(company_data.get("matched_company_id") or "").strip()
+    rows = connection.execute("SELECT * FROM companies ORDER BY created_at,id").fetchall()
+    candidates = [row for row in rows if incoming_names.intersection(_company_names(row))]
     if matched_company_id:
-        existing = connection.execute("SELECT * FROM companies WHERE id=?", (matched_company_id,)).fetchone()
-        if existing and normalize_name(str(existing["display_name"] or "")) != normalize_name(display_name):
-            existing = None
+        explicit = next((row for row in rows if row["id"] == matched_company_id), None)
+        if explicit and explicit not in candidates and incoming_names.intersection(_company_names(explicit)):
+            candidates.append(explicit)
+    if len(candidates) > 1:
+        raise CompanyIdentityConflict(
+            f"企业名称与多个现有企业匹配，需要人工审核：{', '.join(str(row['id']) for row in candidates)}"
+        )
+    existing = candidates[0] if candidates else None
+    if existing and legal_name:
+        existing_legal = normalize_name(normalize_text_value(existing["legal_name"]) or "")
+        incoming_legal = normalize_name(legal_name)
+        if existing_legal and existing_legal != incoming_legal:
+            raise CompanyIdentityConflict(
+                f"企业法定名称冲突，需要人工审核：{existing['legal_name']} / {legal_name}"
+            )
     now = utc_now()
-    if not existing:
-        normalized_display_name = normalize_name(display_name)
-        for row in connection.execute("SELECT * FROM companies").fetchall():
-            if normalize_name(str(row["display_name"] or "")) == normalized_display_name:
-                existing = row
-                break
     industries = [x for x in company_data.get("industry_codes", []) if x in INDUSTRIES]
     primary = industries[0] if industries else "other"
     if existing:
@@ -1112,7 +1144,11 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
                 if isinstance(value, str) and value.strip()
             ]))
             company["industry_codes"] = industry_codes
-            company_id = _company_for(connection, company)
+            try:
+                company_id = _company_for(connection, company)
+            except CompanyIdentityConflict as exc:
+                persistence["invalid_company_entries"].append({"index": index, "reason": "identity_conflict", "detail": str(exc)})
+                continue
             if company_id in initial_company_ids:
                 updated_company_ids.add(company_id)
             else:
@@ -1197,20 +1233,19 @@ def _merge_event(
     normalized_event = {**event, "start_at": start_at or "", "end_at": end_at or "", "timezone": timezone_name}
     location = event.get("location") or ""
     title = event.get("title") or event_type
-    existing = connection.execute(
-        "SELECT * FROM recruitment_events WHERE company_id=? AND COALESCE(batch_id,'')=COALESCE(?,'') AND event_type=? AND lower(title)=lower(?) AND COALESCE(start_at,'')=COALESCE(?,'') AND COALESCE(location,'')=COALESCE(?,'') LIMIT 1",
-        (company_id, batch_id, event_type, title, start_at, location),
-    ).fetchone()
+    identity_match = _find_matching_recruitment_event(connection, company_id, event_type, title, event, None, None)
+    existing = _find_matching_recruitment_event(connection, company_id, event_type, title, event, start_at, end_at)
+    time_conflict = bool(identity_match and existing is None and not _event_times_compatible(identity_match, start_at, end_at))
     job_ids = [title_to_job[normalize_title(str(title))] for title in event.get("job_titles") or [] if normalize_title(str(title)) in title_to_job]
     now = utc_now()
     if existing:
         event_id = existing["id"]
         merged_jobs = _merge_list(existing["job_ids_json"], job_ids)
         connection.execute(
-            """UPDATE recruitment_events SET end_at=COALESCE(?,end_at),city=COALESCE(?,city),campus=COALESCE(?,campus),
+            """UPDATE recruitment_events SET batch_id=COALESCE(batch_id,?),start_at=COALESCE(start_at,?),end_at=COALESCE(?,end_at),city=COALESCE(?,city),campus=COALESCE(?,campus),location=COALESCE(?,location),
                application_url=COALESCE(?,application_url),audience=COALESCE(?,audience),notes=COALESCE(?,notes),
                job_ids_json=?,updated_at=? WHERE id=?""",
-            (end_at, event.get("city") or None, event.get("campus") or None,
+            (batch_id, start_at, end_at, event.get("city") or None, event.get("campus") or None, event.get("location") or None,
              event.get("application_url") or None, event.get("audience") or None, event.get("notes") or None,
              json_text(merged_jobs, []), now, event_id),
         )
@@ -1233,7 +1268,193 @@ def _merge_event(
     )
     connection.execute("UPDATE recruitment_event_versions SET is_current=0 WHERE event_id=? AND id NOT IN (SELECT id FROM recruitment_event_versions WHERE event_id=? ORDER BY observed_at DESC LIMIT 1)", (event_id, event_id))
     connection.execute("INSERT OR IGNORE INTO recruitment_event_evidences(event_id,evidence_id) VALUES(?,?)", (event_id, evidence_id))
+    if time_conflict and identity_match:
+        _record_event_time_conflict(connection, identity_match, event_id, normalized_event)
     return event_id
+
+
+def _event_identity_text(value: Any, *, title: bool = False) -> str:
+    cleaned = normalize_text_value(value) or ""
+    return normalize_title(cleaned) if title else cleaned.casefold()
+
+
+def _event_field_value(value: Any, field: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(field)
+    try:
+        return value[field]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _event_location_identity(value: Any) -> tuple[str, str, str]:
+    return tuple(_event_identity_text(_event_field_value(value, field)) for field in ("city", "campus", "location"))
+
+
+def _event_location_compatible(left: Any, right: Any) -> bool:
+    return all(
+        not left_value or not right_value or left_value == right_value
+        for left_value, right_value in zip(_event_location_identity(left), _event_location_identity(right))
+    )
+
+
+def _event_identity_matches(left: Any, right: Any) -> bool:
+    left_company = _event_identity_text(_event_field_value(left, "company_id"))
+    right_company = _event_identity_text(_event_field_value(right, "company_id"))
+    if left_company and right_company and left_company != right_company:
+        return False
+    if _event_identity_text(_event_field_value(left, "event_type")) != _event_identity_text(_event_field_value(right, "event_type")):
+        return False
+    if _event_identity_text(_event_field_value(left, "title"), title=True) != _event_identity_text(_event_field_value(right, "title"), title=True):
+        return False
+    return _event_location_compatible(left, right)
+
+
+def _event_times_compatible(existing: Any, start_at: str | None, end_at: str | None) -> bool:
+    if existing["start_at"] and start_at and normalize_text_value(existing["start_at"]) != normalize_text_value(start_at):
+        return False
+    if existing["end_at"] and end_at and normalize_text_value(existing["end_at"]) != normalize_text_value(end_at):
+        return False
+    return True
+
+
+def _find_matching_recruitment_event(
+    connection: Any,
+    company_id: str,
+    event_type: str,
+    title: str,
+    event: dict[str, Any],
+    start_at: str | None,
+    end_at: str | None,
+) -> Any | None:
+    identity_probe = {"company_id": company_id, **event, "event_type": event_type, "title": title}
+    for row in connection.execute("SELECT * FROM recruitment_events WHERE company_id=? ORDER BY created_at,id", (company_id,)).fetchall():
+        if not _event_identity_matches(row, identity_probe):
+            continue
+        if _event_times_compatible(row, start_at, end_at):
+            return row
+    return None
+
+
+def _event_row_payload(row: Any) -> dict[str, Any]:
+    return {
+        "title": row["title"],
+        "event_type": row["event_type"],
+        "start_at": row["start_at"],
+        "end_at": row["end_at"],
+        "timezone": row["timezone"],
+        "format": row["format"],
+        "city": row["city"],
+        "campus": row["campus"],
+        "location": row["location"],
+        "application_url": row["application_url"],
+        "audience": row["audience"],
+        "notes": row["notes"],
+        "job_titles": [],
+    }
+
+
+def _record_event_time_conflict(connection: Any, existing: Any, incoming_event_id: str, incoming: dict[str, Any]) -> None:
+    existing_review = connection.execute(
+        "SELECT id FROM review_items WHERE kind='event_time_conflict' AND entity_type='recruitment_event' AND entity_id=? AND status='open' LIMIT 1",
+        (incoming_event_id,),
+    ).fetchone()
+    if existing_review:
+        return
+    payload = {
+        "event_id": incoming_event_id,
+        "existing_event_id": existing["id"],
+        "reason": "双方都有明确但不同的活动时间，保留两条 event 等待人工审核",
+        "existing": _event_row_payload(existing),
+        "incoming": incoming,
+    }
+    connection.execute(
+        "INSERT INTO review_items(id,kind,entity_type,entity_id,payload_json,created_at) VALUES(?,?,?,?,?,?)",
+        (str(uuid4()), "event_time_conflict", "recruitment_event", incoming_event_id, json.dumps(payload, ensure_ascii=False), utc_now()),
+    )
+
+
+def _merge_event_records(connection: Any, keep: Any, duplicate: Any) -> None:
+    try:
+        keep_jobs = json.loads(keep["job_ids_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        keep_jobs = []
+    try:
+        duplicate_jobs = json.loads(duplicate["job_ids_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        duplicate_jobs = []
+    merged_jobs = list(dict.fromkeys([*keep_jobs, *duplicate_jobs]))
+    now = utc_now()
+    status = recruitment_event_state(
+        {"start_at": keep["start_at"] or duplicate["start_at"], "end_at": keep["end_at"] or duplicate["end_at"], "timezone": keep["timezone"] or duplicate["timezone"]},
+        _parse_reliable_datetime(now),
+    )
+    connection.execute(
+        """UPDATE recruitment_events SET batch_id=COALESCE(batch_id,?),start_at=COALESCE(start_at,?),end_at=COALESCE(end_at,?),
+           timezone=COALESCE(NULLIF(timezone,''),?),format=COALESCE(NULLIF(format,''),?),city=COALESCE(city,?),campus=COALESCE(campus,?),location=COALESCE(location,?),application_url=COALESCE(application_url,?),
+           audience=COALESCE(audience,?),notes=COALESCE(notes,?),job_ids_json=?,status=?,updated_at=? WHERE id=?""",
+        (duplicate["batch_id"], duplicate["start_at"], duplicate["end_at"], duplicate["timezone"], duplicate["format"], duplicate["city"], duplicate["campus"], duplicate["location"],
+         duplicate["application_url"], duplicate["audience"], duplicate["notes"], json_text(merged_jobs, []), status, now, keep["id"]),
+    )
+    for version in connection.execute("SELECT id,payload_json,observed_at,is_current FROM recruitment_event_versions WHERE event_id=?", (duplicate["id"],)).fetchall():
+        same = connection.execute(
+            "SELECT id FROM recruitment_event_versions WHERE event_id=? AND payload_json=? LIMIT 1",
+            (keep["id"], version["payload_json"]),
+        ).fetchone()
+        if same:
+            connection.execute("DELETE FROM recruitment_event_versions WHERE id=?", (version["id"],))
+        else:
+            connection.execute("UPDATE recruitment_event_versions SET event_id=? WHERE id=?", (keep["id"], version["id"]))
+    for evidence in connection.execute("SELECT evidence_id FROM recruitment_event_evidences WHERE event_id=?", (duplicate["id"],)).fetchall():
+        connection.execute("INSERT OR IGNORE INTO recruitment_event_evidences(event_id,evidence_id) VALUES(?,?)", (keep["id"], evidence["evidence_id"]))
+    connection.execute("DELETE FROM recruitment_event_evidences WHERE event_id=?", (duplicate["id"],))
+    connection.execute("UPDATE recruitment_event_versions SET is_current=0 WHERE event_id=?", (keep["id"],))
+    latest = connection.execute(
+        "SELECT id FROM recruitment_event_versions WHERE event_id=? ORDER BY observed_at DESC,id DESC LIMIT 1",
+        (keep["id"],),
+    ).fetchone()
+    if latest:
+        connection.execute("UPDATE recruitment_event_versions SET is_current=1 WHERE id=?", (latest["id"],))
+    connection.execute("DELETE FROM recruitment_events WHERE id=?", (duplicate["id"],))
+
+
+def deduplicate_company_events(connection: Any, company_id: str) -> int:
+    """Merge only mechanically identical event identities with compatible times."""
+    rows = [dict(row) for row in connection.execute("SELECT * FROM recruitment_events WHERE company_id=? ORDER BY created_at,id", (company_id,)).fetchall()]
+    removed = 0
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        identity_matches = [candidate for candidate in kept if _event_identity_matches(candidate, row)]
+        match = next(
+            (candidate for candidate in identity_matches if _event_times_compatible(candidate, row["start_at"], row["end_at"])),
+            None,
+        )
+        if match is None and not identity_matches:
+            kept.append(row)
+            continue
+        if match is None:
+            current = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (identity_matches[0]["id"],)).fetchone()
+            if current:
+                _record_event_time_conflict(connection, current, row["id"], _event_row_payload(row))
+            kept.append(row)
+            continue
+        current = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (match["id"],)).fetchone()
+        duplicate = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (row["id"],)).fetchone()
+        if current and duplicate:
+            _merge_event_records(connection, current, duplicate)
+            refreshed = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (match["id"],)).fetchone()
+            if refreshed:
+                kept[kept.index(match)] = dict(refreshed)
+            removed += 1
+    return removed
+
+
+def deduplicate_recruitment_events(connection: Any, company_id: str | None = None) -> int:
+    """Deduplicate event records using the same identity helper as normal ingestion."""
+    if company_id:
+        return deduplicate_company_events(connection, company_id)
+    company_ids = [row["company_id"] for row in connection.execute("SELECT DISTINCT company_id FROM recruitment_events ORDER BY company_id").fetchall()]
+    return sum(deduplicate_company_events(connection, value) for value in company_ids)
 
 
 def _merge_text(old_value: Any, new_value: Any) -> str | None:
@@ -1394,6 +1615,140 @@ def deduplicate_company_jobs(connection: Any, company_id: str) -> int:
     return removed
 
 
+def _apply_semantic_job_payload(connection: Any, job_id: str, payload: dict[str, Any]) -> None:
+    job = _normalize_job_payload(payload)
+    current = connection.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+    title = job.get("title") or "未命名岗位"
+    recruitment_type = str(job.get("recruitment_type") or "unknown")
+    if recruitment_type not in RECRUITMENT_TYPES:
+        recruitment_type = "unknown"
+    employment_type = normalize_employment_type(job.get("employment_type"))
+    explicit_deadline = normalize_text_value(job.get("deadline") or job.get("explicit_deadline"))
+    responsibilities = job.get("responsibilities")
+    if isinstance(responsibilities, list):
+        responsibilities = "\n".join(normalize_text_list(responsibilities, preserve_newlines=True)) or None
+    requirements = job.get("requirements")
+    if isinstance(requirements, list):
+        requirements = "\n".join(normalize_text_list(requirements, preserve_newlines=True)) or None
+    connection.execute(
+        """UPDATE jobs SET canonical_title=?,normalized_title=?,department=?,locations_json=?,recruitment_type=?,employment_type=?,
+           headcount=?,education_json=?,majors_json=?,experience_requirement=?,salary_json=?,responsibilities=?,requirements=?,
+           benefits_json=?,application_methods_json=?,contacts_json=?,explicit_deadline=?,status=?,updated_at=? WHERE id=?""",
+        (
+            title, normalize_title(title), job.get("department"), json_text(normalize_text_list(job.get("locations")), []),
+            recruitment_type, employment_type, job.get("headcount"), json_text(normalize_text_list(job.get("education")), []),
+            json_text(normalize_text_list(job.get("majors")), []), job.get("experience_requirement"), json_text(job.get("salary"), {}),
+            responsibilities, requirements, json_text(normalize_text_list(job.get("benefits"), preserve_newlines=True), []),
+            json_text(normalize_text_list(job.get("application_methods")), []), json_text(normalize_text_list(job.get("contacts"), preserve_newlines=True), []),
+            explicit_deadline,
+            "expired" if explicit_deadline and _deadline_is_expired(explicit_deadline) else (current["status"] if current and not explicit_deadline else "active"),
+            utc_now(), job_id,
+        ),
+    )
+    encoded = json.dumps({**job, "deadline": explicit_deadline or ""}, ensure_ascii=False, sort_keys=True)
+    content_hash = hashlib.sha256(encoded.encode()).hexdigest()
+    connection.execute(
+        "INSERT OR IGNORE INTO job_versions(id,job_id,raw_json,content_hash,observed_at,is_current) VALUES(?,?,?,?,?,1)",
+        (str(uuid4()), job_id, encoded, content_hash, utc_now()),
+    )
+    connection.execute("UPDATE job_versions SET is_current=CASE WHEN content_hash=? THEN 1 ELSE 0 END WHERE job_id=?", (content_hash, job_id))
+    connection.execute("DELETE FROM search_index WHERE entity_type='job' AND entity_id=?", (job_id,))
+    connection.execute(
+        "INSERT INTO search_index(entity_type,entity_id,title,body) VALUES('job',?,?,?)",
+        (job_id, title, f"{title} {requirements or ''} {responsibilities or ''}".strip()),
+    )
+
+
+def merge_job_records_with_payload(job_ids: list[str], payload: dict[str, Any]) -> dict[str, Any]:
+    ids = list(dict.fromkeys(str(value).strip() for value in job_ids if str(value).strip()))
+    if len(ids) < 2:
+        raise CompanyManagementValidationError("岗位语义合并至少需要两个记录")
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = _management_job_rows(connection, ids)
+        if len({row["company_id"] for row in rows}) != 1:
+            raise CompanyManagementConflict("岗位不属于同一企业，不能语义合并")
+        keep = rows[0]
+        for duplicate in rows[1:]:
+            current_keep = connection.execute("SELECT * FROM jobs WHERE id=?", (keep["id"],)).fetchone()
+            current_duplicate = connection.execute("SELECT * FROM jobs WHERE id=?", (duplicate["id"],)).fetchone()
+            if current_keep and current_duplicate:
+                _merge_job_into(connection, current_keep, current_duplicate)
+                keep = connection.execute("SELECT * FROM jobs WHERE id=?", (keep["id"],)).fetchone()
+        _apply_semantic_job_payload(connection, keep["id"], payload)
+        return {"status": "merged", "primary_job_id": keep["id"], "merged_job_ids": ids[1:]}
+
+
+def _apply_semantic_event_payload(connection: Any, event_id: str, payload: dict[str, Any]) -> None:
+    event = _normalize_event_payload(payload)
+    current = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (event_id,)).fetchone()
+    if not current:
+        return
+    timezone_name = event.get("timezone") or current["timezone"] or "Asia/Shanghai"
+    start_at = normalize_event_datetime(event.get("start_at"), timezone_name, utc_now()) or current["start_at"]
+    end_at = normalize_event_datetime(event.get("end_at"), timezone_name, utc_now()) or current["end_at"]
+    if not _event_times_compatible(current, start_at, end_at):
+        raise CompanyManagementConflict("活动明确时间冲突，不能语义合并")
+    try:
+        job_ids = json.loads(current["job_ids_json"] or "[]")
+    except (TypeError, json.JSONDecodeError):
+        job_ids = []
+    normalized_job_titles = {normalize_title(str(value)) for value in event.get("job_titles") or [] if normalize_title(str(value))}
+    if normalized_job_titles:
+        for job in connection.execute("SELECT id,canonical_title FROM jobs WHERE company_id=?", (current["company_id"],)).fetchall():
+            if normalize_title(str(job["canonical_title"] or "")) in normalized_job_titles:
+                job_ids.append(job["id"])
+    job_ids = list(dict.fromkeys(str(value) for value in job_ids if str(value).strip()))
+    fields = {
+        "title": event.get("title") or current["title"],
+        "event_type": event.get("event_type") or current["event_type"],
+        "start_at": start_at,
+        "end_at": end_at,
+        "timezone": timezone_name,
+        "format": event.get("format") or current["format"],
+        "city": event.get("city") or current["city"],
+        "campus": event.get("campus") or current["campus"],
+        "location": event.get("location") or current["location"],
+        "application_url": event.get("application_url") or current["application_url"],
+        "audience": event.get("audience") or current["audience"],
+        "notes": event.get("notes") or current["notes"],
+    }
+    connection.execute(
+        "UPDATE recruitment_events SET title=?,event_type=?,start_at=?,end_at=?,timezone=?,format=?,city=?,campus=?,location=?,application_url=?,audience=?,notes=?,job_ids_json=?,updated_at=? WHERE id=?",
+        (*fields.values(), json_text(job_ids, []), utc_now(), event_id),
+    )
+    version_payload = {**event, "start_at": start_at or "", "end_at": end_at or "", "timezone": timezone_name}
+    connection.execute(
+        "INSERT INTO recruitment_event_versions(id,event_id,payload_json,observed_at,is_current) VALUES(?,?,?,?,1)",
+        (str(uuid4()), event_id, json.dumps(version_payload, ensure_ascii=False), utc_now()),
+    )
+    connection.execute("UPDATE recruitment_event_versions SET is_current=0 WHERE event_id=? AND id NOT IN (SELECT id FROM recruitment_event_versions WHERE event_id=? ORDER BY observed_at DESC,id DESC LIMIT 1)", (event_id, event_id))
+
+
+def merge_event_records_with_payload(event_ids: list[str], payload: dict[str, Any]) -> dict[str, Any]:
+    ids = list(dict.fromkeys(str(value).strip() for value in event_ids if str(value).strip()))
+    if len(ids) < 2:
+        raise CompanyManagementValidationError("活动语义合并至少需要两个记录")
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = _management_event_rows(connection, ids)
+        first = rows[0]
+        if len({row["company_id"] for row in rows}) != 1 or any(not _event_identity_matches(first, row) for row in rows[1:]):
+            raise CompanyManagementConflict("活动身份字段不一致，不能语义合并")
+        keep = rows[0]
+        for duplicate in rows[1:]:
+            current_keep = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (keep["id"],)).fetchone()
+            current_duplicate = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (duplicate["id"],)).fetchone()
+            if not current_keep or not current_duplicate:
+                continue
+            if not _event_times_compatible(current_keep, current_duplicate["start_at"], current_duplicate["end_at"]):
+                raise CompanyManagementConflict("活动明确时间冲突，不能语义合并")
+            _merge_event_records(connection, current_keep, current_duplicate)
+            keep = connection.execute("SELECT * FROM recruitment_events WHERE id=?", (keep["id"],)).fetchone()
+        _apply_semantic_event_payload(connection, keep["id"], payload)
+        return {"status": "merged", "primary_event_id": keep["id"], "merged_event_ids": ids[1:]}
+
+
 class CompanyManagementValidationError(ValueError):
     """Raised when a manual company operation has invalid input."""
 
@@ -1441,6 +1796,26 @@ def _management_company_rows(connection: Any, company_ids: list[str]) -> list[An
     if missing:
         raise CompanyManagementNotFound(f"企业不存在：{', '.join(missing)}")
     return [by_id[company_id] for company_id in company_ids]
+
+
+def _management_job_rows(connection: Any, job_ids: list[str]) -> list[Any]:
+    placeholders = _management_placeholders(job_ids)
+    rows = connection.execute(f"SELECT * FROM jobs WHERE id IN ({placeholders})", tuple(job_ids)).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    missing = [job_id for job_id in job_ids if job_id not in by_id]
+    if missing:
+        raise CompanyManagementNotFound(f"岗位不存在：{', '.join(missing)}")
+    return [by_id[job_id] for job_id in job_ids]
+
+
+def _management_event_rows(connection: Any, event_ids: list[str]) -> list[Any]:
+    placeholders = _management_placeholders(event_ids)
+    rows = connection.execute(f"SELECT * FROM recruitment_events WHERE id IN ({placeholders})", tuple(event_ids)).fetchall()
+    by_id = {row["id"]: row for row in rows}
+    missing = [event_id for event_id in event_ids if event_id not in by_id]
+    if missing:
+        raise CompanyManagementNotFound(f"活动不存在：{', '.join(missing)}")
+    return [by_id[event_id] for event_id in event_ids]
 
 
 def _management_json_array(row: Any, field: str, overrides: dict[str, Any] | None = None) -> list[Any]:
@@ -1556,6 +1931,9 @@ def _merge_company_profile(
     supplements: list[Any],
     now: str,
     content_polish: dict[str, Any] | None = None,
+    version_decision: str = "manual_merge",
+    version_reason: str = "管理员手动合并企业",
+    version_processor: str = "admin:manual",
 ) -> None:
     primary_overrides = company_overrides(primary["manual_overrides_json"])
     supplement_overrides = [company_overrides(row["manual_overrides_json"]) for row in supplements]
@@ -1638,9 +2016,44 @@ def _merge_company_profile(
         "INSERT INTO company_versions(id,company_id,profile_json,decision,reason,processor,created_at) VALUES(?,?,?,?,?,?,?)",
         (
             str(uuid4()), primary["id"], json.dumps(profile, ensure_ascii=False),
-            "manual_merge", "管理员手动合并企业", "admin:manual", now,
+            version_decision, version_reason, version_processor, now,
         ),
     )
+
+
+def _apply_semantic_company_payload(connection: Any, primary: Any, payload: dict[str, Any], now: str) -> None:
+    """Apply one Codex-merged company structure without overriding admin locks."""
+    merged = normalize_company_payload(payload)
+    overrides = company_overrides(primary["manual_overrides_json"])
+    scalar_values = {
+        "display_name": merged.get("display_name"),
+        "legal_name": merged.get("legal_name"),
+        "company_nature": merged.get("company_nature"),
+        "headquarters": merged.get("headquarters"),
+        "founded_at": merged.get("founded_at"),
+        "company_size": merged.get("company_size"),
+        "website": merged.get("website"),
+    }
+    updates: dict[str, Any] = {}
+    for field, value in scalar_values.items():
+        if field not in overrides and _management_non_empty(value):
+            updates[COMPANY_OVERRIDE_COLUMNS[field]] = value
+    industries = [value for value in [merged.get("primary_industry"), *(merged.get("secondary_industries") or []), *(merged.get("industry_codes") or [])] if value in INDUSTRIES]
+    if "primary_industry" not in overrides and industries:
+        updates["primary_industry"] = industries[0]
+    if "secondary_industries" not in overrides and industries:
+        updates["secondary_industries_json"] = json_text(list(dict.fromkeys(industries[1:])), [])
+    for field in ("aliases", "businesses", "highlights", "official_channels"):
+        if field not in overrides and isinstance(merged.get(field), list):
+            updates[COMPANY_OVERRIDE_COLUMNS[field]] = json_text(_management_stable_list(merged[field]), [])
+    if "tags" not in overrides:
+        updates["company_tags_json"] = json_text(normalize_company_tags(merged.get("tags"), merged.get("company_nature"), industries), [])
+    if not updates:
+        return
+    updates["updated_at"] = now
+    assignments = ",".join(f"{column}=?" for column in updates)
+    connection.execute(f"UPDATE companies SET {assignments} WHERE id=?", (*updates.values(), primary["id"]))
+    apply_company_overrides(connection, primary["id"], overrides, now)
 
 
 def _merge_batch_records(connection: Any, keep_id: str, duplicate_id: str, now: str) -> None:
@@ -1783,7 +2196,7 @@ def _management_running_jobs(connection: Any, company_ids: list[str]) -> list[di
     return [
         dict(row)
         for row in connection.execute(
-            f"SELECT id,kind,company_id FROM processing_jobs WHERE status='running' AND company_id IN ({placeholders}) ORDER BY created_at,id",
+            f"SELECT id,kind,company_id FROM processing_jobs WHERE status IN ('running','timeout') AND company_id IN ({placeholders}) ORDER BY created_at,id",
             tuple(company_ids),
         ).fetchall()
     ]
@@ -1956,7 +2369,12 @@ def queue_company_management(company_ids: Any, operation: str) -> dict[str, Any]
         }
 
 
-def merge_company_records(company_ids: Any, *, exclude_processing_job_id: str | None = None) -> dict[str, Any]:
+def merge_company_records(
+    company_ids: Any,
+    *,
+    exclude_processing_job_id: str | None = None,
+    semantic_company: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     ids = _management_company_ids(company_ids)
     if len(ids) < 2:
         raise CompanyManagementValidationError("合并至少需要选择两个企业")
@@ -1964,7 +2382,10 @@ def merge_company_records(company_ids: Any, *, exclude_processing_job_id: str | 
         snapshot_rows = [dict(row) for row in _management_company_rows(snapshot_connection, ids)]
         _ensure_company_management_unlocked(snapshot_connection, ids, exclude_processing_job_id)
     snapshot_updated_at = {row["id"]: row["updated_at"] for row in snapshot_rows}
-    content_polish, content_polish_result = _polish_company_merge_content(snapshot_rows)
+    if semantic_company is None:
+        content_polish, content_polish_result = _polish_company_merge_content(snapshot_rows)
+    else:
+        content_polish, content_polish_result = None, {"status": "semantic", "processor": "codex"}
     now = utc_now()
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -1982,7 +2403,18 @@ def merge_company_records(company_ids: Any, *, exclude_processing_job_id: str | 
                 tuple(ids),
             ).fetchall()
         ]
-        _merge_company_profile(connection, rows[0], rows[1:], now, content_polish)
+        _merge_company_profile(
+            connection,
+            rows[0],
+            rows[1:],
+            now,
+            content_polish,
+            version_decision="semantic_merge" if semantic_company is not None else "manual_merge",
+            version_reason="Codex 历史语义合并" if semantic_company is not None else "管理员手动合并企业",
+            version_processor="codex:historical_entity_dedup" if semantic_company is not None else "admin:manual",
+        )
+        if semantic_company is not None:
+            _apply_semantic_company_payload(connection, rows[0], semantic_company, now)
         supplement_placeholders = _management_placeholders(supplement_ids)
         connection.execute(
             f"UPDATE recruitment_batches SET company_id=? WHERE company_id IN ({supplement_placeholders})",
@@ -2038,6 +2470,7 @@ def merge_company_records(company_ids: Any, *, exclude_processing_job_id: str | 
             (primary_id, *supplement_ids),
         )
         deduplicated_jobs = deduplicate_company_jobs(connection, primary_id)
+        deduplicated_events = deduplicate_recruitment_events(connection, primary_id)
         connection.execute(
             f"DELETE FROM search_index WHERE entity_type='company' AND entity_id IN ({supplement_placeholders})",
             tuple(supplement_ids),
@@ -2053,6 +2486,7 @@ def merge_company_records(company_ids: Any, *, exclude_processing_job_id: str | 
             "merged_company_ids": supplement_ids,
             "counts": impact["counts"],
             "deduplicated_jobs": deduplicated_jobs,
+            "deduplicated_events": deduplicated_events,
             "content_polish": content_polish_result,
         }
 

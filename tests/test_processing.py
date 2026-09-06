@@ -239,7 +239,13 @@ def test_valid_company_and_jobs_report_counts(tmp_path, monkeypatch):
         {"title": "算法工程师", "locations": ["南京"], "recruitment_type": "campus", "employment_type": "full_time"},
         {"title": "测试工程师", "locations": ["上海"], "recruitment_type": "campus", "employment_type": "full_time"},
     ]
-    result, _ = _run_classification(tmp_path, monkeypatch, _classification_payload("双岗位科技", jobs))
+    payload = _classification_payload("双岗位科技", jobs)
+
+    def fake_consolidate(source_text, candidates, metadata, job_id=""):
+        return ModelResult(payload=payload, input_tokens=1, output_tokens=1, estimated=True, provider="fake", model="fake")
+
+    monkeypatch.setattr("app.processing.consolidate_recruitment_source", fake_consolidate)
+    result, _ = _run_classification(tmp_path, monkeypatch, payload)
     assert result["status"] == "succeeded"
     assert result["company_count"] == 1
     assert result["job_count"] == 2
@@ -247,28 +253,94 @@ def test_valid_company_and_jobs_report_counts(tmp_path, monkeypatch):
     assert len(result["job_ids"]) == 2
 
 
-def test_long_text_chunks_merge_anonymous_followup_without_needs_review(tmp_path, monkeypatch):
+def test_long_text_is_sent_once_without_split(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
     db.init_db()
-    first = _classification_payload("长文本分块科技", [])
-    second = _classification_payload("", [{"title": "后续算法工程师"}])
-    payloads = [first, second]
+    source = "企业介绍\n\n" + ("第一段内容 " * 7_000) + "\n\n岗位说明\n" + ("后续内容 " * 5_000)
+    payload = _classification_payload("长文本完整来源科技", [{"title": "完整来源算法工程师"}])
     calls = []
 
     def fake_classify(messages, job_id=""):
         calls.append(messages[0]["text"])
-        return ModelResult(payload=payloads[len(calls) - 1], input_tokens=1, output_tokens=1, estimated=True, provider="fake", model="fake")
+        return ModelResult(payload=payload, input_tokens=1, output_tokens=1, estimated=True, provider="fake", model="fake")
 
     monkeypatch.setattr("app.processing.classify_messages", fake_classify)
-    raw_id = ingest_message({"id": "long-source", "type": "text", "text": "企业介绍\n\n" + ("第一段内容 " * 7_000) + "\n\n岗位说明\n" + ("后续内容 " * 5_000)}, "manual", None)
+    raw_id = ingest_message({"id": "long-source", "type": "text", "text": source}, "manual", None)
     assert raw_id
     result = process_one_batch()
     assert result and result["results"][0]["status"] == "succeeded"
-    assert len(calls) == 2
-    assert db.one("SELECT COUNT(*) AS count FROM companies") ["count"] == 1
-    assert db.one("SELECT canonical_title FROM jobs") ["canonical_title"] == "后续算法工程师"
+    stored_source = db.one("SELECT text_content FROM raw_messages WHERE id=?", (raw_id,))["text_content"]
+    assert len(calls) == 1
+    assert calls[0] == stored_source
+    assert len(calls[0]) > 50_000
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 1
+    assert db.one("SELECT canonical_title FROM jobs")["canonical_title"] == "完整来源算法工程师"
     assert db.one("SELECT status FROM processing_jobs WHERE raw_message_id=? AND kind='classify'", (raw_id,))["status"] == "succeeded"
+
+
+def test_source_consolidation_receives_full_source_and_structured_candidates(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    source = "华为技术有限公司招聘信息\n" + ("岗位说明 " * 2_000)
+    candidate = _classification_payload("华为", [{"title": "算法工程师"}])
+    candidate["companies"].append({
+        "company": {"display_name": "华为技术有限公司", "legal_name": "华为技术有限公司", "industry_codes": ["ai_data"]},
+        "recruitment": {
+            "batch": {"name": "2026 暑期实习", "recruitment_type": "internship"},
+            "shared_details": {"locations": [], "salary": None},
+            "jobs": [{"title": "测试工程师"}],
+            "events": [],
+        },
+    })
+    captured: dict[str, object] = {}
+
+    def fake_classify(messages, job_id=""):
+        captured["extract_text"] = messages[0]["text"]
+        return ModelResult(payload=candidate, input_tokens=1, output_tokens=1, estimated=True, provider="fake", model="fake")
+
+    def fake_consolidate(source_text, candidates, metadata, job_id=""):
+        captured["source_text"] = source_text
+        captured["candidates"] = candidates
+        captured["metadata"] = metadata
+        captured["job_id"] = job_id
+        return ModelResult(payload=_classification_payload("华为技术有限公司", [{"title": "算法工程师"}]), input_tokens=1, output_tokens=1, estimated=True, provider="fake", model="fake")
+
+    monkeypatch.setattr("app.processing.classify_messages", fake_classify)
+    monkeypatch.setattr("app.processing.consolidate_recruitment_source", fake_consolidate)
+    raw_id = ingest_message({"id": "source-consolidation", "type": "text", "text": source}, "manual", None)
+    result = process_one_batch()
+
+    assert result and result["results"][0]["status"] == "succeeded"
+    stored_source = db.one("SELECT text_content FROM raw_messages WHERE id=?", (raw_id,))["text_content"]
+    assert captured["extract_text"] == stored_source
+    assert captured["source_text"] == stored_source
+    assert len(captured["candidates"]["companies"]) == 2
+    assert captured["job_id"]
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 1
+    assert db.one("SELECT COUNT(*) AS count FROM jobs")["count"] == 1
+    assert db.one("SELECT status FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["status"] == "succeeded"
+
+
+def test_source_consolidation_false_empty_result_enters_model_failure_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    candidate = _classification_payload("候选企业", [{"title": "算法工程师"}])
+    candidate["companies"].append({
+        "company": {"display_name": "另一个候选企业", "legal_name": None, "industry_codes": ["ai_data"]},
+        "recruitment": {"batch": {"name": "2026 校招", "recruitment_type": "campus"}, "shared_details": {"locations": [], "salary": None}, "jobs": [], "events": []},
+    })
+    monkeypatch.setattr("app.processing.classify_messages", lambda messages, job_id="": ModelResult(candidate, 1, 1, True, "fake", "fake"))
+    monkeypatch.setattr("app.processing.consolidate_recruitment_source", lambda *args, **kwargs: ModelResult(_classification_payload(None, is_recruitment=False), 1, 1, True, "fake", "fake"))
+    raw_id = ingest_message({"id": "source-consolidation-failure", "type": "text", "text": "两个招聘候选"}, "manual", None)
+
+    result = process_one_batch()
+
+    assert result and result["results"][0]["status"] == "retry_wait"
+    assert db.one("SELECT COUNT(*) AS count FROM companies")["count"] == 0
+    assert db.one("SELECT status FROM processing_jobs WHERE raw_message_id=?", (raw_id,))["status"] == "pending"
 
 
 def test_existing_company_is_updated_not_created(tmp_path, monkeypatch):
@@ -748,7 +820,7 @@ def test_image_ocr_uses_local_fallback_only_after_codex_failure(tmp_path, monkey
     assert metadata["local_ocr_errors"] == ["local test error"]
 
 
-def test_timeout_failure_uses_existing_retry_mechanism(tmp_path, monkeypatch):
+def test_timeout_failure_waits_for_manual_action_without_retry(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
     db.init_db()
@@ -758,9 +830,12 @@ def test_timeout_failure_uses_existing_retry_mechanism(tmp_path, monkeypatch):
 
     result = _fail(job, TimeoutError("Local Codex timed out after 600 seconds"))
 
-    assert result["status"] == "retry_wait"
-    assert db.one("SELECT status,stage,error FROM processing_jobs WHERE id=?", (job["id"],))["status"] == "pending"
-    assert db.one("SELECT stage,error FROM processing_jobs WHERE id=?", (job["id"],))["stage"] == "retry_wait"
+    assert result["status"] == "timeout"
+    stored = db.one("SELECT status,stage,error FROM processing_jobs WHERE id=?", (job["id"],))
+    assert stored["status"] == "timeout"
+    assert stored["stage"] == "timeout"
+    assert "timed out" in stored["error"]
+    assert db.one("SELECT recognition_status FROM raw_messages WHERE id=?", (raw_id,))["recognition_status"] == "timeout"
 
 
 def test_enrichment_jobs_are_limited_to_one_running_job_per_kind(tmp_path, monkeypatch):
@@ -862,7 +937,7 @@ def test_classification_prompt_excludes_chat_metadata(tmp_path, monkeypatch):
         "metadata": {"name": "群成员姓名", "senderId": "member-id", "sessionId": "group-id"},
     }])
     prompt = json.loads(captured["messages"][1]["content"])
-    assert prompt["messages"] == [{"message_id": "item_1", "text": "招聘算法工程师", "source_datetime": "2026-09-04T00:00:00+00:00"}]
+    assert prompt["messages"] == [{"message_id": "item_1", "text": "招聘算法工程师", "source_datetime": "2026-09-04T00:00:00+00:00", "message_type": "普通文本"}]
     assert "群成员姓名" not in captured["messages"][1]["content"]
     assert "member-id" not in captured["messages"][1]["content"]
 

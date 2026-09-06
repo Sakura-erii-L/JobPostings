@@ -1,6 +1,9 @@
+import json
+import httpx
 import app.model_provider as model_provider
+import pytest
 from app import db
-from app.model_provider import OpenAICompatibleProvider, _call_processing_engine, _day_start_utc, create_usage_warning_notifications, extract_json, estimate_tokens
+from app.model_provider import OpenAICompatibleProvider, _call_processing_engine, _day_start_utc, consolidate_recruitment_source, create_usage_warning_notifications, extract_json, estimate_tokens
 from app.prompt_templates import render_prompt_template
 
 
@@ -69,6 +72,62 @@ def test_openai_compatible_chat_response(monkeypatch):
     assert result.input_tokens == 7
     assert result.output_tokens == 3
     assert calls[0][0] == "https://api.example.com/v1/chat/completions"
+
+
+def test_openai_compatible_timeout_is_normalized(monkeypatch):
+    def fake_post(url, **kwargs):
+        raise httpx.TimeoutException("upstream timed out")
+
+    monkeypatch.setattr(model_provider.httpx, "post", fake_post)
+    provider = OpenAICompatibleProvider({"base_url": "https://api.example.com/v1", "model": "demo", "timeout_seconds": 3})
+    with pytest.raises(TimeoutError, match="Generic LLM timed out after 3 seconds"):
+        provider.call([], "test")
+
+
+def test_generic_llm_processing_engine_uses_shared_validation(monkeypatch):
+    captured = {}
+
+    def fake_model(messages, task_type):
+        captured.update({"messages": messages, "task_type": task_type})
+        return model_provider.ModelResult({}, 1, 1, True, "generic", "demo")
+
+    monkeypatch.setattr(model_provider, "get_setting", lambda key, default=None: "generic_llm" if key == "processing_engine" else default)
+    monkeypatch.setattr(model_provider, "_call_model", fake_model)
+    result = _call_processing_engine(
+        [{"role": "system", "content": "system"}, {"role": "user", "content": "user"}],
+        "test",
+        {"type": "object", "required": [], "properties": {}, "additionalProperties": False},
+        job_id="job-generic",
+    )
+
+    assert result.payload == {}
+    assert result.provider == "generic"
+    assert captured["task_type"] == "test"
+    assert captured["messages"][0]["role"] == "system"
+
+
+def test_source_consolidation_sends_complete_source_and_safe_metadata(monkeypatch):
+    captured = {}
+
+    def fake_model(messages, task_type):
+        captured.update({"messages": messages, "task_type": task_type})
+        return model_provider.ModelResult({"is_recruitment": False, "decision_reason": "非招聘", "companies": []}, 1, 1, True, "generic", "demo")
+
+    monkeypatch.setattr(model_provider, "get_setting", lambda key, default=None: "generic_llm" if key == "processing_engine" else default)
+    monkeypatch.setattr(model_provider, "_call_model", fake_model)
+    source = "完整原文\n" + ("招聘正文 " * 100)
+    consolidate_recruitment_source(
+        source,
+        {"is_recruitment": True, "companies": [{"company": {"display_name": "候选企业"}}]},
+        {"title": "招聘汇总", "source_url": "https://example.com/source", "senderId": "must-not-leak"},
+        "job-consolidate",
+    )
+
+    prompt = json.loads(captured["messages"][1]["content"])
+    assert captured["task_type"] == "recruitment_source_consolidation"
+    assert prompt["source_text"] == source
+    assert prompt["structured_candidates"]["companies"][0]["company"]["display_name"] == "候选企业"
+    assert prompt["source_metadata"] == {"title": "招聘汇总", "source_url": "https://example.com/source"}
 
 
 def test_codex_processing_engine_uses_template_and_only_sends_runtime_messages(monkeypatch):
