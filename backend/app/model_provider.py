@@ -24,6 +24,9 @@ class ModelResult:
     model: str
 
 
+USAGE_WARNING_LEVELS = (80, 85, 90, 95, 100)
+
+
 def get_setting(key: str, default: Any = None) -> Any:
     row = one("SELECT value_json FROM system_settings WHERE key=?", (key,))
     if not row:
@@ -141,23 +144,67 @@ def _check_budget(input_tokens: int) -> None:
         raise RuntimeError("LLM output budget reached; task paused")
 
 
+def _usage_percent(used: int, limit: int) -> float:
+    if limit <= 0:
+        return 100.0
+    return min(100.0, used * 100 / limit)
+
+
+def create_usage_warning_notifications() -> int:
+    input_used, output_used = _usage_today()
+    input_limit = int(get_setting("llm_input_budget", 1_000_000))
+    output_limit = int(get_setting("llm_output_budget", 200_000))
+    usage_percent = max(_usage_percent(input_used, input_limit), _usage_percent(output_used, output_limit))
+    try:
+        warning_start = max(80, min(100, int(get_setting("llm_budget_warning_percent", 80))))
+    except (TypeError, ValueError):
+        warning_start = 80
+    levels = [level for level in USAGE_WARNING_LEVELS if level >= warning_start and usage_percent >= level]
+    if not levels:
+        return 0
+
+    day_start = _day_start_utc()
+    created = 0
+    with connect() as connection:
+        admins = connection.execute("SELECT id FROM users WHERE role='admin' AND active=1").fetchall()
+        for admin in admins:
+            snoozed = connection.execute(
+                "SELECT id FROM notifications WHERE user_id=? AND kind='usage_warning_snooze' AND created_at>=? LIMIT 1",
+                (admin["id"], day_start),
+            ).fetchone()
+            if snoozed:
+                continue
+            for level in levels:
+                kind = f"usage_warning_{level}"
+                kinds = ("usage_warning", kind) if level == 80 else (kind,)
+                placeholders = ",".join("?" for _ in kinds)
+                exists = connection.execute(
+                    f"SELECT id FROM notifications WHERE user_id=? AND created_at>=? AND kind IN ({placeholders}) LIMIT 1",
+                    (admin["id"], day_start, *kinds),
+                ).fetchone()
+                if exists:
+                    continue
+                connection.execute(
+                    "INSERT INTO notifications(id,user_id,kind,title,body,created_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        str(uuid4()),
+                        admin["id"],
+                        kind,
+                        f"模型额度已达到 {level}%",
+                        f"今日输入 {input_used}/{input_limit}，输出 {output_used}/{output_limit}，当前最高使用率约 {usage_percent:.1f}%。",
+                        utc_now(),
+                    ),
+                )
+                created += 1
+    return created
+
+
 def record_model_usage(result: ModelResult, task_type: str) -> None:
     with connect() as connection:
         connection.execute(
             "INSERT INTO llm_calls(id,provider_name,model_name,task_type,input_tokens,output_tokens,estimated,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (str(__import__("uuid").uuid4()), result.provider, result.model, task_type, result.input_tokens, result.output_tokens, int(result.estimated), "succeeded", utc_now()),
+            (str(uuid4()), result.provider, result.model, task_type, result.input_tokens, result.output_tokens, int(result.estimated), "succeeded", utc_now()),
         )
-        input_used, output_used = _usage_today()
-        input_limit = int(get_setting("llm_input_budget", 1_000_000))
-        output_limit = int(get_setting("llm_output_budget", 200_000))
-        warning_percent = int(get_setting("llm_budget_warning_percent", 80))
-        if input_used >= input_limit * warning_percent / 100 or output_used >= output_limit * warning_percent / 100:
-            admins = connection.execute("SELECT id FROM users WHERE role='admin' AND active=1").fetchall()
-            day_key = datetime.now().strftime("%Y-%m-%d")
-            for admin in admins:
-                exists = connection.execute("SELECT id FROM notifications WHERE user_id=? AND kind='usage_warning' AND created_at LIKE ?", (admin["id"], day_key + "%")).fetchone()
-                if not exists:
-                    connection.execute("INSERT INTO notifications(id,user_id,kind,title,body,created_at) VALUES(?,?,?,?,?,?)", (str(__import__("uuid").uuid4()), admin["id"], "usage_warning", "模型额度已达到 80%", f"今日输入 {input_used}/{input_limit}，输出 {output_used}/{output_limit}。", utc_now()))
 
 
 def _call_model(messages: list[dict[str, Any]], task_type: str) -> ModelResult:

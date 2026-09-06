@@ -1,5 +1,6 @@
 import app.model_provider as model_provider
-from app.model_provider import OpenAICompatibleProvider, _call_processing_engine, _day_start_utc, extract_json, estimate_tokens
+from app import db
+from app.model_provider import OpenAICompatibleProvider, _call_processing_engine, _day_start_utc, create_usage_warning_notifications, extract_json, estimate_tokens
 from app.prompt_templates import render_prompt_template
 
 
@@ -11,6 +12,41 @@ def test_model_json_extraction():
 def test_day_start_utc_uses_shanghai_timezone():
     value = _day_start_utc()
     assert value.endswith("T16:00:00+00:00")
+
+
+def test_usage_warning_notifications_follow_levels_and_respect_daily_snooze(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    now = db.utc_now()
+    with db.connect() as connection:
+        connection.execute("INSERT INTO users(id,email,role,active,created_at) VALUES(?,?,?,?,?)", ("admin-1", "one@example.com", "admin", 1, now))
+        connection.execute("INSERT INTO users(id,email,role,active,created_at) VALUES(?,?,?,?,?)", ("admin-2", "two@example.com", "admin", 1, now))
+        connection.execute("UPDATE system_settings SET value_json=? WHERE key='llm_input_budget'", ("100",))
+        connection.execute("UPDATE system_settings SET value_json=? WHERE key='llm_output_budget'", ("100000",))
+        connection.execute(
+            "INSERT INTO notifications(id,user_id,kind,title,body,created_at) VALUES(?,?,?,?,?,?)",
+            ("snooze-1", "admin-2", "usage_warning_snooze", "今日不再提醒", "usage_warning", now),
+        )
+        connection.execute(
+            "INSERT INTO llm_calls(id,provider_name,model_name,task_type,input_tokens,output_tokens,estimated,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("call-1", "test", "test", "test", 80, 0, 1, "succeeded", now),
+        )
+
+    assert create_usage_warning_notifications() == 1
+    for level in (85, 90, 95, 100):
+        with db.connect() as connection:
+            connection.execute("UPDATE llm_calls SET input_tokens=? WHERE id='call-1'", (level,))
+        assert create_usage_warning_notifications() == 1
+
+    rows = db.all_rows("SELECT user_id,title FROM notifications WHERE kind LIKE 'usage_warning_%' AND kind<>'usage_warning_snooze' ORDER BY title")
+    assert [(row["user_id"], row["title"]) for row in rows] == [
+        ("admin-1", "模型额度已达到 100%"),
+        ("admin-1", "模型额度已达到 80%"),
+        ("admin-1", "模型额度已达到 85%"),
+        ("admin-1", "模型额度已达到 90%"),
+        ("admin-1", "模型额度已达到 95%"),
+    ]
 
 
 def test_openai_compatible_chat_response(monkeypatch):

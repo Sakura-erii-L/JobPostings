@@ -231,6 +231,17 @@ async def notification_loop() -> None:
         await asyncio.sleep(3600)
 
 
+async def usage_warning_loop() -> None:
+    while True:
+        try:
+            from .model_provider import create_usage_warning_notifications
+
+            await asyncio.to_thread(create_usage_warning_notifications)
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
 async def auto_backup_loop() -> None:
     last_run_day = ""
     while True:
@@ -621,7 +632,8 @@ async def lifespan(app: FastAPI):
     task3 = asyncio.create_task(auto_sync_loop())
     task4 = asyncio.create_task(notification_loop())
     task5 = asyncio.create_task(auto_backup_loop())
-    background_tasks.update({task1, task2, task3, task4, task5})
+    task6 = asyncio.create_task(usage_warning_loop())
+    background_tasks.update({task1, task2, task3, task4, task5, task6})
     yield
     for task in background_tasks:
         task.cancel()
@@ -1504,12 +1516,37 @@ def timeline(user: dict[str, Any] = Depends(require_scope("application:read"))) 
 
 @app.get("/api/v1/notifications")
 def notifications(user: dict[str, Any] = Depends(require_user)) -> list[dict[str, Any]]:
-    return [dict(row) for row in all_rows("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100", (user["id"],))]
+    return [dict(row) for row in all_rows("SELECT * FROM notifications WHERE user_id=? AND kind<>'usage_warning_snooze' ORDER BY created_at DESC LIMIT 100", (user["id"],))]
 
 
 @app.post("/api/v1/notifications/{notification_id}/read")
 def mark_notification_read(notification_id: str, user: dict[str, Any] = Depends(require_user)) -> dict[str, bool]:
     with connect() as connection:
+        connection.execute("UPDATE notifications SET read_at=? WHERE id=? AND user_id=?", (utc_now(), notification_id, user["id"]))
+    return {"ok": True}
+
+
+@app.post("/api/v1/notifications/{notification_id}/snooze-day")
+def snooze_notification_for_day(notification_id: str, user: dict[str, Any] = Depends(require_user)) -> dict[str, bool]:
+    from .model_provider import _day_start_utc
+
+    day_start = _day_start_utc()
+    with connect() as connection:
+        notification = connection.execute(
+            "SELECT kind FROM notifications WHERE id=? AND user_id=?",
+            (notification_id, user["id"]),
+        ).fetchone()
+        if not notification or notification["kind"] == "usage_warning_snooze" or not str(notification["kind"]).startswith("usage_warning"):
+            raise HTTPException(404, "Usage warning notification not found")
+        exists = connection.execute(
+            "SELECT id FROM notifications WHERE user_id=? AND kind='usage_warning_snooze' AND created_at>=? LIMIT 1",
+            (user["id"], day_start),
+        ).fetchone()
+        if not exists:
+            connection.execute(
+                "INSERT INTO notifications(id,user_id,kind,title,body,created_at) VALUES(?,?,?,?,?,?)",
+                (str(uuid4()), user["id"], "usage_warning_snooze", "今日不再提醒", "usage_warning", utc_now()),
+            )
         connection.execute("UPDATE notifications SET read_at=? WHERE id=? AND user_id=?", (utc_now(), notification_id, user["id"]))
     return {"ok": True}
 

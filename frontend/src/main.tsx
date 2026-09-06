@@ -13,7 +13,7 @@ type Application = Job & { state: string; favorite: number; updated_at: string }
 type Evidence = { id: string; source_url?: string; source_type: string; excerpt?: string; artifact_id?: string; artifact_ids?: string[]; qr_values?: string[]; observed_at?: string; raw_text?: string; ocr_text?: string; sender?: string; sent_at?: string; source_group_name?: string; filename?: string; mime_type?: string; metadata?: Record<string, any> }
 type RecruitmentEvent = { id: string; company_id: string; company_name: string; batch_name?: string; title: string; event_type: string; start_at?: string; end_at?: string; timezone: string; format: string; city?: string; campus?: string; location?: string; application_url?: string; audience?: string; notes?: string; job_ids: string[]; evidence_ids: string[]; status: string }
 type CompanyDetail = Company & { aliases: string[]; jobs: Job[]; evidences: Evidence[]; events: RecruitmentEvent[]; recruitment_shared_details?: RecruitmentSharedDetail[]; public_findings?: PublicFinding[] }
-type Notification = { id: string; title: string; body: string; read_at?: string | null }
+type Notification = { id: string; kind?: string; title: string; body: string; read_at?: string | null }
 type Invitation = { id: string; email: string; role: string; expires_at: string; used_at?: string | null; created_at: string }
 type ReviewItem = { id: string; kind: string; entity_type?: string; entity_id?: string; created_at?: string; payload: Record<string, any> }
 type TraceMemoGroup = { id: string; external_id: string; name: string; avatar?: string | null; selected: boolean; enabled?: boolean }
@@ -197,6 +197,10 @@ function App() {
     await api(`/notifications/${id}/read`, { method: 'POST' })
     setNotifications(current => current.map(item => item.id === id ? { ...item, read_at: new Date().toISOString() } : item))
   }
+  const snoozeNotificationForDay = async (id: string) => {
+    await api(`/notifications/${id}/snooze-day`, { method: 'POST' })
+    setNotifications(current => current.filter(item => item.id !== id))
+  }
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -218,7 +222,7 @@ function App() {
     <main className="content">
       {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
       {notice && <div className="notice">{notice}</div>}
-      {!selected && notifications.filter(item => !item.read_at).slice(0, 3).map(item => <div className="notification-strip" key={item.id}><div><strong>{item.title}</strong><span>{item.body}</span></div><button onClick={() => markNotificationRead(item.id)}>知道了</button></div>)}
+      {!selected && notifications.filter(item => !item.read_at).slice(0, 3).map(item => <div className="notification-strip" key={item.id}><div><strong>{item.title}</strong><span>{item.body}</span></div><div className="notification-actions"><button onClick={() => markNotificationRead(item.id)}>知道了</button>{(item.kind === 'usage_warning' || item.kind?.startsWith('usage_warning_')) && <button onClick={() => snoozeNotificationForDay(item.id)}>今日不再提醒</button>}</div></div>)}
       {selected ? <CompanyDetailShell company={selected} onBack={backFromCompany} onState={updateState} onFollow={followCompany} editable={isAdmin} onUpdated={updateCompany} /> : !canViewPage ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => setPage('import') : undefined} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => setPage('import') : undefined} /> : page === 'timeline' ? <TimelinePage events={timeline} onOpenCompany={openCompany} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData(); setPage('queue') }} /> : page === 'admin' ? <AdminPage onNavigate={target => { setPage(target); setSelected(null) }} /> : page === 'queue' ? <QueuePage onSync={sync} syncing={syncing} /> : page === 'security' ? <AccountSecurityPage /> : page === 'review' ? <ReviewPage onResolved={async () => { await loadData() }} /> : <SettingsPage onSaved={flash} onSync={sync} syncing={syncing} />}
     </main>
   </div>

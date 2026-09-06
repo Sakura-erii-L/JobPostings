@@ -5,6 +5,25 @@ from app import db
 from app.main import app
 
 
+def test_usage_warning_can_be_snoozed_for_the_day(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("127.0.0.1", 50012)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        user_id = db.one("SELECT id FROM users WHERE email=?", ("admin@example.com",))["id"]
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO notifications(id,user_id,kind,title,body,created_at) VALUES(?,?,?,?,?,?)",
+                ("usage-80", user_id, "usage_warning_80", "模型额度已达到 80%", "测试提醒", db.utc_now()),
+            )
+        response = client.post("/api/v1/notifications/usage-80/snooze-day")
+        assert response.status_code == 200
+        assert db.one("SELECT read_at FROM notifications WHERE id='usage-80'")["read_at"]
+        assert db.one("SELECT id FROM notifications WHERE user_id=? AND kind='usage_warning_snooze'", (user_id,))
+
+
 def test_bootstrap_import_and_query(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
