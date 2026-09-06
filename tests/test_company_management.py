@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app import catalog, db
-from app.catalog import CompanyManagementConflict, apply_model_item, company_management_impact, delete_company_records, merge_company_records, recruitment_event_state
+from app.catalog import CompanyManagementConflict, apply_model_item, company_management_impact, delete_company_records, merge_company_records, queue_company_management, recruitment_event_state
 from app.main import app, recruitment_events
 from app.model_provider import ModelResult
+from app.processing import process_one_job
 
 
 def configure_test_db(tmp_path, monkeypatch):
@@ -195,6 +196,33 @@ def test_company_management_blocks_running_task_and_delete_cleans_references(tmp
     assert db.one("SELECT COUNT(*) AS count FROM review_items WHERE id IN ('processing-review','raw-review')")["count"] == 0
 
 
+def test_company_management_queues_independent_operations_and_worker_executes_them(tmp_path, monkeypatch):
+    configure_test_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(catalog, "_polish_company_merge_content", lambda rows: (None, {"status": "fallback", "reason": "test"}))
+    first = apply_model_item(_company_payload("队列主企业", "队列主企业有限公司", summary="主摘要", website="https://queue-primary.example", event_title="主宣讲会"), None, "2026-09-06T00:00:00+00:00")
+    second = apply_model_item(_company_payload("队列补充企业", "队列补充企业有限公司", summary="补充摘要", website="https://queue-supplement.example", event_title="补充宣讲会"), None, "2026-09-06T00:00:00+00:00")
+    third = apply_model_item(_company_payload("队列删除企业", "队列删除企业有限公司", summary="删除摘要", website="https://queue-delete.example", event_title="删除宣讲会"), None, "2026-09-06T00:00:00+00:00")
+    primary_id, supplement_id = first["company_ids"][0], second["company_ids"][0]
+    delete_id = third["company_ids"][0]
+
+    queued_merge = queue_company_management([primary_id, supplement_id], "merge")
+    queued_delete = queue_company_management([delete_id], "delete")
+    assert queued_merge["status"] == "queued"
+    assert queued_delete["status"] == "queued"
+    assert db.one("SELECT status,stage FROM processing_jobs WHERE id=?", (queued_merge["job_id"],))["stage"] == "merge_queued"
+    assert json.loads(db.one("SELECT payload_json FROM processing_jobs WHERE id=?", (queued_merge["job_id"],))["payload_json"])["company_names"] == ["队列主企业", "队列补充企业"]
+
+    merged = process_one_job(prefer_enrichment=True)
+    assert merged and merged["status"] == "succeeded"
+    assert db.one("SELECT status FROM processing_jobs WHERE id=?", (queued_merge["job_id"],))["status"] == "succeeded"
+    assert db.one("SELECT id FROM companies WHERE id=?", (supplement_id,)) is None
+
+    deleted = process_one_job(prefer_enrichment=True)
+    assert deleted and deleted["status"] == "succeeded"
+    assert db.one("SELECT status FROM processing_jobs WHERE id=?", (queued_delete["job_id"],))["status"] == "succeeded"
+    assert db.one("SELECT id FROM companies WHERE id=?", (delete_id,)) is None
+
+
 def test_recruitment_event_state_and_api_sort_ignore_legacy_status(tmp_path, monkeypatch):
     configure_test_db(tmp_path, monkeypatch)
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -217,6 +245,34 @@ def test_recruitment_event_state_and_api_sort_ignore_legacy_status(tmp_path, mon
     listed = recruitment_events(_={})
     assert [event["id"] for event in listed] == ["ongoing", "upcoming", "historical"]
     assert [event["status"] for event in listed] == ["ongoing", "upcoming", "historical"]
+
+
+def test_company_management_api_enqueues_merge_and_delete_tasks(tmp_path, monkeypatch):
+    configure_test_db(tmp_path, monkeypatch)
+    first = apply_model_item(_company_payload("接口主企业", "接口主企业有限公司", summary="主摘要", website="https://api-primary.example", event_title="主宣讲会"), None, "2026-09-06T00:00:00+00:00")
+    second = apply_model_item(_company_payload("接口补充企业", "接口补充企业有限公司", summary="补充摘要", website="https://api-supplement.example", event_title="补充宣讲会"), None, "2026-09-06T00:00:00+00:00")
+    third = apply_model_item(_company_payload("接口删除企业", "接口删除企业有限公司", summary="删除摘要", website="https://api-delete.example", event_title="删除宣讲会"), None, "2026-09-06T00:00:00+00:00")
+    primary_id, supplement_id = first["company_ids"][0], second["company_ids"][0]
+    delete_id = third["company_ids"][0]
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("127.0.0.1", 50122)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        merge_response = client.post("/api/v1/admin/companies/merge", json={"ids": [primary_id, supplement_id]})
+        delete_response = client.request("DELETE", "/api/v1/admin/companies", json={"ids": [delete_id]})
+
+        assert merge_response.status_code == 200
+        assert merge_response.json()["status"] == "queued"
+        assert delete_response.status_code == 200
+        assert delete_response.json()["status"] == "queued"
+        queue = client.get("/api/v1/admin/processing-queue").json()
+
+    merge_item = next(item for item in queue["items"] if item["id"] == merge_response.json()["job_id"])
+    delete_item = next(item for item in queue["items"] if item["id"] == delete_response.json()["job_id"])
+    assert merge_item["kind"] == "merge_company"
+    assert merge_item["task_payload"]["company_names"] == ["接口主企业", "接口补充企业"]
+    assert delete_item["kind"] == "delete_company"
+    assert delete_item["text_preview"] == "待删除企业：接口删除企业"
 
 
 def test_processing_queue_returns_original_text_and_fallback(tmp_path, monkeypatch):

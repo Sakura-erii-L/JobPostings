@@ -18,7 +18,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 from .auth import authenticate_password, create_session, initial_admin_password_required, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_initial_admin_password, set_user_password, verify_code
 from .backups import WebDAVClient, _backup_credentials, create_backup, list_backups, validate_remote_backup
-from .catalog import COMPANY_OVERRIDE_COLUMNS, INDUSTRIES, CompanyManagementConflict, CompanyManagementNotFound, CompanyManagementValidationError, _parse_reliable_datetime, apply_company_overrides, company_management_impact, company_overrides, delete_company_records, merge_company_records, recruitment_event_sort_key, recruitment_event_state, refresh_expiration
+from .catalog import COMPANY_OVERRIDE_COLUMNS, INDUSTRIES, CompanyManagementConflict, CompanyManagementNotFound, CompanyManagementValidationError, _parse_reliable_datetime, apply_company_overrides, company_management_impact, company_overrides, queue_company_management, recruitment_event_sort_key, recruitment_event_state, refresh_expiration
 from .config import config
 from .db import all_rows, connect, init_db, one, utc_now
 from .events import events
@@ -1016,7 +1016,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     params = [*query_params, limit]
     rows = all_rows(
         f"""
-        SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
+        SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.payload_json,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
                p.cancel_requested,p.processor,p.error,p.result_json,p.created_at,p.updated_at,p.started_at,p.finished_at,
                r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,r.recognition_status,r.recognized_at,r.recognition_error,
                r.text_content,r.metadata_json,
@@ -1055,6 +1055,21 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         item = dict(row)
         current_text = item.pop("text_content", None)
         metadata_json = item.pop("metadata_json", None)
+        task_payload_json = item.pop("payload_json", None)
+        if task_payload_json:
+            try:
+                task_payload = json.loads(task_payload_json)
+            except (TypeError, json.JSONDecodeError):
+                task_payload = None
+            item["task_payload"] = task_payload if isinstance(task_payload, dict) else None
+            if isinstance(task_payload, dict) and item["kind"] in {"merge_company", "delete_company"}:
+                names = [str(value) for value in task_payload.get("company_names") or [] if str(value).strip()]
+                if item["kind"] == "merge_company":
+                    item["text_preview"] = f"主企业：{task_payload.get('primary_company_name') or (names[0] if names else '—')}；待合并：{'、'.join(names[1:]) or '—'}"
+                else:
+                    item["text_preview"] = f"待删除企业：{'、'.join(names) or '—'}"
+        else:
+            item["task_payload"] = None
         if item["kind"] == "classify":
             try:
                 metadata = json.loads(metadata_json or "{}")
@@ -1264,28 +1279,28 @@ def company_management_impact_endpoint(body: CompanyManagementPreviewRequest, _:
 @app.post("/api/v1/admin/companies/merge")
 async def merge_companies_endpoint(body: CompanySelectionRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     try:
-        result = merge_company_records(body.ids)
+        result = queue_company_management(body.ids, "merge")
     except CompanyManagementConflict as exc:
         raise HTTPException(409, str(exc)) from exc
     except CompanyManagementNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except CompanyManagementValidationError as exc:
         raise HTTPException(400, str(exc)) from exc
-    await events.publish("company.updated", {"company_id": result["primary_company_id"], "merged_company_ids": result["merged_company_ids"]})
+    await events.publish("processing.updated", result)
     return result
 
 
 @app.delete("/api/v1/admin/companies")
 async def delete_companies_endpoint(body: CompanySelectionRequest, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     try:
-        result = delete_company_records(body.ids)
+        result = queue_company_management(body.ids, "delete")
     except CompanyManagementConflict as exc:
         raise HTTPException(409, str(exc)) from exc
     except CompanyManagementNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     except CompanyManagementValidationError as exc:
         raise HTTPException(400, str(exc)) from exc
-    await events.publish("company.updated", {"deleted_company_ids": result["deleted_company_ids"]})
+    await events.publish("processing.updated", result)
     return result
 
 

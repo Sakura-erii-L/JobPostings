@@ -1781,8 +1781,10 @@ def _management_running_jobs(connection: Any, company_ids: list[str]) -> list[di
     ]
 
 
-def _ensure_company_management_unlocked(connection: Any, company_ids: list[str]) -> None:
+def _ensure_company_management_unlocked(connection: Any, company_ids: list[str], exclude_processing_job_id: str | None = None) -> None:
     running = _management_running_jobs(connection, company_ids)
+    if exclude_processing_job_id:
+        running = [row for row in running if row["id"] != exclude_processing_job_id]
     if running:
         raise CompanyManagementConflict("参与操作的企业存在正在运行的后台任务，请等待任务结束后重试")
 
@@ -1886,13 +1888,73 @@ def company_management_impact(company_ids: Any, operation: str) -> dict[str, Any
         return _company_management_impact(connection, ids, operation)
 
 
-def merge_company_records(company_ids: Any) -> dict[str, Any]:
+def queue_company_management(company_ids: Any, operation: str) -> dict[str, Any]:
+    ids = _management_company_ids(company_ids)
+    if operation not in {"merge", "delete"}:
+        raise CompanyManagementValidationError("operation must be merge or delete")
+    if operation == "merge" and len(ids) < 2:
+        raise CompanyManagementValidationError("合并至少需要选择两个企业")
+    kind = "merge_company" if operation == "merge" else "delete_company"
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = _management_company_rows(connection, ids)
+        _ensure_company_management_unlocked(connection, ids)
+        payload = {
+            "operation": operation,
+            "company_ids": ids,
+            "company_names": [row["display_name"] for row in rows],
+        }
+        if operation == "merge":
+            payload["primary_company_id"] = rows[0]["id"]
+            payload["primary_company_name"] = rows[0]["display_name"]
+        active_jobs = connection.execute(
+            "SELECT id,kind,payload_json FROM processing_jobs WHERE kind IN ('merge_company','delete_company') AND status IN ('pending','running','retry_wait') ORDER BY created_at,id"
+        ).fetchall()
+        selected_set = set(ids)
+        for active_job in active_jobs:
+            try:
+                active_payload = json.loads(active_job["payload_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            active_ids = [str(value) for value in active_payload.get("company_ids") or []]
+            if not active_ids or selected_set.isdisjoint(active_ids):
+                continue
+            same_selection = active_job["kind"] == kind and (
+                active_ids == ids if operation == "merge" else set(active_ids) == selected_set
+            )
+            if same_selection:
+                return {
+                    "status": "already_queued",
+                    "queued": False,
+                    "job_id": active_job["id"],
+                    "kind": kind,
+                    "operation": operation,
+                    "company_ids": ids,
+                }
+            raise CompanyManagementConflict("选中的企业已有管理任务正在排队，请等待该任务完成")
+        job_id = str(uuid4())
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO processing_jobs(id,kind,payload_json,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (job_id, kind, json.dumps(payload, ensure_ascii=False), "pending", f"{operation}_queued", now, now),
+        )
+        return {
+            "status": "queued",
+            "queued": True,
+            "job_id": job_id,
+            "kind": kind,
+            "operation": operation,
+            "company_ids": ids,
+        }
+
+
+def merge_company_records(company_ids: Any, *, exclude_processing_job_id: str | None = None) -> dict[str, Any]:
     ids = _management_company_ids(company_ids)
     if len(ids) < 2:
         raise CompanyManagementValidationError("合并至少需要选择两个企业")
     with connect() as snapshot_connection:
         snapshot_rows = [dict(row) for row in _management_company_rows(snapshot_connection, ids)]
-        _ensure_company_management_unlocked(snapshot_connection, ids)
+        _ensure_company_management_unlocked(snapshot_connection, ids, exclude_processing_job_id)
     snapshot_updated_at = {row["id"]: row["updated_at"] for row in snapshot_rows}
     content_polish, content_polish_result = _polish_company_merge_content(snapshot_rows)
     now = utc_now()
@@ -1901,7 +1963,7 @@ def merge_company_records(company_ids: Any) -> dict[str, Any]:
         rows = _management_company_rows(connection, ids)
         if any(row["updated_at"] != snapshot_updated_at.get(row["id"]) for row in rows):
             raise CompanyManagementConflict("企业资料在 Codex 整理期间发生变化，请重试")
-        _ensure_company_management_unlocked(connection, ids)
+        _ensure_company_management_unlocked(connection, ids, exclude_processing_job_id)
         impact = _company_management_impact(connection, ids, "merge", rows)
         primary_id = ids[0]
         supplement_ids = ids[1:]
@@ -1987,13 +2049,13 @@ def merge_company_records(company_ids: Any) -> dict[str, Any]:
         }
 
 
-def delete_company_records(company_ids: Any) -> dict[str, Any]:
+def delete_company_records(company_ids: Any, *, exclude_processing_job_id: str | None = None) -> dict[str, Any]:
     ids = _management_company_ids(company_ids)
     now = utc_now()
     with connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         rows = _management_company_rows(connection, ids)
-        _ensure_company_management_unlocked(connection, ids)
+        _ensure_company_management_unlocked(connection, ids, exclude_processing_job_id)
         impact = _company_management_impact(connection, ids, "delete", rows)
         company_placeholders = _management_placeholders(ids)
         job_ids = [
@@ -2010,9 +2072,14 @@ def delete_company_records(company_ids: Any) -> dict[str, Any]:
                 tuple(ids),
             ).fetchall()
         ]
+        processing_job_where = f"company_id IN ({company_placeholders})"
+        processing_job_params: list[Any] = list(ids)
+        if exclude_processing_job_id:
+            processing_job_where += " AND id<>?"
+            processing_job_params.append(exclude_processing_job_id)
         processing_job_rows = connection.execute(
-            f"SELECT id,raw_message_id FROM processing_jobs WHERE company_id IN ({company_placeholders})",
-            tuple(ids),
+            f"SELECT id,raw_message_id FROM processing_jobs WHERE {processing_job_where}",
+            tuple(processing_job_params),
         ).fetchall()
         processing_job_ids = [row["id"] for row in processing_job_rows]
         processing_raw_message_ids = list(dict.fromkeys(
@@ -2100,8 +2167,8 @@ def delete_company_records(company_ids: Any) -> dict[str, Any]:
             tuple(ids),
         )
         connection.execute(
-            f"DELETE FROM processing_jobs WHERE company_id IN ({company_placeholders})",
-            tuple(ids),
+            f"DELETE FROM processing_jobs WHERE {processing_job_where}",
+            tuple(processing_job_params),
         )
         review_conditions: list[str] = []
         review_params: list[Any] = []

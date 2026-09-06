@@ -163,6 +163,7 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
   kind TEXT NOT NULL,
   raw_message_id TEXT REFERENCES raw_messages(id) ON DELETE CASCADE,
   company_id TEXT,
+  payload_json TEXT,
   status TEXT NOT NULL,
   stage TEXT NOT NULL DEFAULT 'queued',
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -519,6 +520,7 @@ def init_db() -> None:
             },
             "processing_jobs": {
                 "company_id": "TEXT",
+                "payload_json": "TEXT",
                 "stage": "TEXT NOT NULL DEFAULT 'queued'",
                 "next_attempt_at": "TEXT",
                 "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
@@ -592,7 +594,7 @@ def init_db() -> None:
             (utc_now(),),
         )
         connection.execute(
-            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '4')"
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '5')"
         )
         connection.execute(
             """INSERT OR IGNORE INTO system_settings(key, value_json, updated_at)

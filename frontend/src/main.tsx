@@ -20,10 +20,11 @@ type TraceMemoGroup = { id: string; external_id: string; name: string; avatar?: 
 type TraceMemoMessage = { id: string; external_message_id?: string | null; source_group_id: string; group_name: string; sent_at?: string | null; sender?: string; message_type: string; text_preview: string; imported: boolean }
 type TraceMemoMessagesResponse = { days: number; groups: number; total: number; items: TraceMemoMessage[] }
 type ProcessingLog = { id: string; stage: string; level: string; message: string; details: Record<string, any>; created_at: string }
-type ProcessingQueueItem = { id: string; kind: string; raw_message_id?: string | null; company_id?: string | null; status: string; stage: string; attempts: number; lease_until?: string | null; next_attempt_at?: string | null; processor?: string | null; error?: string | null; result_json?: string | null; result?: Record<string, any> | null; created_at: string; updated_at: string; connector_id?: string | null; source_group_id?: string | null; source_group_name?: string | null; message_type?: string | null; sender?: string | null; sent_at?: string | null; recognition_status?: string | null; recognized_at?: string | null; recognition_error?: string | null; text_preview?: string | null; original_text?: string | null }
+type ProcessingTaskPayload = { operation?: 'merge' | 'delete'; company_ids?: string[]; company_names?: string[]; primary_company_name?: string }
+type ProcessingQueueItem = { id: string; kind: string; raw_message_id?: string | null; company_id?: string | null; task_payload?: ProcessingTaskPayload | null; status: string; stage: string; attempts: number; lease_until?: string | null; next_attempt_at?: string | null; processor?: string | null; error?: string | null; result_json?: string | null; result?: Record<string, any> | null; created_at: string; updated_at: string; connector_id?: string | null; source_group_id?: string | null; source_group_name?: string | null; message_type?: string | null; sender?: string | null; sent_at?: string | null; recognition_status?: string | null; recognized_at?: string | null; recognition_error?: string | null; text_preview?: string | null; original_text?: string | null }
 type ProcessingStatusStats = Record<string, number>
 type ProcessingQueue = { state: 'running' | 'paused'; stats: ProcessingStatusStats; stats_by_kind?: Record<string, ProcessingStatusStats>; source_recognition?: ProcessingStatusStats; background_tasks?: ProcessingStatusStats; background_by_kind?: Record<string, ProcessingStatusStats>; items: ProcessingQueueItem[]; total: number }
-type CompanyMergeResult = { deduplicated_jobs: number; content_polish?: { status?: string; reason?: string } }
+type CompanyManagementQueueResult = { status: 'queued' | 'already_queued'; queued: boolean; job_id: string; kind: string; operation: 'merge' | 'delete'; company_ids: string[] }
 type CompanyManagementImpact = { operation: 'merge' | 'delete'; primary_company?: { id: string; display_name: string } | null; supplementary_companies: { id: string; display_name: string }[]; selected_companies: { id: string; display_name: string }[]; counts: Record<string, number>; running_jobs: { id: string; kind: string; company_id: string }[]; blocked: boolean }
 type LocalBackup = { name: string; size: number; created_at: string }
 type LocalStorageSnapshot = { database: { path: string; size: number }; backups: LocalBackup[]; tracememo_cache: { groups: number; messages: number; bytes: number }; chat_records: { messages: number; artifacts: number; artifact_bytes: number } }
@@ -304,11 +305,12 @@ function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onResearch,
   const toggleSelection = (id: string) => setSelectedIds(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id])
   const leaveSelectionMode = () => { setSelectionMode(false); setSelectedIds([]); setManagementMessage('') }
   const manageCompanies = async (operation: 'merge' | 'delete') => {
-    if (operation === 'merge' && selectedIds.length < 2) { setManagementMessage('合并至少需要选择两个企业'); return }
-    if (operation === 'delete' && !selectedIds.length) { setManagementMessage('删除至少需要选择一个企业'); return }
+    const ids = [...selectedIds]
+    if (operation === 'merge' && ids.length < 2) { setManagementMessage('合并至少需要选择两个企业'); return }
+    if (operation === 'delete' && !ids.length) { setManagementMessage('删除至少需要选择一个企业'); return }
     setBusy(`${operation}-impact`)
     try {
-      const impact = await api<CompanyManagementImpact>('/admin/companies/impact', { method: 'POST', body: JSON.stringify({ operation, ids: selectedIds }) })
+      const impact = await api<CompanyManagementImpact>('/admin/companies/impact', { method: 'POST', body: JSON.stringify({ operation, ids }) })
       if (impact.blocked) { setManagementMessage('参与操作的企业存在正在运行的后台任务，请等待任务结束后重试'); return }
       const count = (key: string) => Number(impact.counts[key] || 0)
       const companyNames = (operation === 'merge' ? impact.supplementary_companies : impact.selected_companies).map(company => company.display_name).join('、') || '—'
@@ -316,18 +318,17 @@ function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onResearch,
         ? [`主企业：${impact.primary_company?.display_name || '—'}`, `被合并企业：${companyNames}`, `将迁移：岗位 ${count('jobs')} 个、招聘批次 ${count('recruitment_batches')} 个、招聘事件 ${count('recruitment_events')} 个、来源证据 ${count('evidences')} 条`, '主企业已有非空字段优先，确认执行合并？'].join('\n')
         : [`将删除企业：${companyNames}`, `预计受影响：企业 ${count('companies')} 个、岗位 ${count('jobs')} 个、招聘批次 ${count('recruitment_batches')} 个、招聘事件 ${count('recruitment_events')} 个、来源证据 ${count('evidences')} 条`, '删除将在单个事务中执行，确认继续？'].join('\n')
       if (!window.confirm(confirmation)) return
-      setBusy(operation)
-      if (operation === 'merge') {
-        const result = await api<CompanyMergeResult>('/admin/companies/merge', { method: 'POST', body: JSON.stringify({ ids: selectedIds }) })
-        const polishMessage = result.content_polish?.status === 'applied' ? '，Codex 已完成内容去重润色' : result.content_polish?.status === 'uncertain' ? '，Codex 内容存在不确定项，已保留确定性结果' : '，Codex 不可用，已保留确定性结果'
-        setManagementMessage(`企业合并完成，岗位去重 ${result.deduplicated_jobs} 个${polishMessage}`)
-      } else {
-        const result = await api<{ deleted_company_ids: string[] }>('/admin/companies', { method: 'DELETE', body: JSON.stringify({ ids: selectedIds }) })
-        setManagementMessage(`已删除 ${result.deleted_company_ids.length} 个企业`)
-      }
       setSelectedIds([])
       setSelectionMode(false)
-      await onChanged?.()
+      setManagementMessage(operation === 'merge' ? '正在将企业合并加入处理队列…' : '正在将企业删除加入处理队列…')
+      setBusy('')
+      if (operation === 'merge') {
+        const result = await api<CompanyManagementQueueResult>('/admin/companies/merge', { method: 'POST', body: JSON.stringify({ ids }) })
+        setManagementMessage(result.status === 'already_queued' ? '该企业合并已在处理队列中' : '企业合并已进入处理队列，可继续选择其他企业')
+      } else {
+        const result = await api<CompanyManagementQueueResult>('/admin/companies', { method: 'DELETE', body: JSON.stringify({ ids }) })
+        setManagementMessage(result.status === 'already_queued' ? '该企业删除已在处理队列中' : '企业删除已进入处理队列，可继续选择其他企业')
+      }
     } catch (e) { setManagementMessage((e as Error).message) }
     finally { setBusy('') }
   }
@@ -788,8 +789,8 @@ function QueuePage({ onSync, syncing }: { onSync: () => Promise<void>; syncing: 
   const attention = (stats.needs_review || 0) + (stats.paused_quota || 0) + (stats.failed || 0)
   const statusLabel: Record<string, string> = { pending: '等待处理', running: '处理中', succeeded: '已完成', needs_review: '需要处理', paused_quota: '额度暂停', failed: '失败', canceled: '已取消' }
   const recognitionLabel: Record<string, string> = { pending: '待识别', running: '识别中', succeeded: '已识别', needs_review: '识别需审核', canceled: '已取消', filtered: '系统消息已过滤' }
-  const kindLabel: Record<string, string> = { classify: '来源识别', consolidate_company: '企业内容整理', research_company: '企业公开概览' }
-  const stageLabel: Record<string, string> = { queued: '等待领取', starting: '启动任务', extracting: '提取来源内容', codex_ocr: 'Codex 图片 OCR', codex_fallback: 'Codex 兜底提取 / OCR', local_ocr_fallback: '本地 OCR 兜底', classifying: '招聘识别与结构化', persisting: '写入企业、岗位与时间轴', waiting_for_sources: '等待来源汇总', consolidating: '合并企业资料', research_queued: '等待公开检索', researching: '联网检索企业概览与风险', saving_research: '保存概览、标签与来源', retry_wait: '等待自动重试', review: '等待人工审核', failed: '处理失败', completed: '已完成', canceled: '已取消' }
+  const kindLabel: Record<string, string> = { classify: '来源识别', consolidate_company: '企业内容整理', research_company: '企业公开概览', merge_company: '企业合并', delete_company: '企业删除' }
+  const stageLabel: Record<string, string> = { queued: '等待领取', starting: '启动任务', extracting: '提取来源内容', codex_ocr: 'Codex 图片 OCR', codex_fallback: 'Codex 兜底提取 / OCR', local_ocr_fallback: '本地 OCR 兜底', classifying: '招聘识别与结构化', persisting: '写入企业、岗位与时间轴', waiting_for_sources: '等待来源汇总', consolidating: '合并企业资料', merge_queued: '等待企业合并', merging: '执行企业合并', delete_queued: '等待企业删除', deleting: '执行企业删除', research_queued: '等待公开检索', researching: '联网检索企业概览与风险', saving_research: '保存概览、标签与来源', retry_wait: '等待自动重试', review: '等待人工审核', failed: '处理失败', completed: '已完成', canceled: '已取消' }
 
   const resultLabel = (item: ProcessingQueueItem) => {
     const result = item.result
@@ -799,6 +800,8 @@ function QueuePage({ onSync, syncing }: { onSync: () => Promise<void>; syncing: 
       if (result.is_recruitment === true) return `成功提取 ${Number(result.company_count || 0)} 家企业 / ${Number(result.job_count || 0)} 个岗位`
     }
     if (item.status === 'needs_review' && item.error === '模型判断为招聘信息，但未产生可持久化企业数据') return '需要处理：未提取到有效企业'
+    if (item.kind === 'merge_company' && result?.status === 'succeeded') return `合并完成，岗位去重 ${Number(result.deduplicated_jobs || 0)} 个`
+    if (item.kind === 'delete_company' && result?.status === 'succeeded') return `删除完成 ${Number(result.deleted_company_ids?.length || 0)} 个企业`
     return ''
   }
 

@@ -12,7 +12,7 @@ from uuid import uuid4
 from urllib.parse import urlparse
 
 from .browser import fetch_public_browser
-from .catalog import INDUSTRIES, apply_company_overrides, apply_model_item, company_overrides, deduplicate_company_jobs, normalize_company_tags, normalize_recruitment_payload, normalize_text_value
+from .catalog import INDUSTRIES, apply_company_overrides, apply_model_item, company_overrides, deduplicate_company_jobs, delete_company_records, merge_company_records, normalize_company_tags, normalize_recruitment_payload, normalize_text_value
 from .company_research import execute_company_research
 from .db import connect, one, utc_now
 from .model_provider import RecruitmentPayloadValidationError, classify_messages, consolidate_company_profile, get_setting, validate_recruitment_payload
@@ -309,7 +309,7 @@ def queue_is_running() -> bool:
 def _claim_one(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
     now = utc_now()
     priority = (
-        "CASE kind WHEN 'consolidate_company' THEN 0 WHEN 'research_company' THEN 1 ELSE 2 END"
+        "CASE kind WHEN 'merge_company' THEN 0 WHEN 'delete_company' THEN 0 WHEN 'consolidate_company' THEN 1 WHEN 'research_company' THEN 2 ELSE 3 END"
         if prefer_enrichment
         else "CASE kind WHEN 'classify' THEN 0 ELSE 1 END"
     )
@@ -320,7 +320,7 @@ def _claim_one(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
                WHERE status='pending' AND cancel_requested=0
                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
                  AND (
-                   kind NOT IN ('consolidate_company', 'research_company')
+                   kind NOT IN ('merge_company', 'delete_company', 'consolidate_company', 'research_company')
                    OR (SELECT COUNT(*) FROM processing_jobs active
                        WHERE active.kind=processing_jobs.kind AND active.status='running') < 1
                  )
@@ -1334,6 +1334,32 @@ def _process_company_research(job: dict[str, Any]) -> dict[str, Any]:
     return {**result, "id": job["id"]}
 
 
+def _process_company_management(job: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(job.get("payload_json") or "{}")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("企业管理任务载荷无效") from exc
+    company_ids = payload.get("company_ids")
+    if not isinstance(company_ids, list) or not company_ids:
+        raise RuntimeError("企业管理任务缺少企业 ID")
+    operation = "merge" if job["kind"] == "merge_company" else "delete"
+    stage = "merging" if operation == "merge" else "deleting"
+    message = "执行企业合并并整理历史数据" if operation == "merge" else "执行企业删除并清理历史引用"
+    _stage(job["id"], stage, message, "admin:manual")
+    if not _still_active(job["id"]):
+        return {"status": "canceled", "id": job["id"]}
+    if operation == "merge":
+        result = merge_company_records(company_ids, exclude_processing_job_id=job["id"])
+    else:
+        result = delete_company_records(company_ids, exclude_processing_job_id=job["id"])
+    if result.get("status") == "merged":
+        result["status"] = "succeeded"
+    elif result.get("status") == "deleted":
+        result["status"] = "succeeded"
+    _finish(job["id"], {**result, "operation": operation, "id": job["id"]})
+    return {**result, "operation": operation, "id": job["id"]}
+
+
 def process_one_job(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
     job = _claim_one(prefer_enrichment=prefer_enrichment)
     if not job:
@@ -1344,6 +1370,8 @@ def process_one_job(*, prefer_enrichment: bool = False) -> dict[str, Any] | None
             return _process_classify(job)
         if job["kind"] == "consolidate_company":
             return _process_company_consolidation(job)
+        if job["kind"] in {"merge_company", "delete_company"}:
+            return _process_company_management(job)
         if job["kind"] == "research_company":
             return _process_company_research(job)
         raise RuntimeError(f"Unknown processing job kind: {job['kind']}")

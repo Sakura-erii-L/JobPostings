@@ -62,6 +62,7 @@ def test_init_db_migrates_legacy_processing_jobs_before_index(tmp_path, monkeypa
     db.init_db()
     columns = {row["name"] for row in db.all_rows("PRAGMA table_info(processing_jobs)")}
     assert "next_attempt_at" in columns
+    assert "payload_json" in columns
     assert db.one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_processing_jobs_ready'")
 
 
