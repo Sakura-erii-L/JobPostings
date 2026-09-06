@@ -248,7 +248,46 @@ def test_review_items_include_current_task_original_message_and_logs(tmp_path, m
         payload = response.json()[0]["payload"]
         assert payload["job"]["error"] == "完整错误信息"
         assert payload["original_message"]["original_text_content"] == "审核用的完整原始招聘正文"
+        assert payload["source_reference"]["raw_message_id"] == raw_id
+        assert payload["source_reference"]["source_status"] == "text_available"
         assert payload["processing_logs"][0]["message"] == "失败阶段日志"
+
+
+def test_processing_queue_exposes_locator_for_missing_text_with_tracememo_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    from fastapi.testclient import TestClient
+
+    with TestClient(app, client=("127.0.0.1", 50010)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        raw_id = client.post("/api/v1/imports/text", json={"text": "临时占位内容"}).json()["raw_message_id"]
+        now = db.utc_now()
+        with db.connect() as connection:
+            connection.execute(
+                "INSERT INTO connectors(id,kind,base_url,enabled,config_json,updated_at) VALUES(?,?,?,?,?,?)",
+                ("trace-connector", "tracememo", "http://127.0.0.1:6131/api/v1", 1, "{}", now),
+            )
+            connection.execute(
+                "INSERT INTO source_groups(id,connector_id,external_id,name,selected,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                ("trace-group", "trace-connector", "external-group", "招聘测试群", 1, 1, now, now),
+            )
+            connection.execute(
+                "UPDATE raw_messages SET connector_id=?,source_group_id=?,external_message_id=?,sender=?,sent_at=?,message_type=?,text_content=?,metadata_json=? WHERE id=?",
+                ("trace-connector", "trace-group", "message-42", "测试发送者", now, "图片", "", "{}", raw_id),
+            )
+            connection.execute(
+                "INSERT INTO tracememo_message_cache(id,connector_id,source_group_id,external_message_id,content_hash,source_time,message_json,first_fetched_at,last_fetched_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("cache-42", "trace-connector", "trace-group", "message-42", "cache-hash-42", now, json.dumps({"type": "图片"}, ensure_ascii=False), now, now, now),
+            )
+        queue = client.get("/api/v1/admin/processing-queue").json()
+
+    item = next(item for item in queue["items"] if item["raw_message_id"] == raw_id)
+    reference = item["source_reference"]
+    assert item["original_text"] == ""
+    assert reference["source_group_name"] == "招聘测试群"
+    assert reference["external_message_id"] == "message-42"
+    assert reference["source_status"] == "cache_available_no_text"
+    assert reference["tracememo_cache"]["id"] == "cache-42"
 
 
 def test_manual_sync_accepts_force_request(tmp_path, monkeypatch):

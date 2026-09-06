@@ -26,6 +26,16 @@
 .queue-original summary strong { font-size:12px; }
 .queue-original summary span { color:#8994a8; font-size:11px; text-align:right; }
 .queue-original pre { max-height:230px; overflow:auto; margin:0; padding:0 12px 12px; color:#52607c; font:inherit; font-size:13px; line-height:1.7; white-space:pre-wrap; overflow-wrap:anywhere; word-break:break-word; }
+.queue-source-reference { margin: 16px 0 12px; border: 1px solid #dfe6f5; border-radius: 11px; background: #f5f8ff; overflow: hidden; }
+.queue-source-reference summary { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; cursor:pointer; list-style:none; color:#43516d; }
+.queue-source-reference summary::-webkit-details-marker { display:none; }
+.queue-source-reference summary strong { font-size:12px; }
+.queue-source-reference summary span { color:#5369ca; font-size:11px; text-align:right; }
+.queue-source-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:10px 14px; padding:0 12px 10px; }
+.queue-source-grid div { display:flex; flex-direction:column; gap:4px; min-width:0; }
+.queue-source-grid small { color:#8994a8; font-size:10px; }
+.queue-source-grid strong, .queue-source-grid code { color:#52607c; font:inherit; font-size:12px; overflow-wrap:anywhere; word-break:break-word; }
+.queue-source-note { margin:0; padding:0 12px 12px; color:#65718b; font-size:11px; line-height:1.6; }
 .queue-error { margin: 0 0 12px; padding: 10px 12px; border-radius: 9px; background: #fff6f7; color: #a8334b; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
 .queue-current-step { display:flex; align-items:center; gap:9px; margin:14px 0 2px; padding:10px 12px; border-radius:10px; background:#f4f6ff; color:#5369ca; }
 .queue-current-step span { font-size:11px; color:#8994a8; }
@@ -65,6 +75,8 @@
   .queue-subtask-head { display: block; }
   .queue-original summary { align-items: flex-start; }
   .queue-original summary span { text-align: left; }
+  .queue-source-reference summary { align-items: flex-start; }
+  .queue-source-reference summary span { text-align: left; }
   .log-line { grid-template-columns:1fr; }
   .log-line pre { grid-column:auto; }
 }

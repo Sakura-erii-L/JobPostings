@@ -604,6 +604,74 @@ def _merge_texts(*values: Any) -> str:
     return "\n".join(result)
 
 
+def source_reference_for_raw_message(raw_message_id: str | None) -> dict[str, Any] | None:
+    """Return stable source identifiers without pretending missing content exists."""
+    if not raw_message_id:
+        return None
+    row = one(
+        """SELECT r.*, sg.name AS source_group_name
+           FROM raw_messages r
+           LEFT JOIN source_groups sg ON sg.id=r.source_group_id
+          WHERE r.id=?""",
+        (raw_message_id,),
+    )
+    if not row:
+        return None
+    value = dict(row)
+    try:
+        metadata = json.loads(value.get("metadata_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    original_text = metadata.get("_original_text_content")
+    original_text_available = bool(str(original_text if original_text is not None else value.get("text_content") or "").strip())
+    current_text_available = bool(str(value.get("text_content") or "").strip())
+    artifact_row = one("SELECT COUNT(*) AS count FROM artifacts WHERE raw_message_id=?", (raw_message_id,))
+    artifact_count = int(artifact_row["count"] if artifact_row else 0)
+    cache = None
+    if value.get("connector_id") and value.get("source_group_id") and value.get("external_message_id") is not None:
+        cache = one(
+            """SELECT id,source_time,updated_at
+                 FROM tracememo_message_cache
+                WHERE connector_id=? AND source_group_id=? AND external_message_id=?
+                ORDER BY updated_at DESC,id DESC LIMIT 1""",
+            (value["connector_id"], value["source_group_id"], value["external_message_id"]),
+        )
+    if original_text_available:
+        source_status = "text_available"
+    elif artifact_count:
+        source_status = "attachment_available_no_text"
+    elif cache:
+        source_status = "cache_available_no_text"
+    else:
+        source_status = "identifier_only"
+    return {
+        "raw_message_id": value.get("id"),
+        "connector_id": value.get("connector_id"),
+        "source_group_id": value.get("source_group_id"),
+        "source_group_name": value.get("source_group_name"),
+        "external_message_id": value.get("external_message_id"),
+        "sender": value.get("sender"),
+        "sent_at": value.get("sent_at"),
+        "message_type": value.get("message_type"),
+        "original_text_available": original_text_available,
+        "current_text_available": current_text_available,
+        "artifact_count": artifact_count,
+        "source_status": source_status,
+        "tracememo_cache": (
+            {
+                "available": True,
+                "id": cache["id"],
+                "source_time": cache["source_time"],
+                "updated_at": cache["updated_at"],
+            }
+            if cache
+            else None
+        ),
+    }
+
+
 def _raw_snapshot(raw_message_id: str | None) -> dict[str, Any] | None:
     if not raw_message_id:
         return None
@@ -654,10 +722,12 @@ def _processing_log_snapshots(job_id: str) -> list[dict[str, Any]]:
 
 def _review_context(job_id: str, raw_message_id: str | None = None, company_id: str | None = None) -> dict[str, Any]:
     job = _job_snapshot(job_id)
-    raw = _raw_snapshot(raw_message_id or (job or {}).get("raw_message_id"))
+    resolved_raw_message_id = raw_message_id or (job or {}).get("raw_message_id")
+    raw = _raw_snapshot(resolved_raw_message_id)
     return {
         "job": job,
         "original_message": raw,
+        "source_reference": source_reference_for_raw_message(resolved_raw_message_id),
         "processing_logs": _processing_log_snapshots(job_id),
         "company_id": company_id or (job or {}).get("company_id"),
     }
@@ -679,6 +749,8 @@ def enrich_review_payload(payload: dict[str, Any], entity_type: str | None, enti
                     result["error"] = {"type": "processing_error", "message": context["job"]["error"]}
             if context["original_message"]:
                 result["original_message"] = context["original_message"]
+            if context["source_reference"]:
+                result["source_reference"] = context["source_reference"]
             result["processing_logs"] = context["processing_logs"]
         return result
     if entity_type == "company" and entity_id and not result.get("original_messages"):

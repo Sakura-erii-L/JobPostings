@@ -27,7 +27,7 @@ from .company_research import ensure_company_research_jobs
 from .maintenance import repair_event_company_assignments, repair_source_urls, repair_tracememo_file_attachments, reset_recruitment_data
 from .local_storage import clear_cache, clear_chat_records, delete_local_database_backup, storage_snapshot
 from .parsers import is_file_message, is_image_message, parse_message_time
-from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running, wait_for_processing_job
+from .processing import attach_artifact, enrich_review_payload, import_file, import_text, import_url, ingest_message, log_processing, process_one_batch, process_one_enrichment, queue_is_running, source_reference_for_raw_message, wait_for_processing_job
 from .security import SecretVault, hash_password, hash_value, token
 from .tracememo import TraceMemoClient, normalize_group, tracememo_filename, tracememo_inline_media, tracememo_local_media, tracememo_media_references
 from .tracememo_cache import has_cached_group, load_cached_messages, store_messages
@@ -551,7 +551,7 @@ def tracememo_messages(days: int = 0, limit: int = 100, query: str = "", _: dict
             continue
         text = _tracememo_message_text(message)
         sender = _tracememo_message_sender(message)
-        if needle and needle not in " ".join((row["group_name"], row["group_external_id"], sender, text)).casefold():
+        if needle and needle not in " ".join((row["group_name"], row["group_external_id"], row["external_message_id"] or "", sender, text)).casefold():
             continue
         items.append(
             {
@@ -1139,6 +1139,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         else:
             item["task_payload"] = None
         item["original_text"] = _queue_original_text(current_text, metadata_json) if item.get("raw_message_id") else ""
+        item["source_reference"] = source_reference_for_raw_message(item.get("raw_message_id")) if item.get("raw_message_id") else None
         raw_result = item.get("result_json")
         if raw_result:
             try:
