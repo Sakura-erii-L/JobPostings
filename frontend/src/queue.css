@@ -33,6 +33,18 @@
 .queue-current-step.running { background:#f0eaff; color:#7655c5; }
 .queue-current-step.succeeded, .queue-current-step.canceled { background:#f0f3f7; color:#69758c; }
 .queue-current-step.needs_review, .queue-current-step.failed { background:#fff0f3; color:#b4314e; }
+.queue-subtasks { margin-top: 16px; padding: 12px; border: 1px solid #e2e7f2; border-radius: 11px; background: #fbfcff; }
+.queue-subtasks-head { margin-bottom: 9px; color: #43516d; font-size: 12px; font-weight: 600; }
+.queue-subtask { padding: 11px 0; border-top: 1px solid #edf0f6; }
+.queue-subtask:first-of-type { padding-top: 2px; border-top: 0; }
+.queue-subtask-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.queue-subtask-selector { align-self: center; display: inline-flex; flex: 0 0 auto; }
+.queue-subtask-copy { display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1 1 auto; }
+.queue-subtask-head strong { color: #35415d; font-size: 12px; }
+.queue-subtask-head span { color: #8994a8; font-size: 11px; }
+.queue-subtask .queue-current-step { margin: 9px 0 8px; padding: 8px 10px; }
+.queue-subtask .queue-result, .queue-subtask .queue-error { margin-bottom: 8px; }
+.queue-subtask .processing-log { margin-top: 9px; }
 .queue-meta { display: flex; gap: 12px; flex-wrap: wrap; color: #8994a8; font-size: 11px; }
 .queue-id { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .processing-log { margin-top:14px; border-top:1px solid #edf0f6; padding-top:10px; }
@@ -50,6 +62,7 @@
   .queue-item-head { display: block; }
   .queue-item-head > div:first-of-type { width: 100%; }
   .queue-item-actions { margin-top: 12px; }
+  .queue-subtask-head { display: block; }
   .queue-original summary { align-items: flex-start; }
   .queue-original summary span { text-align: left; }
   .log-line { grid-template-columns:1fr; }

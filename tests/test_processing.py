@@ -63,6 +63,7 @@ def test_init_db_migrates_legacy_processing_jobs_before_index(tmp_path, monkeypa
     columns = {row["name"] for row in db.all_rows("PRAGMA table_info(processing_jobs)")}
     assert "next_attempt_at" in columns
     assert "payload_json" in columns
+    assert "parent_job_id" in columns
     assert db.one("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_processing_jobs_ready'")
 
 
@@ -188,6 +189,9 @@ def test_message_processing_creates_catalog_and_consolidation_job(tmp_path, monk
     assert db.one("SELECT canonical_title FROM jobs")['canonical_title'] == "算法工程师"
     assert db.one("SELECT source_type FROM evidences WHERE raw_message_id=?", (raw_id,))["source_type"] == "wechat_group"
     assert db.one("SELECT kind FROM processing_jobs WHERE kind='consolidate_company'")["kind"] == "consolidate_company"
+    classify_id = db.one("SELECT id FROM processing_jobs WHERE kind='classify' AND raw_message_id=?", (raw_id,))["id"]
+    assert db.one("SELECT parent_job_id FROM processing_jobs WHERE kind='consolidate_company'")["parent_job_id"] == classify_id
+    assert db.one("SELECT parent_job_id FROM processing_jobs WHERE kind='research_company'")["parent_job_id"] == classify_id
 
 
 def test_recruitment_without_companies_goes_to_review(tmp_path, monkeypatch):

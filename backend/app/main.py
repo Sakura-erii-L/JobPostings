@@ -1002,6 +1002,25 @@ def repair_tracememo_files(_: dict[str, Any] = Depends(require_admin)) -> dict[s
     return repair_tracememo_file_attachments()
 
 
+_QUEUE_CHILD_KINDS_SQL = "'consolidate_company','research_company'"
+
+
+def _queue_original_text(current_text: Any, metadata_json: Any) -> str:
+    try:
+        metadata = json.loads(metadata_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        metadata = {}
+    candidates = [
+        metadata.get("_original_text_content") if isinstance(metadata, dict) else None,
+        current_text,
+        metadata.get("_parsed_text_content") if isinstance(metadata, dict) else None,
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    return ""
+
+
 @app.get("/api/v1/admin/processing-queue")
 def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     allowed_statuses = {"pending", "running", "succeeded", "needs_review", "paused_quota", "failed", "canceled"}
@@ -1013,24 +1032,71 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     if status:
         where = "WHERE p.status=?"
         query_params.append(status)
-    params = [*query_params, limit]
-    rows = all_rows(
+    legacy_parent_expression = """COALESCE(
+        p.parent_job_id,
+        (SELECT parent.id
+           FROM processing_jobs parent
+          WHERE parent.kind='classify'
+            AND parent.raw_message_id=p.raw_message_id
+          ORDER BY parent.created_at DESC,parent.id DESC
+          LIMIT 1),
+        (SELECT parent.id
+           FROM evidences evidence
+           JOIN processing_jobs parent
+             ON parent.kind='classify' AND parent.raw_message_id=evidence.raw_message_id
+          WHERE evidence.company_id=p.company_id
+            AND evidence.raw_message_id IS NOT NULL
+          ORDER BY evidence.observed_at DESC,parent.created_at DESC,parent.id DESC
+          LIMIT 1)
+    )"""
+    resolved_parent_expression = f"CASE WHEN p.kind IN ({_QUEUE_CHILD_KINDS_SQL}) THEN {legacy_parent_expression} ELSE NULL END"
+    root_expression = f"CASE WHEN p.kind IN ({_QUEUE_CHILD_KINDS_SQL}) THEN {legacy_parent_expression} ELSE p.id END"
+    root_rows = all_rows(
         f"""
-        SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.payload_json,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
-               p.cancel_requested,p.processor,p.error,p.result_json,p.created_at,p.updated_at,p.started_at,p.finished_at,
-               r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,r.recognition_status,r.recognized_at,r.recognition_error,
-               r.text_content,r.metadata_json,
-               substr(COALESCE(r.text_content,''),1,240) AS text_preview,
-               sg.name AS source_group_name
+        SELECT {root_expression} AS root_id,MAX(p.updated_at) AS last_updated_at,MAX(p.created_at) AS last_created_at
         FROM processing_jobs p
-        LEFT JOIN raw_messages r ON r.id=p.raw_message_id
-        LEFT JOIN source_groups sg ON sg.id=r.source_group_id
         {where}
-        ORDER BY p.updated_at DESC, p.created_at DESC
+        GROUP BY {root_expression}
+        HAVING {root_expression} IS NOT NULL
+        ORDER BY last_updated_at DESC,last_created_at DESC,root_id DESC
         LIMIT ?
         """,
-        tuple(params),
+        tuple([*query_params, limit]),
     )
+    total_row = one(
+        f"""
+        SELECT COUNT(*) AS count FROM (
+            SELECT {root_expression} AS root_id
+            FROM processing_jobs p
+            {where}
+            GROUP BY {root_expression}
+            HAVING {root_expression} IS NOT NULL
+        ) roots
+        """,
+        tuple(query_params),
+    )
+    job_total_row = one(f"SELECT COUNT(*) AS count FROM processing_jobs p {where}", tuple(query_params))
+    root_ids = [row["root_id"] for row in root_rows if row["root_id"]]
+    rows = []
+    if root_ids:
+        placeholders = ",".join("?" for _ in root_ids)
+        visible_rows_where = f"WHERE {root_expression} IN ({placeholders})"
+        rows = all_rows(
+            f"""
+            SELECT p.id,p.kind,p.raw_message_id,p.company_id,p.payload_json,p.parent_job_id,{resolved_parent_expression} AS resolved_parent_job_id,p.status,p.stage,p.attempts,p.lease_until,p.next_attempt_at,
+                   p.cancel_requested,p.processor,p.error,p.result_json,p.created_at,p.updated_at,p.started_at,p.finished_at,
+                   r.connector_id,r.source_group_id,r.message_type,r.sender,r.sent_at,r.recognition_status,r.recognized_at,r.recognition_error,
+                   r.text_content,r.metadata_json,
+                   substr(COALESCE(r.text_content,''),1,240) AS text_preview,
+                   sg.name AS source_group_name
+            FROM processing_jobs p
+            LEFT JOIN raw_messages r ON r.id=p.raw_message_id
+            LEFT JOIN source_groups sg ON sg.id=r.source_group_id
+            {visible_rows_where}
+            ORDER BY p.updated_at DESC,p.created_at DESC,p.id DESC
+            """,
+            tuple(root_ids),
+        )
     stats = {name: 0 for name in allowed_statuses}
     for row in all_rows("SELECT status,COUNT(*) AS count FROM processing_jobs GROUP BY status"):
         stats[row["status"]] = row["count"]
@@ -1049,12 +1115,14 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         for name in allowed_statuses:
             background_tasks[name] += values.get(name, 0)
     control = one("SELECT state,updated_at FROM queue_control WHERE id=1")
-    total_row = one(f"SELECT COUNT(*) AS count FROM processing_jobs p {where}", tuple(query_params))
-    items: list[dict[str, Any]] = []
+    raw_items: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         current_text = item.pop("text_content", None)
         metadata_json = item.pop("metadata_json", None)
+        resolved_parent_job_id = item.pop("resolved_parent_job_id", None)
+        if item["kind"] in {"consolidate_company", "research_company"} and not item.get("parent_job_id"):
+            item["parent_job_id"] = resolved_parent_job_id
         task_payload_json = item.pop("payload_json", None)
         if task_payload_json:
             try:
@@ -1070,15 +1138,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
                     item["text_preview"] = f"待删除企业：{'、'.join(names) or '—'}"
         else:
             item["task_payload"] = None
-        if item["kind"] == "classify":
-            try:
-                metadata = json.loads(metadata_json or "{}")
-            except (TypeError, json.JSONDecodeError):
-                metadata = {}
-            original_text = metadata.get("_original_text_content") if isinstance(metadata, dict) else None
-            item["original_text"] = original_text if isinstance(original_text, str) else current_text or ""
-        else:
-            item["original_text"] = None
+        item["original_text"] = _queue_original_text(current_text, metadata_json) if item.get("raw_message_id") else ""
         raw_result = item.get("result_json")
         if raw_result:
             try:
@@ -1087,6 +1147,26 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
                 item["result"] = None
         else:
             item["result"] = None
+        raw_items.append(item)
+    items_by_id = {item["id"]: item for item in raw_items}
+    child_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for item in raw_items:
+        if item["kind"] not in {"consolidate_company", "research_company"}:
+            continue
+        parent_id = item.get("parent_job_id")
+        parent = items_by_id.get(parent_id) if parent_id else None
+        if parent and parent["kind"] == "classify":
+            child_by_parent.setdefault(parent_id, []).append(item)
+    items: list[dict[str, Any]] = []
+    for root_id in root_ids:
+        item = items_by_id.get(root_id)
+        if not item or item["kind"] in {"consolidate_company", "research_company"}:
+            continue
+        subtasks = child_by_parent.get(item["id"], [])
+        if subtasks:
+            item["subtasks"] = sorted(subtasks, key=lambda child: (child.get("created_at") or "", child["id"]))
+        else:
+            item["subtasks"] = []
         items.append(item)
     return {
         "state": control["state"] if control else "paused",
@@ -1098,6 +1178,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         "background_by_kind": background_by_kind,
         "items": items,
         "total": total_row["count"] if total_row else 0,
+        "job_total": job_total_row["count"] if job_total_row else 0,
     }
 
 

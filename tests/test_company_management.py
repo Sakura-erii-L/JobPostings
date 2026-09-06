@@ -294,6 +294,34 @@ def test_processing_queue_returns_original_text_and_fallback(tmp_path, monkeypat
         assert item["original_text"] == "OCR/处理后的文本"
 
 
+def test_processing_queue_groups_followups_under_source_task_and_repairs_legacy_parent(tmp_path, monkeypatch):
+    configure_test_db(tmp_path, monkeypatch)
+    from fastapi.testclient import TestClient
+    from app.processing import ingest_message
+
+    raw_id = ingest_message({"id": "queue-source", "type": "普通文本", "text": "原始聊天招聘正文"}, "tracememo", "group-1")
+    classify_id = db.one("SELECT id FROM processing_jobs WHERE kind='classify' AND raw_message_id=?", (raw_id,))["id"]
+    seeded = apply_model_item(_company_payload("队列关联科技", "队列关联科技有限公司", summary="企业摘要", website="https://queue-linked.example", event_title="关联宣讲会"), raw_id, "2026-09-06T00:00:00+00:00")
+    company_id = seeded["company_ids"][0]
+    with db.connect() as connection:
+        connection.execute("UPDATE raw_messages SET text_content=?,metadata_json=? WHERE id=?", ("处理后的提取正文", json.dumps({"_original_text_content": "原始聊天招聘正文"}, ensure_ascii=False), raw_id))
+        connection.execute("UPDATE processing_jobs SET parent_job_id=NULL WHERE kind IN ('consolidate_company','research_company') AND company_id=?", (company_id,))
+    db.init_db()
+
+    with TestClient(app, client=("127.0.0.1", 50123)) as client:
+        assert client.post("/api/v1/bootstrap", json={"email": "admin@example.com", "password": "AdminPass123!"}).status_code == 200
+        queue = client.get("/api/v1/admin/processing-queue").json()
+
+    assert queue["total"] == 1
+    assert queue["job_total"] == 3
+    assert len(queue["items"]) == 1
+    item = queue["items"][0]
+    assert item["id"] == classify_id
+    assert item["original_text"] == "原始聊天招聘正文"
+    assert {subtask["kind"] for subtask in item["subtasks"]} == {"consolidate_company", "research_company"}
+    assert all(subtask["parent_job_id"] == classify_id for subtask in item["subtasks"])
+
+
 def test_company_management_endpoints_require_admin(tmp_path, monkeypatch):
     configure_test_db(tmp_path, monkeypatch)
     from fastapi.testclient import TestClient

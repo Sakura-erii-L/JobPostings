@@ -69,18 +69,25 @@ def _source_hints(company: dict[str, Any]) -> list[dict[str, str]]:
     return hints[:12]
 
 
-def queue_company_research_in_connection(connection: Any, company_id: str, force: bool = False) -> str | None:
+def queue_company_research_in_connection(
+    connection: Any,
+    company_id: str,
+    force: bool = False,
+    parent_job_id: str | None = None,
+) -> str | None:
     existing = connection.execute(
         "SELECT id,status FROM processing_jobs WHERE kind='research_company' AND company_id=? ORDER BY created_at DESC LIMIT 1",
         (company_id,),
     ).fetchone()
     if existing and (not force or existing["status"] in {"pending", "running", "retry_wait"}):
+        if parent_job_id and existing["status"] in {"pending", "retry_wait"}:
+            connection.execute("UPDATE processing_jobs SET parent_job_id=? WHERE id=?", (parent_job_id, existing["id"]))
         return existing["id"]
     job_id = str(uuid4())
     now = utc_now()
     connection.execute(
-        "INSERT INTO processing_jobs(id,kind,company_id,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-        (job_id, "research_company", company_id, "pending", "research_queued", now, now),
+        "INSERT INTO processing_jobs(id,kind,company_id,parent_job_id,status,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        (job_id, "research_company", company_id, parent_job_id, "pending", "research_queued", now, now),
     )
     return job_id
 

@@ -164,6 +164,7 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
   raw_message_id TEXT REFERENCES raw_messages(id) ON DELETE CASCADE,
   company_id TEXT,
   payload_json TEXT,
+  parent_job_id TEXT,
   status TEXT NOT NULL,
   stage TEXT NOT NULL DEFAULT 'queued',
   attempts INTEGER NOT NULL DEFAULT 0,
@@ -521,6 +522,7 @@ def init_db() -> None:
             "processing_jobs": {
                 "company_id": "TEXT",
                 "payload_json": "TEXT",
+                "parent_job_id": "TEXT",
                 "stage": "TEXT NOT NULL DEFAULT 'queued'",
                 "next_attempt_at": "TEXT",
                 "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
@@ -568,6 +570,9 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_processing_jobs_ready ON processing_jobs(status, next_attempt_at, created_at)"
         )
         connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_processing_jobs_parent ON processing_jobs(parent_job_id, created_at)"
+        )
+        connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_raw_messages_recognition_status ON raw_messages(recognition_status, created_at)"
         )
         connection.execute(
@@ -590,11 +595,33 @@ def init_db() -> None:
                  AND raw_messages.is_recruitment IS NULL"""
         )
         connection.execute(
+            """UPDATE processing_jobs
+               SET parent_job_id=COALESCE(
+                   (SELECT parent.id
+                      FROM processing_jobs parent
+                     WHERE parent.kind='classify'
+                       AND parent.raw_message_id=processing_jobs.raw_message_id
+                     ORDER BY parent.created_at DESC,parent.id DESC
+                     LIMIT 1),
+                   (SELECT parent.id
+                      FROM evidences evidence
+                      JOIN processing_jobs parent
+                        ON parent.kind='classify' AND parent.raw_message_id=evidence.raw_message_id
+                     WHERE evidence.company_id=processing_jobs.company_id
+                       AND evidence.raw_message_id IS NOT NULL
+                     ORDER BY evidence.observed_at DESC,parent.created_at DESC,parent.id DESC
+                     LIMIT 1)
+               )
+             WHERE processing_jobs.kind IN ('consolidate_company','research_company')
+               AND processing_jobs.parent_job_id IS NULL
+               AND (processing_jobs.raw_message_id IS NOT NULL OR processing_jobs.company_id IS NOT NULL)"""
+        )
+        connection.execute(
             "INSERT OR IGNORE INTO queue_control(id,state,updated_at) VALUES(1,'paused',?)",
             (utc_now(),),
         )
         connection.execute(
-            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '5')"
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('schema_version', '6')"
         )
         connection.execute(
             """INSERT OR IGNORE INTO system_settings(key, value_json, updated_at)

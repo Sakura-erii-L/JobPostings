@@ -1083,6 +1083,11 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             source_type = source_type_for_url(recover_original_source_url(metadata.get("source_url") or metadata.get("url")) or "")
         source_url = recover_original_source_url(metadata.get("source_url") or metadata.get("url"))
         artifact_id = metadata.get("artifact_id")
+        parent_job = connection.execute(
+            "SELECT id FROM processing_jobs WHERE kind='classify' AND raw_message_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+            (raw_message_id,),
+        ).fetchone() if raw_message_id else None
+        parent_job_id = parent_job["id"] if parent_job else None
         initial_company_ids = {row["id"] for row in connection.execute("SELECT id FROM companies").fetchall()}
         for index, company_entry in enumerate(company_items):
             if not isinstance(company_entry, dict):
@@ -1147,14 +1152,17 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
                 (company_id,),
             ).fetchone()
             if pending:
-                connection.execute("UPDATE processing_jobs SET next_attempt_at=?,updated_at=? WHERE id=?", (ready_at, utc_now(), pending["id"]))
+                connection.execute(
+                    "UPDATE processing_jobs SET parent_job_id=COALESCE(?,parent_job_id),next_attempt_at=?,updated_at=? WHERE id=?",
+                    (parent_job_id, ready_at, utc_now(), pending["id"]),
+                )
             else:
                 connection.execute(
-                    "INSERT INTO processing_jobs(id,kind,company_id,status,stage,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (str(uuid4()), "consolidate_company", company_id, "pending", "waiting_for_sources", ready_at, utc_now(), utc_now()),
+                    "INSERT INTO processing_jobs(id,kind,company_id,parent_job_id,status,stage,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (str(uuid4()), "consolidate_company", company_id, parent_job_id, "pending", "waiting_for_sources", ready_at, utc_now(), utc_now()),
                 )
             from .company_research import queue_company_research_in_connection
-            queue_company_research_in_connection(connection, company_id)
+            queue_company_research_in_connection(connection, company_id, parent_job_id=parent_job_id)
             deduplicate_company_jobs(connection, company_id)
     persistence["company_ids"] = list(dict.fromkeys(persisted_company_ids))
     persistence["job_ids"] = list(dict.fromkeys(all_job_ids))
