@@ -627,7 +627,7 @@ def init_db() -> None:
                      ORDER BY evidence.observed_at DESC,parent.created_at DESC,parent.id DESC
                      LIMIT 1)
                )
-             WHERE processing_jobs.kind IN ('consolidate_company','research_company')
+             WHERE processing_jobs.kind IN ('consolidate_company','research_company','deduplicate_events')
                AND processing_jobs.parent_job_id IS NULL
                AND (processing_jobs.raw_message_id IS NOT NULL OR processing_jobs.company_id IS NOT NULL)"""
         )

@@ -6,7 +6,7 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 
@@ -29,6 +29,7 @@ from .catalog import (
     normalize_company_tags,
     normalize_name,
     normalize_employment_type,
+    normalize_text_value,
     normalize_title,
     recruitment_event_state,
 )
@@ -1127,6 +1128,168 @@ def _event_pair_has_conflicting_time(record_ids: list[str]) -> bool:
     return any(not _event_times_compatible(left, right["start_at"], right["end_at"]) for index, left in enumerate(rows) for right in rows[index + 1:])
 
 
+def _event_time_value(value: Any, timezone_name: Any) -> str | None:
+    normalized = normalize_event_datetime(value, str(timezone_name or "Asia/Shanghai"), utc_now())
+    return normalized or normalize_text_value(value)
+
+
+def _event_merged_time_is_supported(candidates: list[dict[str, Any]], merged: dict[str, Any]) -> bool:
+    """Prevent a semantic merge from inventing a time not present in its evidence."""
+    explicit_starts = {
+        value
+        for candidate in candidates
+        if (value := _event_time_value(candidate.get("start_at"), candidate.get("timezone")))
+    }
+    explicit_ends = {
+        value
+        for candidate in candidates
+        if (value := _event_time_value(candidate.get("end_at"), candidate.get("timezone")))
+    }
+    merged_start = _event_time_value(merged.get("start_at"), merged.get("timezone"))
+    merged_end = _event_time_value(merged.get("end_at"), merged.get("timezone"))
+    return (
+        (not explicit_starts or not merged_start or merged_start in explicit_starts)
+        and (not explicit_ends or not merged_end or merged_end in explicit_ends)
+    )
+
+
+def _historical_event_candidate_clusters(company_id: str | None = None) -> list[list[dict[str, Any]]]:
+    """Build conservative event clusters; Codex still makes the semantic decision."""
+    with connect() as connection:
+        query = "SELECT * FROM recruitment_events"
+        parameters: tuple[Any, ...] = ()
+        if company_id:
+            query += " WHERE company_id=?"
+            parameters = (company_id,)
+        query += " ORDER BY company_id,event_type,start_at,created_at,id"
+        rows = connection.execute(query, parameters).fetchall()
+        by_type: dict[tuple[str, str], list[Any]] = {}
+        for row in rows:
+            key = (str(row["company_id"]), _event_identity_text(row["event_type"]))
+            by_type.setdefault(key, []).append(row)
+
+        clusters: list[list[dict[str, Any]]] = []
+        for group in by_type.values():
+            parents = list(range(len(group)))
+
+            def find(index: int) -> int:
+                while parents[index] != index:
+                    parents[index] = parents[parents[index]]
+                    index = parents[index]
+                return index
+
+            def union(left: int, right: int) -> None:
+                left_root = find(left)
+                right_root = find(right)
+                if left_root != right_root:
+                    parents[right_root] = left_root
+
+            for left_index, left in enumerate(group):
+                for right_index in range(left_index + 1, len(group)):
+                    right = group[right_index]
+                    left_start = normalize_text_value(left["start_at"])
+                    right_start = normalize_text_value(right["start_at"])
+                    if left_start and right_start:
+                        if left_start == right_start:
+                            union(left_index, right_index)
+                        continue
+                    if _event_identity_matches(left, right):
+                        union(left_index, right_index)
+
+            components: dict[int, list[Any]] = {}
+            for index, row in enumerate(group):
+                components.setdefault(find(index), []).append(row)
+            for component in components.values():
+                if len(component) > 1:
+                    clusters.append([_event_semantic_candidate(connection, row) for row in component])
+        return clusters
+
+
+def repair_historical_event_clusters(
+    company_id: str | None = None,
+    *,
+    job_id: str | None = None,
+    should_continue: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Use Codex to deduplicate all current event candidates for one company."""
+    from .model_provider import deduplicate_entity_candidates
+
+    result: dict[str, Any] = {
+        "status": "completed",
+        "candidate_clusters": 0,
+        "candidate_records": 0,
+        "semantic_decisions": 0,
+        "semantic_merged": 0,
+        "semantic_kept_separate": 0,
+        "semantic_review": 0,
+        "semantic_skipped": 0,
+    }
+    candidates_list = _historical_event_candidate_clusters(company_id)
+    result["candidate_clusters"] = len(candidates_list)
+    result["candidate_records"] = sum(len(candidates) for candidates in candidates_list)
+    model_job_id = job_id or f"event-dedup-{uuid4()}"
+    for candidates in candidates_list:
+        if should_continue is not None and not should_continue():
+            result["status"] = "canceled"
+            return result
+        record_ids = [str(item["id"]) for item in candidates]
+        fingerprint = _semantic_fingerprint("event", candidates)
+        existing = _existing_semantic_decision("event", fingerprint)
+        if existing and (existing["action"] in {"keep_separate", "merge"} or existing["status"] == "open"):
+            result["semantic_skipped"] += 1
+            continue
+        model_result = deduplicate_entity_candidates("event", candidates, model_job_id)
+        if should_continue is not None and not should_continue():
+            result["status"] = "canceled"
+            return result
+        operation = dict(model_result.payload)
+        returned_ids = [str(value) for value in operation.get("record_ids") or []]
+        if set(returned_ids) != set(record_ids) or len(returned_ids) != len(set(returned_ids)):
+            operation = {
+                "action": "review",
+                "record_ids": record_ids,
+                "reason": "模型返回的 record_ids 与候选记录不一致",
+                "evidence": [],
+                "merged": None,
+            }
+        result["semantic_decisions"] += 1
+        action = operation.get("action")
+        if action == "keep_separate":
+            _save_semantic_decision(
+                "event", record_ids, "keep_separate", str(operation.get("reason") or "保留独立记录"),
+                [str(value) for value in operation.get("evidence") or []], None, fingerprint, "active",
+            )
+            result["semantic_kept_separate"] += 1
+            continue
+        if action != "merge" or not isinstance(operation.get("merged"), dict):
+            _save_semantic_review("event", record_ids, operation, candidates, fingerprint)
+            result["semantic_review"] += 1
+            continue
+        if _event_pair_has_conflicting_time(record_ids) or not _event_merged_time_is_supported(candidates, operation["merged"]):
+            operation["action"] = "review"
+            operation["reason"] = "活动明确时间冲突或合并结果包含来源未支持的时间，按边界不得自动合并"
+            _save_semantic_review("event", record_ids, operation, candidates, fingerprint)
+            result["semantic_review"] += 1
+            continue
+        if should_continue is not None and not should_continue():
+            result["status"] = "canceled"
+            return result
+        try:
+            merge_event_records_with_payload(record_ids, operation["merged"], semantic_identity=True)
+        except Exception as exc:
+            operation["action"] = "review"
+            operation["reason"] = f"程序执行语义合并时遇到冲突：{exc}"
+            _save_semantic_review("event", record_ids, operation, candidates, fingerprint)
+            result["semantic_review"] += 1
+            continue
+        _save_semantic_decision(
+            "event", record_ids, "merge", str(operation.get("reason") or "Codex 判定为同一活动"),
+            [str(value) for value in operation.get("evidence") or []], operation["merged"], fingerprint, "applied",
+        )
+        result["semantic_merged"] += 1
+    return result
+
+
 def repair_historical_semantic_duplicates() -> dict[str, int]:
     """Use Codex decisions for exact candidate pairs and persist each decision."""
     from .model_provider import deduplicate_entity_candidates
@@ -1138,6 +1301,11 @@ def repair_historical_semantic_duplicates() -> dict[str, int]:
         "semantic_review": 0,
     }
     for entity_type in ("company", "job", "event"):
+        if entity_type == "event":
+            event_result = repair_historical_event_clusters()
+            for key in ("semantic_decisions", "semantic_merged", "semantic_kept_separate", "semantic_review"):
+                result[key] += int(event_result.get(key, 0))
+            continue
         progress = True
         while progress:
             progress = False

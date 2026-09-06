@@ -574,6 +574,7 @@ def test_historical_semantic_event_repair_accepts_title_and_location_variants(tm
             None,
             "2026-09-06T00:00:00+00:00",
         )
+    assert db.one("SELECT COUNT(*) AS count FROM processing_jobs WHERE kind='deduplicate_events'")["count"] == 1
     calls = []
 
     def fake_deduplicate(entity_type, candidates, job_id):
@@ -601,6 +602,7 @@ def test_historical_semantic_event_repair_accepts_title_and_location_variants(tm
 
     assert result["semantic_merged"] >= 1
     assert calls and all(call[0] == "event" for call in calls)
+    assert len(calls[0][1]) == 3
     assert db.one("SELECT COUNT(*) AS count FROM recruitment_events WHERE company_id=(SELECT id FROM companies WHERE display_name=?)", ("沈飞语义去重测试",))["count"] == 1
 
 

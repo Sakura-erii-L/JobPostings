@@ -1002,7 +1002,7 @@ def repair_tracememo_files(_: dict[str, Any] = Depends(require_admin)) -> dict[s
     return repair_tracememo_file_attachments()
 
 
-_QUEUE_CHILD_KINDS_SQL = "'consolidate_company','research_company'"
+_QUEUE_CHILD_KINDS_SQL = "'consolidate_company','research_company','deduplicate_events'"
 
 
 def _queue_original_text(current_text: Any, metadata_json: Any) -> str:
@@ -1121,7 +1121,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
         current_text = item.pop("text_content", None)
         metadata_json = item.pop("metadata_json", None)
         resolved_parent_job_id = item.pop("resolved_parent_job_id", None)
-        if item["kind"] in {"consolidate_company", "research_company"} and not item.get("parent_job_id"):
+        if item["kind"] in {"consolidate_company", "research_company", "deduplicate_events"} and not item.get("parent_job_id"):
             item["parent_job_id"] = resolved_parent_job_id
         task_payload_json = item.pop("payload_json", None)
         if task_payload_json:
@@ -1151,7 +1151,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     items_by_id = {item["id"]: item for item in raw_items}
     child_by_parent: dict[str, list[dict[str, Any]]] = {}
     for item in raw_items:
-        if item["kind"] not in {"consolidate_company", "research_company"}:
+        if item["kind"] not in {"consolidate_company", "research_company", "deduplicate_events"}:
             continue
         parent_id = item.get("parent_job_id")
         parent = items_by_id.get(parent_id) if parent_id else None
@@ -1160,7 +1160,7 @@ def processing_queue(status: str | None = None, limit: int = 100, _: dict[str, A
     items: list[dict[str, Any]] = []
     for root_id in root_ids:
         item = items_by_id.get(root_id)
-        if not item or item["kind"] in {"consolidate_company", "research_company"}:
+        if not item or item["kind"] in {"consolidate_company", "research_company", "deduplicate_events"}:
             continue
         subtasks = child_by_parent.get(item["id"], [])
         if subtasks:

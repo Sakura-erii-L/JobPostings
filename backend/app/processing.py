@@ -365,7 +365,7 @@ def queue_is_running() -> bool:
 def _claim_one(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
     now = utc_now()
     priority = (
-        "CASE kind WHEN 'merge_company' THEN 0 WHEN 'delete_company' THEN 0 WHEN 'consolidate_company' THEN 1 WHEN 'research_company' THEN 2 ELSE 3 END"
+        "CASE kind WHEN 'merge_company' THEN 0 WHEN 'delete_company' THEN 0 WHEN 'consolidate_company' THEN 1 WHEN 'research_company' THEN 2 WHEN 'deduplicate_events' THEN 3 ELSE 4 END"
         if prefer_enrichment
         else "CASE kind WHEN 'classify' THEN 0 ELSE 1 END"
     )
@@ -376,9 +376,13 @@ def _claim_one(*, prefer_enrichment: bool = False) -> dict[str, Any] | None:
                WHERE status='pending' AND cancel_requested=0
                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
                  AND (
-                   kind NOT IN ('merge_company', 'delete_company', 'consolidate_company', 'research_company')
-                   OR (SELECT COUNT(*) FROM processing_jobs active
+                   kind NOT IN ('merge_company', 'delete_company', 'consolidate_company', 'research_company', 'deduplicate_events')
+                   OR (kind <> 'deduplicate_events' AND (SELECT COUNT(*) FROM processing_jobs active
                        WHERE active.kind=processing_jobs.kind AND active.status='running') < 1
+                   )
+                   OR (kind='deduplicate_events' AND (SELECT COUNT(*) FROM processing_jobs active
+                       WHERE active.kind=processing_jobs.kind AND active.status IN ('running','timeout')) < 1
+                   )
                  )
                ORDER BY {priority}, created_at LIMIT 1""",
             (now,),
@@ -1303,6 +1307,26 @@ def _process_company_research(job: dict[str, Any]) -> dict[str, Any]:
     return {**result, "id": job["id"]}
 
 
+def _process_event_semantic_dedup(job: dict[str, Any]) -> dict[str, Any]:
+    from .maintenance import repair_historical_event_clusters
+
+    if not job.get("company_id"):
+        raise RuntimeError("活动语义去重任务缺少企业 ID")
+    engine = str(get_setting("processing_engine", "codex") or "codex")
+    processor = "local_codex:gpt-5.6-luna" if engine == "codex" else "generic_llm"
+    _stage(job["id"], "deduplicating_events", "调用配置的模型判断同一企业招聘活动候选是否重复", processor)
+    result = repair_historical_event_clusters(
+        company_id=job["company_id"],
+        job_id=job["id"],
+        should_continue=lambda: _still_active(job["id"]),
+    )
+    if result.get("status") == "canceled" or not _still_active(job["id"]):
+        return {"status": "canceled", "id": job["id"]}
+    queue_result = {**result, "status": "succeeded", "company_id": job["company_id"], "id": job["id"]}
+    _finish(job["id"], queue_result)
+    return queue_result
+
+
 def _process_company_management(job: dict[str, Any]) -> dict[str, Any]:
     try:
         payload = json.loads(job.get("payload_json") or "{}")
@@ -1340,6 +1364,8 @@ def process_one_job(*, prefer_enrichment: bool = False) -> dict[str, Any] | None
             return _process_classify(job)
         if job["kind"] == "consolidate_company":
             return _process_company_consolidation(job)
+        if job["kind"] == "deduplicate_events":
+            return _process_event_semantic_dedup(job)
         if job["kind"] in {"merge_company", "delete_company"}:
             return _process_company_management(job)
         if job["kind"] == "research_company":

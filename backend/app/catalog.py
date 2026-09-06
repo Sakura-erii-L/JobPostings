@@ -1065,6 +1065,33 @@ def _make_job(connection, company_id: str, batch_id: str | None, job_data: dict[
     return job_id
 
 
+def _queue_event_semantic_dedup(connection: Any, company_id: str, parent_job_id: str | None, ready_at: str) -> None:
+    event_count = connection.execute(
+        "SELECT COUNT(*) AS count FROM recruitment_events WHERE company_id=?",
+        (company_id,),
+    ).fetchone()["count"]
+    if int(event_count or 0) < 2:
+        return
+    pending = connection.execute(
+        """SELECT id FROM processing_jobs
+           WHERE kind='deduplicate_events' AND company_id=? AND status='pending' AND cancel_requested=0
+           ORDER BY created_at DESC,id DESC LIMIT 1""",
+        (company_id,),
+    ).fetchone()
+    if pending:
+        connection.execute(
+            "UPDATE processing_jobs SET parent_job_id=COALESCE(?,parent_job_id),next_attempt_at=?,updated_at=? WHERE id=?",
+            (parent_job_id, ready_at, utc_now(), pending["id"]),
+        )
+        return
+    connection.execute(
+        """INSERT INTO processing_jobs(
+           id,kind,company_id,parent_job_id,status,stage,next_attempt_at,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (str(uuid4()), "deduplicate_events", company_id, parent_job_id, "pending", "waiting_for_sources", ready_at, utc_now(), utc_now()),
+    )
+
+
 def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_at: str | None) -> dict[str, Any]:
     persistence: dict[str, Any] = {
         "company_ids": [],
@@ -1207,6 +1234,7 @@ def apply_model_item(item: dict[str, Any], raw_message_id: str | None, observed_
             from .company_research import queue_company_research_in_connection
             queue_company_research_in_connection(connection, company_id, parent_job_id=parent_job_id)
             deduplicate_company_jobs(connection, company_id)
+            _queue_event_semantic_dedup(connection, company_id, parent_job_id, ready_at)
     persistence["company_ids"] = list(dict.fromkeys(persisted_company_ids))
     persistence["job_ids"] = list(dict.fromkeys(all_job_ids))
     persistence["created_company_count"] = len(created_company_ids)

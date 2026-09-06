@@ -790,8 +790,8 @@ function QueuePage({ onSync, syncing }: { onSync: () => Promise<void>; syncing: 
   const attention = (stats.needs_review || 0) + (stats.paused_quota || 0) + (stats.failed || 0) + (stats.timeout || 0)
   const statusLabel: Record<string, string> = { pending: '等待处理', running: '处理中', timeout: '超时（进程仍在运行）', succeeded: '已完成', needs_review: '需要处理', paused_quota: '额度暂停', failed: '失败', canceled: '已取消' }
   const recognitionLabel: Record<string, string> = { pending: '待识别', running: '识别中', timeout: '超时待人工操作', succeeded: '已识别', needs_review: '识别需审核', canceled: '已取消', filtered: '系统消息已过滤' }
-  const kindLabel: Record<string, string> = { classify: '来源识别', consolidate_company: '企业内容整理', research_company: '企业公开概览', merge_company: '企业合并', delete_company: '企业删除' }
-  const stageLabel: Record<string, string> = { queued: '等待领取', starting: '启动任务', extracting: '提取来源内容', codex_ocr: 'Codex 图片 OCR', codex_fallback: 'Codex 兜底提取 / OCR', local_ocr_fallback: '本地 OCR 兜底', classifying: '招聘识别与结构化', consolidating_source: '整源复核与语义去重', persisting: '写入企业、岗位与时间轴', waiting_for_sources: '等待来源汇总', consolidating: '合并企业资料', merge_queued: '等待企业合并', merging: '执行企业合并', delete_queued: '等待企业删除', deleting: '执行企业删除', research_queued: '等待公开检索', researching: '联网检索企业概览与风险', saving_research: '保存概览、标签与来源', retry_wait: '等待自动重试', timeout: '超时，等待手动中断或重试', review: '等待人工审核', failed: '处理失败', completed: '已完成', canceled: '已取消' }
+  const kindLabel: Record<string, string> = { classify: '来源识别', consolidate_company: '企业内容整理', research_company: '企业公开概览', deduplicate_events: '活动语义去重', merge_company: '企业合并', delete_company: '企业删除' }
+  const stageLabel: Record<string, string> = { queued: '等待领取', starting: '启动任务', extracting: '提取来源内容', codex_ocr: 'Codex 图片 OCR', codex_fallback: 'Codex 兜底提取 / OCR', local_ocr_fallback: '本地 OCR 兜底', classifying: '招聘识别与结构化', consolidating_source: '整源复核与语义去重', persisting: '写入企业、岗位与时间轴', waiting_for_sources: '等待来源汇总', consolidating: '合并企业资料', deduplicating_events: '调用 Codex 判断活动重复', merge_queued: '等待企业合并', merging: '执行企业合并', delete_queued: '等待企业删除', deleting: '执行企业删除', research_queued: '等待公开检索', researching: '联网检索企业概览与风险', saving_research: '保存概览、标签与来源', retry_wait: '等待自动重试', timeout: '超时，等待手动中断或重试', review: '等待人工审核', failed: '处理失败', completed: '已完成', canceled: '已取消' }
 
   const resultLabel = (item: ProcessingQueueItem) => {
     const result = item.result
@@ -805,6 +805,7 @@ function QueuePage({ onSync, syncing }: { onSync: () => Promise<void>; syncing: 
     if (item.kind === 'delete_company' && result?.status === 'succeeded') return `删除完成 ${Number(result.deleted_company_ids?.length || 0)} 个企业`
     if (item.kind === 'consolidate_company' && result?.status === 'succeeded') return '企业内容整理完成'
     if (item.kind === 'research_company' && result?.status === 'succeeded') return '企业公开概览完成'
+    if (item.kind === 'deduplicate_events' && result?.status === 'succeeded') return `活动语义去重完成，合并 ${Number(result.semantic_merged || 0)} 个候选簇，待审核 ${Number(result.semantic_review || 0)} 个候选簇`
     return ''
   }
 

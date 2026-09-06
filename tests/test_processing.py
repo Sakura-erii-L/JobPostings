@@ -862,6 +862,26 @@ def test_enrichment_jobs_are_limited_to_one_running_job_per_kind(tmp_path, monke
     assert _claim_one(prefer_enrichment=True)["kind"] == "consolidate_company"
 
 
+def test_event_dedup_waits_for_manual_timeout_action_before_parallel_claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(db.config, "data_dir", tmp_path)
+    monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
+    db.init_db()
+    now = db.utc_now()
+    with db.connect() as connection:
+        connection.executemany(
+            "INSERT INTO processing_jobs(id,kind,company_id,status,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            [
+                ("event-dedup-timeout", "deduplicate_events", "company-1", "timeout", now, now, now),
+                ("event-dedup-pending", "deduplicate_events", "company-1", "pending", now, now, now),
+            ],
+        )
+
+    assert _claim_one() is None
+    with db.connect() as connection:
+        connection.execute("UPDATE processing_jobs SET status='canceled' WHERE id='event-dedup-timeout'")
+    assert _claim_one()["id"] == "event-dedup-pending"
+
+
 def test_multiple_page_images_use_one_ordered_codex_ocr_and_retry_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(db.config, "data_dir", tmp_path)
     monkeypatch.setattr(db.config, "db_path", tmp_path / "data" / "jobpostings.db")
