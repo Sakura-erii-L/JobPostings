@@ -244,3 +244,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .mobile-nav-close { display: inline-flex; }
   .kanban-tabs { display: flex; }
 }
+
+.view-toggle { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 42px; min-height: 42px; border: 1px solid #dde2e8; border-radius: 6px; background: #fff; color: #2457a6; padding: 10px; }
+.view-toggle:hover, .view-toggle:focus-visible { border-color: #b8cbe0; background: #edf4fb; }
+.view-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.view-toggle rect { fill: none; }
+.company-grid.company-grid-list { display: flex; flex-direction: column; gap: 0; }
+.company-grid.company-grid-list .company-card { width: 100%; }
+.company-grid.company-grid-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; perspective: 900px; }
+.company-grid.company-grid-tiles .company-card { display: flex; flex-direction: column; width: 100%; min-height: 245px; border: 1px solid #dde2e8; border-radius: 8px; padding: 20px; }
+.company-grid.company-grid-tiles .company-card:hover { border-color: #b8cbe0; }
+.company-grid.company-grid-tiles .company-card.selected-company-card { border-color: #6e83e8; }
+.company-grid.company-grid-tiles .company-card-motion { transform-style: preserve-3d; will-change: transform; }
+.company-grid.company-grid-tiles .company-card p { min-height: 43px; }
+.company-grid.company-grid-tiles .card-footer { margin-top: auto; }
+@media(max-width:680px){.company-grid.company-grid-tiles{grid-template-columns:1fr;gap:10px}}
+@media(prefers-reduced-motion: reduce){.company-card-motion{transform:none !important;transition:none !important}}

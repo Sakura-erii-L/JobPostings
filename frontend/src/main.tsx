@@ -35,6 +35,9 @@ const TAG_LABELS: Record<string, string> = { private: '民营企业', state_owne
 const SOURCE_TYPE_LABELS: Record<string, string> = { wechat_group: '微信群聊', wechat_official_account: '微信公众号', public_web: '公开网页', manual_import: '手动导入', public_negative_news: '公开负面信息' }
 const ADMIN_ONLY_PAGES = new Set(['import', 'admin', 'queue', 'review'])
 type SettingsSection = 'account' | 'invitations' | 'connections' | 'processing' | 'storage'
+type CompanyViewMode = 'tiles' | 'list'
+
+const COMPANY_VIEW_MODE_STORAGE_KEY = 'jobpostings-company-view-mode'
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isForm = options.body instanceof FormData
@@ -224,13 +227,21 @@ function App() {
     try {
       setSelected(await api<CompanyDetail>(`/companies/${id}`))
       setPage('companies')
+      clearCompanyHistoryState()
       window.history.pushState({ ...(window.history.state || {}), jobPostingsCompanyId: id }, '', window.location.href)
     }
     catch (e) { setError((e as Error).message) }
   }
+  const clearCompanyHistoryState = () => {
+    const nextState = { ...(window.history.state || {}) }
+    delete nextState.jobPostingsCompanyId
+    nextState.jobPostingsRoot = true
+    window.history.replaceState(nextState, '', window.location.href)
+  }
   const backFromCompany = () => {
-    if (window.history.state?.jobPostingsCompanyId) window.history.back()
-    else { setSelected(null); setPage('companies') }
+    clearCompanyHistoryState()
+    setSelected(null)
+    setPage('companies')
   }
   const updateCompany = async (company: CompanyDetail) => {
     setSelected(company)
@@ -259,6 +270,7 @@ function App() {
   }
 
   const completeNavigation = (nextPage: typeof page, nextSettingsSection?: SettingsSection) => {
+    clearCompanyHistoryState()
     setPage(nextPage)
     setSelected(null)
     if (nextSettingsSection) setSettingsSection(nextSettingsSection)
@@ -359,6 +371,13 @@ function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onResearch,
   const [managementMessage, setManagementMessage] = useState('')
   const [industryFilter, setIndustryFilter] = useState('')
   const [sortBy, setSortBy] = useState<'updated_desc' | 'jobs_desc' | 'name_asc' | 'updated_asc'>('updated_desc')
+  const [viewMode, setViewMode] = useState<CompanyViewMode>(() => {
+    try { return window.localStorage.getItem(COMPANY_VIEW_MODE_STORAGE_KEY) === 'list' ? 'list' : 'tiles' }
+    catch { return 'tiles' }
+  })
+  useEffect(() => {
+    try { window.localStorage.setItem(COMPANY_VIEW_MODE_STORAGE_KEY, viewMode) } catch {}
+  }, [viewMode])
   const industryOptions = Array.from(new Set([...INDUSTRY_OPTIONS, ...companies.map(company => company.primary_industry).filter(Boolean)]))
   const visibleCompanies = companies
     .filter(company => !industryFilter || company.primary_industry === industryFilter)
@@ -400,7 +419,7 @@ function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onResearch,
     } catch (e) { setManagementMessage((e as Error).message) }
     finally { setBusy('') }
   }
-  return <><PageHeader eyebrow="招聘知识库" title="企业与岗位" description="把分散在群聊、公众号和文件里的招聘信息，整理成可以行动的机会。">{isAdmin && <button className={selectionMode ? 'secondary' : 'filter'} onClick={selectionMode ? leaveSelectionMode : () => { setSelectionMode(true); setManagementMessage('') }}>{selectionMode ? '退出选择' : '选择企业'}</button>}{onResearch && <button className="secondary" disabled={researching || Boolean(busy)} onClick={() => onResearch()}>{researching ? '概览排队中…' : '⌕ 自动获取企业概览'}</button>}<button className="secondary" onClick={() => onExport('csv')}>导出 CSV</button><button className="secondary" onClick={() => onExport('xlsx')}>导出 Excel</button>{onImport && <button className="primary" onClick={onImport}>＋ 快速导入</button>}</PageHeader><div className="metrics"><Metric label="企业" value={companies.length} tone="blue" /><Metric label="岗位" value={jobs.length} tone="violet" /><Metric label="有效岗位" value={jobs.filter(j => j.status === 'active').length} tone="green" /><Metric label="最近更新" value={jobs[0]?.updated_at?.slice(5, 10) || '—'} tone="orange" /></div><div className="toolbar"><div className="search"><span>⌕</span><input className="search-input" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && onSearch()} placeholder="搜索企业、岗位、地点或专业" /></div><select className="filter" aria-label="筛选企业行业" value={industryFilter} onChange={event => setIndustryFilter(event.target.value)}><option value="">筛选：全部行业</option>{industryOptions.map(code => <option value={code} key={code}>{TAG_LABELS[code] || code}</option>)}</select><select className="filter" aria-label="企业排序" value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="updated_desc">排序：最近更新</option><option value="jobs_desc">排序：岗位最多</option><option value="name_asc">排序：企业名称</option><option value="updated_asc">排序：最早更新</option></select></div>{selectionMode && <div className="company-management-bar"><span>{selectedIds.length ? `已选择 ${selectedIds.length} 个企业；第一个为主企业` : '请选择企业；第一个选择将作为主企业'}</span><div className="company-management-actions"><button className="secondary" disabled={selectedIds.length < 2 || Boolean(busy)} onClick={() => void manageCompanies('merge')}>{busy === 'merge-impact' || busy === 'merge' ? '合并处理中…' : `合并${selectedIds.length >= 2 ? `（${selectedIds.length}）` : ''}`}</button><button className="secondary danger" disabled={!selectedIds.length || Boolean(busy)} onClick={() => void manageCompanies('delete')}>{busy === 'delete-impact' || busy === 'delete' ? '删除处理中…' : `删除${selectedIds.length ? `（${selectedIds.length}）` : ''}`}</button></div></div>}{managementMessage && <div className="setting-help company-management-message">{managementMessage}</div>}{visibleCompanies.length ? <div className="company-grid">{visibleCompanies.map(company => { const selectionOrder = selectedIds.indexOf(company.id) + 1; return <CompanyCard key={company.id} company={company} selectable={selectionMode} selected={selectionOrder > 0} selectionOrder={selectionOrder} onClick={() => selectionMode ? toggleSelection(company.id) : onOpen(company.id)} /> })}</div> : <EmptyState />}</>
+  return <><PageHeader eyebrow="招聘知识库" title="企业与岗位" description="把分散在群聊、公众号和文件里的招聘信息，整理成可以行动的机会。">{isAdmin && <button className={selectionMode ? 'secondary' : 'filter'} onClick={selectionMode ? leaveSelectionMode : () => { setSelectionMode(true); setManagementMessage('') }}>{selectionMode ? '退出选择' : '选择企业'}</button>}{onResearch && <button className="secondary" disabled={researching || Boolean(busy)} onClick={() => onResearch()}>{researching ? '概览排队中…' : '⌕ 自动获取企业概览'}</button>}<button className="secondary" onClick={() => onExport('csv')}>导出 CSV</button><button className="secondary" onClick={() => onExport('xlsx')}>导出 Excel</button>{onImport && <button className="primary" onClick={onImport}>＋ 快速导入</button>}</PageHeader><div className="metrics"><Metric label="企业" value={companies.length} tone="blue" /><Metric label="岗位" value={jobs.length} tone="violet" /><Metric label="有效岗位" value={jobs.filter(j => j.status === 'active').length} tone="green" /><Metric label="最近更新" value={jobs[0]?.updated_at?.slice(5, 10) || '—'} tone="orange" /></div><div className="toolbar"><div className="search"><span>⌕</span><input className="search-input" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && onSearch()} placeholder="搜索企业、岗位、地点或专业" /></div><select className="filter" aria-label="筛选企业行业" value={industryFilter} onChange={event => setIndustryFilter(event.target.value)}><option value="">筛选：全部行业</option>{industryOptions.map(code => <option value={code} key={code}>{TAG_LABELS[code] || code}</option>)}</select><select className="filter" aria-label="企业排序" value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="updated_desc">排序：最近更新</option><option value="jobs_desc">排序：岗位最多</option><option value="name_asc">排序：企业名称</option><option value="updated_asc">排序：最早更新</option></select><CompanyViewToggle mode={viewMode} onToggle={() => setViewMode(current => current === 'tiles' ? 'list' : 'tiles')} /></div>{selectionMode && <div className="company-management-bar"><span>{selectedIds.length ? `已选择 ${selectedIds.length} 个企业；第一个为主企业` : '请选择企业；第一个选择将作为主企业'}</span><div className="company-management-actions"><button className="secondary" disabled={selectedIds.length < 2 || Boolean(busy)} onClick={() => void manageCompanies('merge')}>{busy === 'merge-impact' || busy === 'merge' ? '合并处理中…' : `合并${selectedIds.length >= 2 ? `（${selectedIds.length}）` : ''}`}</button><button className="secondary danger" disabled={!selectedIds.length || Boolean(busy)} onClick={() => void manageCompanies('delete')}>{busy === 'delete-impact' || busy === 'delete' ? '删除处理中…' : `删除${selectedIds.length ? `（${selectedIds.length}）` : ''}`}</button></div></div>}{managementMessage && <div className="setting-help company-management-message">{managementMessage}</div>}{visibleCompanies.length ? <div className={`company-grid company-grid-${viewMode}`}>{visibleCompanies.map(company => { const selectionOrder = selectedIds.indexOf(company.id) + 1; return <CompanyCard key={company.id} company={company} selectable={selectionMode} selected={selectionOrder > 0} selectionOrder={selectionOrder} motionEnabled={viewMode === 'tiles'} onClick={() => selectionMode ? toggleSelection(company.id) : onOpen(company.id)} /> })}</div> : <EmptyState />}</>
 }
 
 function Metric({ label, value, tone }: { label: string; value: string | number; tone: string }) { return <div className="metric"><div className={`metric-icon ${tone}`}>{tone === 'blue' ? '◈' : tone === 'violet' ? '▣' : tone === 'green' ? '✓' : '◷'}</div><div><small>{label}</small><strong>{value}</strong></div></div> }
@@ -408,7 +427,80 @@ function CompanyTags({ tags, primaryIndustry, limit = 5 }: { tags?: CompanyTag[]
   const values = tags?.length ? tags : primaryIndustry ? [{ category: 'industry', code: primaryIndustry, label: TAG_LABELS[primaryIndustry] || primaryIndustry }] : []
   return <div className="chips company-tags">{values.slice(0, limit).map(tag => <span className={`company-tag ${tag.category}`} key={`${tag.category}-${tag.code}`}>{tag.label || TAG_LABELS[tag.code] || tag.code}</span>)}</div>
 }
-function CompanyCard({ company, onClick, selectable = false, selected = false, selectionOrder = 0 }: { company: Company; onClick: () => void; selectable?: boolean; selected?: boolean; selectionOrder?: number }) { return <button className={`company-card${selected ? ' selected-company-card' : ''}`} onClick={onClick}><div className="company-top"><div className="company-avatar">{company.display_name.slice(0, 1)}</div>{selectable ? <span className="company-select-indicator" aria-label={selected ? `第 ${selectionOrder} 个选择` : '未选择'}>{selected ? selectionOrder : '○'}</span> : <span className="more">···</span>}</div><h3>{company.display_name}</h3><CompanyTags tags={company.tags} primaryIndustry={company.primary_industry} /><div className="chips company-card-meta"><span>{company.job_count} 个岗位</span></div><p>{company.summary || '企业介绍将在联网检索或审核后补充。'}</p><div className="card-footer"><span>{selectable ? (selected ? `选择顺序 ${selectionOrder}` : '点击选择') : '最近更新'}</span><time>{selectable ? '' : company.updated_at?.replace('T', ' ').slice(0, 16) || '—'}</time><span className="arrow">{selectable ? (selected ? '✓' : '＋') : '→'}</span></div></button> }
+function CompanyViewToggle({ mode, onToggle }: { mode: CompanyViewMode; onToggle: () => void }) {
+  const isTiles = mode === 'tiles'
+  return <button type="button" className="view-toggle" aria-label={isTiles ? '当前为图块，切换为列表' : '当前为列表，切换为图块'} aria-pressed={isTiles} onClick={onToggle}>{isTiles ? <ListViewIcon /> : <TilesViewIcon />}</button>
+}
+
+function ListViewIcon() { return <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 6h14M5 12h14M5 18h14" /></svg> }
+function TilesViewIcon() { return <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><rect x="4" y="4" width="6" height="6" rx="1" /><rect x="14" y="4" width="6" height="6" rx="1" /><rect x="4" y="14" width="6" height="6" rx="1" /><rect x="14" y="14" width="6" height="6" rx="1" /></svg> }
+
+type CardMotion = { x: number; y: number; rotateX: number; rotateY: number }
+const ZERO_CARD_MOTION: CardMotion = { x: 0, y: 0, rotateX: 0, rotateY: 0 }
+
+function CompanyCard({ company, onClick, selectable = false, selected = false, selectionOrder = 0, motionEnabled = false }: { company: Company; onClick: () => void; selectable?: boolean; selected?: boolean; selectionOrder?: number; motionEnabled?: boolean }) {
+  const cardRef = useRef<HTMLButtonElement>(null)
+  const targetMotion = useRef<CardMotion>({ ...ZERO_CARD_MOTION })
+  const currentMotion = useRef<CardMotion>({ ...ZERO_CARD_MOTION })
+  const animationFrame = useRef<number | null>(null)
+  const prefersReducedMotion = () => {
+    const media = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-reduced-motion: reduce)') : null
+    return Boolean(media?.matches)
+  }
+  const animateMotion = () => {
+    const current = currentMotion.current
+    const target = targetMotion.current
+    current.x += (target.x - current.x) * 0.16
+    current.y += (target.y - current.y) * 0.16
+    current.rotateX += (target.rotateX - current.rotateX) * 0.16
+    current.rotateY += (target.rotateY - current.rotateY) * 0.16
+    const settled = Math.abs(target.x - current.x) < 0.01 && Math.abs(target.y - current.y) < 0.01 && Math.abs(target.rotateX - current.rotateX) < 0.01 && Math.abs(target.rotateY - current.rotateY) < 0.01
+    if (settled) {
+      current.x = target.x
+      current.y = target.y
+      current.rotateX = target.rotateX
+      current.rotateY = target.rotateY
+    }
+    if (cardRef.current) {
+      if (settled && target.x === 0 && target.y === 0 && target.rotateX === 0 && target.rotateY === 0) cardRef.current.style.removeProperty('transform')
+      else cardRef.current.style.transform = `translate3d(${current.x.toFixed(2)}px, ${current.y.toFixed(2)}px, 0) rotateX(${current.rotateX.toFixed(2)}deg) rotateY(${current.rotateY.toFixed(2)}deg)`
+    }
+    animationFrame.current = settled ? null : window.requestAnimationFrame(animateMotion)
+  }
+  const scheduleMotion = () => {
+    if (animationFrame.current === null) animationFrame.current = window.requestAnimationFrame(animateMotion)
+  }
+  const resetMotion = () => {
+    targetMotion.current = { ...ZERO_CARD_MOTION }
+    if (!motionEnabled || prefersReducedMotion()) {
+      currentMotion.current = { ...ZERO_CARD_MOTION }
+      if (animationFrame.current !== null) window.cancelAnimationFrame(animationFrame.current)
+      animationFrame.current = null
+      cardRef.current?.style.removeProperty('transform')
+      return
+    }
+    scheduleMotion()
+  }
+  const handlePointerMove = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!motionEnabled || event.pointerType !== 'mouse' || prefersReducedMotion()) return
+    const rect = event.currentTarget.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    const x = ((event.clientX - rect.left) / rect.width) * 2 - 1
+    const y = ((event.clientY - rect.top) / rect.height) * 2 - 1
+    targetMotion.current = { x: x * 4, y: y * 4, rotateX: y * -2, rotateY: x * 2 }
+    scheduleMotion()
+  }
+  useEffect(() => {
+    if (motionEnabled) return
+    targetMotion.current = { ...ZERO_CARD_MOTION }
+    currentMotion.current = { ...ZERO_CARD_MOTION }
+    if (animationFrame.current !== null) window.cancelAnimationFrame(animationFrame.current)
+    animationFrame.current = null
+    cardRef.current?.style.removeProperty('transform')
+  }, [motionEnabled])
+  useEffect(() => () => { if (animationFrame.current !== null) window.cancelAnimationFrame(animationFrame.current) }, [])
+  return <button type="button" ref={cardRef} className={`company-card${selected ? ' selected-company-card' : ''}${motionEnabled ? ' company-card-motion' : ''}`} onClick={onClick} onPointerMove={handlePointerMove} onPointerLeave={resetMotion} onPointerCancel={resetMotion}><div className="company-top"><div className="company-avatar">{company.display_name.slice(0, 1)}</div>{selectable ? <span className="company-select-indicator" aria-label={selected ? `第 ${selectionOrder} 个选择` : '未选择'}>{selected ? selectionOrder : '○'}</span> : <span className="more">···</span>}</div><h3>{company.display_name}</h3><CompanyTags tags={company.tags} primaryIndustry={company.primary_industry} /><div className="chips company-card-meta"><span>{company.job_count} 个岗位</span></div><p>{company.summary || '企业介绍将在联网检索或审核后补充。'}</p><div className="card-footer"><span>{selectable ? (selected ? `选择顺序 ${selectionOrder}` : '点击选择') : '最近更新'}</span><time>{selectable ? '' : company.updated_at?.replace('T', ' ').slice(0, 16) || '—'}</time><span className="arrow">{selectable ? (selected ? '✓' : '＋') : '→'}</span></div></button>
+}
 function EmptyState() { return <div className="empty-state"><div className="empty-icon">✦</div><h3>知识库还在等待第一条招聘信息</h3><p>从“导入信息”粘贴群消息或公开链接，系统会自动识别企业和岗位。</p></div> }
 
 type CompanyEditForm = {
