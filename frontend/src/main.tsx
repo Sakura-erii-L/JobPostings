@@ -69,6 +69,8 @@ function App() {
   const [syncing, setSyncing] = useState(false)
   const [researching, setResearching] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
+  const [pendingNavigation, setPendingNavigation] = useState<{ page: typeof page; settingsSection?: SettingsSection } | null>(null)
+  const [settingsSaveRequest, setSettingsSaveRequest] = useState(0)
 
   const loadData = async () => {
     const [companyData, jobData, applicationData, notificationData, timelineData] = await Promise.all([
@@ -166,7 +168,7 @@ function App() {
     const handlePopState = () => {
       if (settingsDirty && page === 'settings') {
         window.history.pushState(window.history.state, '', window.location.href)
-        setError('当前设置有未保存修改，请先保存、放弃或留在当前页。')
+        setPendingNavigation({ page: 'companies' })
         return
       }
       const companyId = window.history.state?.jobPostingsCompanyId
@@ -256,16 +258,21 @@ function App() {
     setNotifications(current => current.filter(item => item.id !== id))
   }
 
-  const navigate = (nextPage: typeof page, nextSettingsSection?: SettingsSection) => {
-    if (page === 'settings' && nextPage !== 'settings' && settingsDirty) {
-      setError('当前设置有未保存修改，请先保存、放弃或留在当前页。')
-      return
-    }
+  const completeNavigation = (nextPage: typeof page, nextSettingsSection?: SettingsSection) => {
     setPage(nextPage)
     setSelected(null)
     if (nextSettingsSection) setSettingsSection(nextSettingsSection)
     setMobileNavOpen(false)
     window.setTimeout(() => menuButtonRef.current?.focus(), 0)
+  }
+  const navigate = (nextPage: typeof page, nextSettingsSection?: SettingsSection) => {
+    if (page === 'settings' && nextPage !== 'settings' && settingsDirty) {
+      setPendingNavigation({ page: nextPage, settingsSection: nextSettingsSection })
+      setMobileNavOpen(false)
+      window.setTimeout(() => document.querySelector<HTMLElement>('.app-navigation-dialog button')?.focus(), 0)
+      return
+    }
+    completeNavigation(nextPage, nextSettingsSection)
   }
 
   return <div className="app-shell">
@@ -285,8 +292,9 @@ function App() {
       <button ref={menuButtonRef} className="mobile-menu-button" aria-expanded={mobileNavOpen} aria-controls="main-navigation" onClick={() => setMobileNavOpen(value => !value)}>☰ <span>菜单</span></button>
       {error && <div className="error-banner">{error}<button onClick={() => setError('')}>×</button></div>}
       {notice && <div className="notice">{notice}</div>}
+      {pendingNavigation && <div className="unsaved-dialog app-navigation-dialog" role="alertdialog" aria-live="assertive"><strong>当前设置有未保存修改</strong><span>离开前请选择保存、放弃或留在当前页。</span><div className="button-row"><button className="primary" onClick={() => setSettingsSaveRequest(value => value + 1)}>保存并离开</button><button className="secondary danger" onClick={() => { const next = pendingNavigation; setPendingNavigation(null); setSettingsDirty(false); completeNavigation(next.page, next.settingsSection) }}>放弃修改</button><button className="secondary" onClick={() => setPendingNavigation(null)}>留在当前页</button></div></div>}
       {!selected && notifications.filter(item => !item.read_at).slice(0, 3).map(item => <div className="notification-strip" key={item.id}><div><strong>{item.title}</strong><span>{item.body}</span></div><div className="notification-actions"><button onClick={() => markNotificationRead(item.id)}>知道了</button>{(item.kind === 'usage_warning' || item.kind?.startsWith('usage_warning_')) && <button onClick={() => snoozeNotificationForDay(item.id)}>今日不再提醒</button>}</div></div>)}
-      {selected ? <CompanyDetailShell company={selected} onBack={backFromCompany} onState={updateState} onFollow={followCompany} editable={isAdmin} onUpdated={updateCompany} /> : !canViewPage ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} /> : page === 'timeline' ? <TimelinePage events={timeline} onOpenCompany={openCompany} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData(); navigate('queue') }} /> : page === 'queue' ? <CompactQueuePage onSync={sync} syncing={syncing} /> : page === 'review' ? <ReviewPage onResolved={async () => { await loadData() }} /> : <SettingsCenter isAdmin={isAdmin} section={page === 'admin' ? 'invitations' : page === 'security' ? 'account' : settingsSection} onSectionChange={setSettingsSection} onDirtyChange={setSettingsDirty} onSaved={flash} onSync={sync} syncing={syncing} />}
+      {selected ? <CompanyDetailShell company={selected} onBack={backFromCompany} onState={updateState} onFollow={followCompany} editable={isAdmin} onUpdated={updateCompany} /> : !canViewPage ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} /> : page === 'timeline' ? <TimelinePage events={timeline} onOpenCompany={openCompany} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData(); navigate('queue') }} /> : page === 'queue' ? <CompactQueuePage onSync={sync} syncing={syncing} /> : page === 'review' ? <ReviewPage onResolved={async () => { await loadData() }} /> : <SettingsCenter isAdmin={isAdmin} section={page === 'admin' ? 'invitations' : page === 'security' ? 'account' : settingsSection} onSectionChange={setSettingsSection} onDirtyChange={setSettingsDirty} onSaved={flash} onSync={sync} syncing={syncing} externalSaveRequest={settingsSaveRequest} onExternalSaveHandled={ok => { if (!ok || !pendingNavigation) return; const next = pendingNavigation; setPendingNavigation(null); setSettingsDirty(false); completeNavigation(next.page, next.settingsSection) }} />}
     </main>
   </div>
 }
@@ -907,10 +915,14 @@ function AccountSecurityPage({ onDirtyChange, saveRequest, onSaveHandled }: { on
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [message, setMessage] = useState('')
+  const [saving, setSaving] = useState(false)
   const initialSaveRequest = useRef(saveRequest)
   const savePassword = async (event: FormEvent) => {
     event.preventDefault()
-    if (newPassword !== confirmPassword) { setMessage('两次输入的密码不一致'); return }
+    if (saving) return
+    if (newPassword.length < 8 || newPassword.length > 128) { setMessage('密码长度需为 8–128 位'); onSaveHandled?.(false); return }
+    if (newPassword !== confirmPassword) { setMessage('两次输入的密码不一致'); onSaveHandled?.(false); return }
+    setSaving(true)
     try {
       await api('/auth/password', { method: 'POST', body: JSON.stringify({ password: newPassword }) })
       setNewPassword('')
@@ -919,9 +931,10 @@ function AccountSecurityPage({ onDirtyChange, saveRequest, onSaveHandled }: { on
       onDirtyChange?.(false)
       onSaveHandled?.(true)
     } catch (e) { setMessage((e as Error).message); onSaveHandled?.(false) }
+    finally { setSaving(false) }
   }
   useEffect(() => { if (saveRequest !== initialSaveRequest.current) { initialSaveRequest.current = saveRequest; void savePassword(new Event('submit') as unknown as FormEvent) } }, [saveRequest])
-  return <><PageHeader eyebrow="账户与安全" title="账户与安全" description="仅修改当前账户的登录密码；邮箱验证码登录仍保留，但当前默认关闭。" /><section className="detail-card setting-section security-card"><h2>账号密码</h2><form onSubmit={savePassword}><label>新密码<input type="password" required minLength={8} maxLength={128} value={newPassword} onChange={e => { setNewPassword(e.target.value); onDirtyChange?.(true) }} placeholder="至少 8 位" /></label><label>确认新密码<input type="password" required minLength={8} maxLength={128} value={confirmPassword} onChange={e => { setConfirmPassword(e.target.value); onDirtyChange?.(true) }} placeholder="再次输入新密码" /></label><button className="primary" type="submit">保存密码</button>{message && <p className="setting-help">{message}</p>}</form></section></>
+  return <><PageHeader eyebrow="账户与安全" title="账户与安全" description="仅修改当前账户的登录密码；邮箱验证码登录仍保留，但当前默认关闭。" /><section className="detail-card setting-section security-card"><h2>账号密码</h2><form onSubmit={savePassword}><label>新密码<input type="password" required minLength={8} maxLength={128} value={newPassword} onChange={e => { setNewPassword(e.target.value); onDirtyChange?.(true) }} placeholder="至少 8 位" /></label><label>确认新密码<input type="password" required minLength={8} maxLength={128} value={confirmPassword} onChange={e => { setConfirmPassword(e.target.value); onDirtyChange?.(true) }} placeholder="再次输入新密码" /></label><button className="primary" type="submit" disabled={saving}>{saving ? '保存中…' : '保存密码'}</button>{message && <p className="setting-help">{message}</p>}</form></section></>
 }
 
 function LocalStoragePanel() {
@@ -959,11 +972,12 @@ function LocalStoragePanel() {
   return <section className="detail-card setting-section local-storage-section"><div className="section-title"><h2>本地数据管理</h2><button className="secondary" onClick={load} disabled={Boolean(busy)}>{busy === 'load' ? '刷新中…' : '刷新'}</button></div>{storage ? <><div className="storage-summary"><div className="storage-stat"><small>当前数据库</small><strong>{formatBytes(storage.database.size)}</strong><code>{storage.database.path}</code></div><div className="storage-stat"><small>聊天记录</small><strong>{storage.chat_records.messages} 条</strong><span>附件 {storage.chat_records.artifacts} 个 · {formatBytes(storage.chat_records.artifact_bytes)}</span></div><div className="storage-stat"><small>TraceMemo 缓存</small><strong>{storage.tracememo_cache.messages} 条</strong><span>{storage.tracememo_cache.groups} 个群 · {formatBytes(storage.tracememo_cache.bytes)}</span></div><div className="storage-stat"><small>本地 DB 备份</small><strong>{storage.backups.length} 个</strong><span>强制重取前会自动创建</span></div></div><div className="storage-actions"><button className="secondary danger" onClick={() => clear('cache')} disabled={Boolean(busy)}>清除 TraceMemo 缓存</button><button className="secondary danger" onClick={() => clear('chat-records')} disabled={Boolean(busy)}>清除本地聊天记录</button></div><p className="setting-help">清除缓存只影响后续同步是否访问 TraceMemo；清除聊天记录会删除原始消息、附件、相关处理队列和阶段日志，但保留已整理的企业与岗位目录。清除前请确认已有备份。</p><div className="storage-backups"><div className="section-title"><strong>本地数据库备份</strong><span>{storage.backups.length} 个</span></div>{storage.backups.length ? storage.backups.map(backup => <div className="storage-backup-row" key={backup.name}><div><strong>{backup.name}</strong><span>{formatBytes(backup.size)} · {formatDate(backup.created_at)}</span></div><button className="secondary danger" onClick={() => removeBackup(backup.name)} disabled={Boolean(busy)}>删除</button></div>) : <div className="empty-inline">暂无本地数据库备份；勾选强制重新获取时会自动创建。</div>}</div></> : <div className="loading-inline">加载本地存储信息…</div>}{message && <p className="setting-help">{message}</p>}</section>
 }
 
-function SettingsCenter({ isAdmin, section, onSectionChange, onDirtyChange, onSaved, onSync, syncing }: { isAdmin: boolean; section: SettingsSection; onSectionChange: (section: SettingsSection) => void; onDirtyChange: (dirty: boolean) => void; onSaved: (message: string) => void; onSync: () => Promise<void>; syncing: boolean }) {
+function SettingsCenter({ isAdmin, section, onSectionChange, onDirtyChange, onSaved, onSync, syncing, externalSaveRequest, onExternalSaveHandled }: { isAdmin: boolean; section: SettingsSection; onSectionChange: (section: SettingsSection) => void; onDirtyChange: (dirty: boolean) => void; onSaved: (message: string) => void; onSync: () => Promise<void>; syncing: boolean; externalSaveRequest?: number; onExternalSaveHandled?: (ok: boolean) => void }) {
   const [dirty, setDirty] = useState(false)
   const [pending, setPending] = useState<SettingsSection | null>(null)
   const [saveRequest, setSaveRequest] = useState(0)
   const [savePending, setSavePending] = useState(false)
+  const initialExternalSaveRequest = useRef(externalSaveRequest)
   const labels: Array<[SettingsSection, string, boolean]> = [['account', '账户与安全', true], ['invitations', '邀请与权限', isAdmin], ['connections', '连接服务', isAdmin], ['processing', '处理与隐私', isAdmin], ['storage', '存储与备份', isAdmin]]
   const visible = labels.filter(([, , allowed]) => allowed)
   const markDirty = (value: boolean) => { setDirty(value); onDirtyChange(value) }
@@ -975,12 +989,19 @@ function SettingsCenter({ isAdmin, section, onSectionChange, onDirtyChange, onSa
   const leaveAfterSave = () => { if (savePending) return; setSavePending(true); setSaveRequest(value => value + 1) }
   const savedAndLeave = (ok: boolean) => {
     setSavePending(false)
+    onExternalSaveHandled?.(ok)
     if (!ok || !pending) return
     markDirty(false)
     const next = pending
     setPending(null)
     onSectionChange(next)
   }
+  useEffect(() => {
+    if (externalSaveRequest === initialExternalSaveRequest.current) return
+    initialExternalSaveRequest.current = externalSaveRequest
+    if (dirty) { setSavePending(true); setSaveRequest(value => value + 1) }
+    else onExternalSaveHandled?.(false)
+  }, [externalSaveRequest, dirty])
   const cancelPending = () => setPending(null)
   return <><PageHeader eyebrow="工作台" title="设置与管理" description="按任务分区管理账户、连接、处理和本地存储。只显示当前选中的分区。" /><div className="settings-center"><aside className="settings-subnav" aria-label="设置分区"><label className="settings-mobile-label">当前设置分区<select className="settings-mobile-select" value={section} onChange={event => choose(event.target.value as SettingsSection)}>{visible.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>{visible.map(([value, label]) => <button key={value} className={section === value ? 'active' : ''} onClick={() => choose(value)}>{label}</button>)}</aside><section className="settings-panel">{pending && <div className="unsaved-dialog" role="alertdialog" aria-live="assertive"><strong>当前分区有未保存修改</strong><span>选择如何处理后再切换到“{labels.find(([value]) => value === pending)?.[1]}”。</span><div className="button-row"><button className="primary" disabled={savePending} onClick={leaveAfterSave}>{savePending ? "保存中…" : "保存并切换"}</button><button className="secondary danger" onClick={() => { markDirty(false); const next = pending; setPending(null); onSectionChange(next) }}>放弃修改</button><button className="secondary" onClick={cancelPending}>留在当前页</button></div></div>}{section === 'account' && <AccountSecurityPage onDirtyChange={markDirty} saveRequest={saveRequest} onSaveHandled={savedAndLeave} />} {section === 'invitations' && isAdmin && <div className="settings-invitation-page"><AdminPage onNavigate={target => onSectionChange(target === 'settings' ? 'connections' : 'invitations')} /></div>} {section === 'connections' && isAdmin && <SettingsConnectionsPage onSaved={onSaved} onDirtyChange={markDirty} saveRequest={saveRequest} onSaveHandled={savedAndLeave} onSync={onSync} syncing={syncing} />} {section === 'processing' && isAdmin && <SettingsProcessingPage onSaved={onSaved} onDirtyChange={markDirty} saveRequest={saveRequest} onSaveHandled={savedAndLeave} />} {section === 'storage' && isAdmin && <LocalStoragePanel />}</section></div></>
 }
