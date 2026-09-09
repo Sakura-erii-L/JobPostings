@@ -80,3 +80,10 @@
   .log-line { grid-template-columns:1fr; }
   .log-line pre { grid-column:auto; }
 }
+
+.queue-item { border-radius: 8px; box-shadow: none; }
+.queue-item-head .secondary, .queue-item-head .primary, .queue-item-actions button { min-height: 44px; }
+.queue-original, .queue-source-reference, .queue-subtasks { border-radius: 6px; }
+.queue-current-step { border-radius: 6px; }
+.queue-error { border-left: 3px solid #b4314e; border-radius: 4px; }
+.queue-log { background: #fbfcfd; padding: 0 10px 10px; }
