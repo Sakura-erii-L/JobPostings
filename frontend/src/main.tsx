@@ -1,7 +1,9 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import { motion } from 'motion/react'
 import './styles.css'
 import './queue.css'
+import { useJellyMotion } from './useJellyMotion'
 
 type User = { id: string; email: string; role: string; password_configured?: boolean }
 type CompanyTag = { category: 'company_type' | 'industry' | string; code: string; label: string }
@@ -435,71 +437,9 @@ function CompanyViewToggle({ mode, onToggle }: { mode: CompanyViewMode; onToggle
 function ListViewIcon() { return <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><path d="M5 6h14M5 12h14M5 18h14" /></svg> }
 function TilesViewIcon() { return <svg aria-hidden="true" viewBox="0 0 24 24" focusable="false"><rect x="4" y="4" width="6" height="6" rx="1" /><rect x="14" y="4" width="6" height="6" rx="1" /><rect x="4" y="14" width="6" height="6" rx="1" /><rect x="14" y="14" width="6" height="6" rx="1" /></svg> }
 
-type CardMotion = { x: number; y: number; rotateX: number; rotateY: number }
-const ZERO_CARD_MOTION: CardMotion = { x: 0, y: 0, rotateX: 0, rotateY: 0 }
-
 function CompanyCard({ company, onClick, selectable = false, selected = false, selectionOrder = 0, motionEnabled = false }: { company: Company; onClick: () => void; selectable?: boolean; selected?: boolean; selectionOrder?: number; motionEnabled?: boolean }) {
-  const cardRef = useRef<HTMLButtonElement>(null)
-  const targetMotion = useRef<CardMotion>({ ...ZERO_CARD_MOTION })
-  const currentMotion = useRef<CardMotion>({ ...ZERO_CARD_MOTION })
-  const animationFrame = useRef<number | null>(null)
-  const prefersReducedMotion = () => {
-    const media = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-reduced-motion: reduce)') : null
-    return Boolean(media?.matches)
-  }
-  const animateMotion = () => {
-    const current = currentMotion.current
-    const target = targetMotion.current
-    current.x += (target.x - current.x) * 0.16
-    current.y += (target.y - current.y) * 0.16
-    current.rotateX += (target.rotateX - current.rotateX) * 0.16
-    current.rotateY += (target.rotateY - current.rotateY) * 0.16
-    const settled = Math.abs(target.x - current.x) < 0.01 && Math.abs(target.y - current.y) < 0.01 && Math.abs(target.rotateX - current.rotateX) < 0.01 && Math.abs(target.rotateY - current.rotateY) < 0.01
-    if (settled) {
-      current.x = target.x
-      current.y = target.y
-      current.rotateX = target.rotateX
-      current.rotateY = target.rotateY
-    }
-    if (cardRef.current) {
-      if (settled && target.x === 0 && target.y === 0 && target.rotateX === 0 && target.rotateY === 0) cardRef.current.style.removeProperty('transform')
-      else cardRef.current.style.transform = `translate3d(${current.x.toFixed(2)}px, ${current.y.toFixed(2)}px, 0) rotateX(${current.rotateX.toFixed(2)}deg) rotateY(${current.rotateY.toFixed(2)}deg)`
-    }
-    animationFrame.current = settled ? null : window.requestAnimationFrame(animateMotion)
-  }
-  const scheduleMotion = () => {
-    if (animationFrame.current === null) animationFrame.current = window.requestAnimationFrame(animateMotion)
-  }
-  const resetMotion = () => {
-    targetMotion.current = { ...ZERO_CARD_MOTION }
-    if (!motionEnabled || prefersReducedMotion()) {
-      currentMotion.current = { ...ZERO_CARD_MOTION }
-      if (animationFrame.current !== null) window.cancelAnimationFrame(animationFrame.current)
-      animationFrame.current = null
-      cardRef.current?.style.removeProperty('transform')
-      return
-    }
-    scheduleMotion()
-  }
-  const handlePointerMove = (event: React.PointerEvent<HTMLButtonElement>) => {
-    if (!motionEnabled || event.pointerType !== 'mouse' || prefersReducedMotion()) return
-    const rect = event.currentTarget.getBoundingClientRect()
-    if (!rect.width || !rect.height) return
-    const x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-    const y = ((event.clientY - rect.top) / rect.height) * 2 - 1
-    targetMotion.current = { x: x * 4, y: y * 4, rotateX: y * -2, rotateY: x * 2 }
-    scheduleMotion()
-  }
-  useEffect(() => {
-    if (motionEnabled) return
-    targetMotion.current = { ...ZERO_CARD_MOTION }
-    currentMotion.current = { ...ZERO_CARD_MOTION }
-    if (animationFrame.current !== null) window.cancelAnimationFrame(animationFrame.current)
-    animationFrame.current = null
-    cardRef.current?.style.removeProperty('transform')
-  }, [motionEnabled])
-  useEffect(() => () => { if (animationFrame.current !== null) window.cancelAnimationFrame(animationFrame.current) }, [])
-  return <button type="button" ref={cardRef} className={`company-card${selected ? ' selected-company-card' : ''}${motionEnabled ? ' company-card-motion' : ''}`} onClick={onClick} onPointerMove={handlePointerMove} onPointerLeave={resetMotion} onPointerCancel={resetMotion}><div className="company-top"><div className="company-avatar">{company.display_name.slice(0, 1)}</div>{selectable ? <span className="company-select-indicator" aria-label={selected ? `第 ${selectionOrder} 个选择` : '未选择'}>{selected ? selectionOrder : '○'}</span> : <span className="more">···</span>}</div><h3>{company.display_name}</h3><CompanyTags tags={company.tags} primaryIndustry={company.primary_industry} /><div className="chips company-card-meta"><span>{company.job_count} 个岗位</span></div><p>{company.summary || '企业介绍将在联网检索或审核后补充。'}</p><div className="card-footer"><span>{selectable ? (selected ? `选择顺序 ${selectionOrder}` : '点击选择') : '最近更新'}</span><time>{selectable ? '' : company.updated_at?.replace('T', ' ').slice(0, 16) || '—'}</time><span className="arrow">{selectable ? (selected ? '✓' : '＋') : '→'}</span></div></button>
+  const jelly = useJellyMotion(motionEnabled)
+  return <button type="button" className={`company-card${selected ? ' selected-company-card' : ''}${motionEnabled ? ' company-card-motion' : ''}`} onClick={onClick} onPointerMove={jelly.onPointerMove} onPointerDown={jelly.onPointerDown} onPointerUp={jelly.onPointerUp} onPointerLeave={jelly.onPointerLeave} onPointerCancel={jelly.onPointerCancel}><motion.div className="company-card-visual" style={jelly.style}><div className="company-top"><div className="company-avatar">{company.display_name.slice(0, 1)}</div>{selectable ? <span className="company-select-indicator" aria-label={selected ? `第 ${selectionOrder} 个选择` : '未选择'}>{selected ? selectionOrder : '○'}</span> : <span className="more">···</span>}</div><h3>{company.display_name}</h3><CompanyTags tags={company.tags} primaryIndustry={company.primary_industry} /><div className="chips company-card-meta"><span>{company.job_count} 个岗位</span></div><p>{company.summary || '企业介绍将在联网检索或审核后补充。'}</p><div className="card-footer"><span>{selectable ? (selected ? `选择顺序 ${selectionOrder}` : '点击选择') : '最近更新'}</span><time>{selectable ? '' : company.updated_at?.replace('T', ' ').slice(0, 16) || '—'}</time><span className="arrow">{selectable ? (selected ? '✓' : '＋') : '→'}</span></div></motion.div></button>
 }
 function EmptyState() { return <div className="empty-state"><div className="empty-icon">✦</div><h3>知识库还在等待第一条招聘信息</h3><p>从“导入信息”粘贴群消息或公开链接，系统会自动识别企业和岗位。</p></div> }
 
