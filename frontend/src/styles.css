@@ -294,7 +294,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   transform-style: preserve-3d;
   isolation: isolate;
   overflow: hidden;
+  will-change: transform;
   transition: border-color .22s ease, box-shadow .22s ease;
+}
+.company-grid.company-grid-tiles .company-card-motion {
+  will-change: auto;
 }
 .company-grid.company-grid-tiles .company-card-visual::before,
 .company-grid.company-grid-tiles .company-card-visual::after {
