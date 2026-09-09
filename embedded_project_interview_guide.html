@@ -1,0 +1,1671 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>嵌入式项目面试讲解｜国赛寻宝 × 光电工程赛三车</title>
+  <style>
+    :root {
+      --bg: #08111f;
+      --panel: #0e1b2e;
+      --panel-2: #12243b;
+      --panel-3: #172d48;
+      --line: rgba(157, 190, 222, .18);
+      --text: #e9f2fb;
+      --muted: #9fb3c8;
+      --faint: #6f879f;
+      --cyan: #67e8f9;
+      --blue: #70a5ff;
+      --green: #72e0b0;
+      --yellow: #ffd479;
+      --orange: #ffad70;
+      --red: #ff8c9a;
+      --shadow: 0 22px 70px rgba(0, 0, 0, .22);
+      --radius: 16px;
+      --sidebar: 315px;
+    }
+
+    [data-theme="light"] {
+      --bg: #f2f6fa;
+      --panel: #ffffff;
+      --panel-2: #eef5fb;
+      --panel-3: #e4eff9;
+      --line: rgba(37, 66, 96, .16);
+      --text: #15283d;
+      --muted: #526b84;
+      --faint: #7890a7;
+      --cyan: #007f98;
+      --blue: #286ac4;
+      --green: #147d59;
+      --yellow: #9a6700;
+      --orange: #a14f10;
+      --red: #b52845;
+      --shadow: 0 22px 70px rgba(38, 74, 108, .12);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 80% -10%, rgba(50, 143, 194, .18), transparent 31rem),
+        radial-gradient(circle at -10% 30%, rgba(72, 103, 190, .12), transparent 27rem),
+        var(--bg);
+      font: 15px/1.72 "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    }
+
+    body.sidebar-collapsed { --sidebar: 0px; }
+
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button, input { font: inherit; }
+    code, pre, .mono { font-family: "Cascadia Code", "Consolas", "SFMono-Regular", monospace; }
+    code {
+      color: var(--cyan);
+      background: rgba(103, 232, 249, .08);
+      border: 1px solid rgba(103, 232, 249, .12);
+      border-radius: 5px;
+      padding: .08em .32em;
+      font-size: .92em;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: var(--sidebar) minmax(0, 1fr);
+    }
+
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: hidden auto;
+      padding: 22px 16px 28px;
+      background: rgba(8, 17, 31, .72);
+      border-right: 1px solid var(--line);
+      backdrop-filter: blur(18px);
+      transition: width .25s ease, padding .25s ease, opacity .25s ease;
+      z-index: 10;
+    }
+
+    [data-theme="light"] .sidebar { background: rgba(255, 255, 255, .84); }
+    .sidebar-collapsed .sidebar { width: 0; padding-left: 0; padding-right: 0; opacity: 0; pointer-events: none; }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      margin: 0 8px 22px;
+      white-space: nowrap;
+    }
+
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      display: grid;
+      place-items: center;
+      color: #06101c;
+      background: linear-gradient(135deg, var(--cyan), var(--blue));
+      border-radius: 12px;
+      font-weight: 900;
+      box-shadow: 0 8px 26px rgba(103, 232, 249, .24);
+    }
+
+    .brand strong { display: block; font-size: 14px; letter-spacing: .03em; }
+    .brand small { display: block; color: var(--muted); font-size: 11px; margin-top: 1px; }
+
+    .sidebar-tools {
+      display: grid;
+      gap: 9px;
+      margin: 0 2px 16px;
+    }
+
+    .search {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 11px;
+      color: var(--text);
+      background: var(--panel);
+      outline: none;
+    }
+
+    .search:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(103, 232, 249, .11); }
+
+    .tool-row { display: flex; gap: 8px; }
+    .tool-button, .top-button {
+      cursor: pointer;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 9px;
+      padding: 7px 10px;
+      transition: .18s ease;
+    }
+
+    .tool-button:hover, .top-button:hover {
+      color: var(--text);
+      border-color: rgba(103, 232, 249, .52);
+      transform: translateY(-1px);
+    }
+
+    .nav-title {
+      color: var(--faint);
+      font-size: 11px;
+      letter-spacing: .14em;
+      margin: 17px 8px 7px;
+      text-transform: uppercase;
+    }
+
+    .nav details { margin: 3px 0; }
+    .nav summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 8px 9px;
+      color: var(--muted);
+      border-radius: 9px;
+      user-select: none;
+    }
+
+    .nav summary::-webkit-details-marker { display: none; }
+    .nav summary::before { content: "▸"; display: inline-block; width: 17px; color: var(--faint); transition: transform .18s ease; }
+    .nav details[open] > summary::before { transform: rotate(90deg); color: var(--cyan); }
+    .nav summary:hover { color: var(--text); background: rgba(103, 232, 249, .06); }
+    .nav-level { margin: 1px 0 5px 12px; border-left: 1px solid var(--line); padding-left: 7px; }
+    .nav-level details summary { padding-top: 6px; padding-bottom: 6px; font-size: 13px; }
+    .nav-link {
+      display: block;
+      padding: 6px 9px;
+      color: var(--muted);
+      border-radius: 8px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .nav-link:hover, .nav-link.active {
+      color: var(--text);
+      background: linear-gradient(90deg, rgba(103, 232, 249, .14), transparent);
+      text-decoration: none;
+    }
+
+    .nav-link.active { box-shadow: inset 2px 0 0 var(--cyan); }
+    .nav-item-hidden { display: none !important; }
+
+    main {
+      min-width: 0;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 22px clamp(18px, 4vw, 62px) 80px;
+    }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      min-height: 48px;
+      margin: -22px 0 20px;
+      padding: 9px 0;
+      background: linear-gradient(var(--bg) 65%, transparent);
+    }
+
+    .topbar-left, .topbar-right { display: flex; align-items: center; gap: 8px; }
+    .topbar-status { color: var(--faint); font-size: 12px; }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 6vw, 68px);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background:
+        linear-gradient(135deg, rgba(21, 58, 91, .86), rgba(10, 25, 44, .88)),
+        var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    [data-theme="light"] .hero {
+      background: linear-gradient(135deg, #e5f4fb, #fff);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 380px;
+      height: 380px;
+      right: -125px;
+      top: -170px;
+      border: 1px solid rgba(103, 232, 249, .28);
+      border-radius: 50%;
+      box-shadow: 0 0 0 24px rgba(103, 232, 249, .05), 0 0 0 50px rgba(103, 232, 249, .035);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before { content: ""; width: 22px; height: 2px; background: var(--cyan); border-radius: 2px; }
+    h1, h2, h3, h4 { line-height: 1.25; margin: 0; letter-spacing: -.02em; }
+    h1 { max-width: 850px; font-size: clamp(31px, 5vw, 62px); margin-top: 17px; }
+    h2 { font-size: clamp(23px, 3vw, 34px); margin-bottom: 15px; }
+    h3 { font-size: 19px; margin-bottom: 10px; }
+    h4 { font-size: 15px; margin-bottom: 7px; }
+    p { margin: 8px 0; }
+    .lead { max-width: 850px; color: var(--muted); font-size: clamp(16px, 2vw, 19px); margin-top: 20px; }
+
+    .hero-meta, .tag-row, .stats, .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+    }
+
+    .hero-meta { margin-top: 25px; }
+    .pill, .tag, .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 9px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, .04);
+      font-size: 12px;
+    }
+
+    .pill.cyan, .tag.cyan { color: var(--cyan); border-color: rgba(103, 232, 249, .27); background: rgba(103, 232, 249, .08); }
+    .pill.green, .tag.green { color: var(--green); border-color: rgba(114, 224, 176, .27); background: rgba(114, 224, 176, .08); }
+    .pill.yellow, .tag.yellow { color: var(--yellow); border-color: rgba(255, 212, 121, .27); background: rgba(255, 212, 121, .08); }
+    .pill.orange, .tag.orange { color: var(--orange); border-color: rgba(255, 173, 112, .27); background: rgba(255, 173, 112, .08); }
+    .pill.red, .tag.red { color: var(--red); border-color: rgba(255, 140, 154, .27); background: rgba(255, 140, 154, .08); }
+
+    .section {
+      scroll-margin-top: 80px;
+      margin-top: 68px;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 20px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 14px;
+      margin-bottom: 20px;
+    }
+
+    .section-kicker { color: var(--cyan); font: 700 11px/1.2 "Cascadia Code", monospace; letter-spacing: .12em; margin-bottom: 8px; }
+    .section-note { max-width: 450px; color: var(--muted); font-size: 13px; text-align: right; }
+
+    .grid { display: grid; gap: 15px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      min-width: 0;
+      padding: 19px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(145deg, rgba(255,255,255,.045), rgba(255,255,255,.015)), var(--panel);
+      box-shadow: 0 9px 27px rgba(0, 0, 0, .08);
+    }
+
+    .card.accent-cyan { border-top: 2px solid var(--cyan); }
+    .card.accent-blue { border-top: 2px solid var(--blue); }
+    .card.accent-green { border-top: 2px solid var(--green); }
+    .card.accent-orange { border-top: 2px solid var(--orange); }
+    .card p:last-child { margin-bottom: 0; }
+    .muted { color: var(--muted); }
+    .faint { color: var(--faint); }
+    .small { font-size: 13px; }
+    .tiny { font-size: 12px; }
+    .accent { color: var(--cyan); }
+    .green-text { color: var(--green); }
+    .yellow-text { color: var(--yellow); }
+    .orange-text { color: var(--orange); }
+    .red-text { color: var(--red); }
+
+    .stat {
+      flex: 1 1 140px;
+      min-width: 125px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--panel);
+    }
+
+    .stat strong { display: block; color: var(--cyan); font-size: 25px; line-height: 1; }
+    .stat span { display: block; color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+    .callout {
+      margin: 15px 0;
+      padding: 14px 16px;
+      border-left: 3px solid var(--cyan);
+      border-radius: 0 11px 11px 0;
+      background: rgba(103, 232, 249, .07);
+    }
+
+    .callout.warn { border-left-color: var(--yellow); background: rgba(255, 212, 121, .08); }
+    .callout.danger { border-left-color: var(--red); background: rgba(255, 140, 154, .07); }
+    .callout strong { color: var(--text); }
+
+    ul.clean, ol.clean { margin: 8px 0 0; padding-left: 20px; }
+    ul.clean li, ol.clean li { margin: 4px 0; }
+    ul.clean li::marker, ol.clean li::marker { color: var(--cyan); }
+
+    .flow {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      overflow-x: auto;
+      padding: 4px 2px 12px;
+    }
+
+    .flow-step {
+      position: relative;
+      flex: 1 0 150px;
+      min-height: 86px;
+      padding: 13px 15px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--panel);
+    }
+
+    .flow-step + .flow-step { margin-left: 19px; }
+    .flow-step + .flow-step::before {
+      content: "→";
+      position: absolute;
+      left: -19px;
+      top: 28px;
+      width: 18px;
+      color: var(--cyan);
+      text-align: center;
+    }
+
+    .flow-step strong { display: block; font-size: 13px; margin-bottom: 4px; }
+    .flow-step span { color: var(--muted); font-size: 12px; line-height: 1.45; }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 32px minmax(0, 1fr) 32px minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+    }
+
+    .pipeline .arrow { color: var(--cyan); text-align: center; font-size: 23px; }
+    .pipeline-box { padding: 15px; border: 1px dashed var(--line); border-radius: 12px; background: var(--panel); }
+    .pipeline-box strong { display: block; color: var(--cyan); font-size: 13px; margin-bottom: 5px; }
+    .pipeline-box span { display: block; color: var(--muted); font-size: 12px; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 13px; }
+    table { width: 100%; min-width: 620px; border-collapse: collapse; background: var(--panel); }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    tr:last-child td { border-bottom: 0; }
+    th { color: var(--cyan); background: rgba(103, 232, 249, .06); font-size: 12px; font-weight: 700; }
+    td { color: var(--muted); font-size: 13px; }
+    td strong { color: var(--text); }
+
+    .source {
+      display: inline-block;
+      margin-top: 9px;
+      padding: 5px 8px;
+      color: var(--faint);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: rgba(0, 0, 0, .08);
+      font: 11px/1.5 "Cascadia Code", "Consolas", monospace;
+      word-break: break-all;
+    }
+
+    pre {
+      position: relative;
+      overflow: auto;
+      margin: 12px 0 0;
+      padding: 16px 17px;
+      color: #d9efff;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #07101d;
+      font-size: 12px;
+      line-height: 1.65;
+      white-space: pre-wrap;
+    }
+
+    [data-theme="light"] pre { color: #20435f; background: #edf5fa; }
+    .copy {
+      position: absolute;
+      right: 8px;
+      top: 8px;
+      cursor: pointer;
+      padding: 4px 7px;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255,255,255,.06);
+      font-size: 11px;
+    }
+    .copy:hover { color: var(--cyan); }
+
+    details.qa {
+      margin: 9px 0;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--panel);
+    }
+    details.qa summary {
+      cursor: pointer;
+      padding: 12px 14px;
+      color: var(--text);
+      font-weight: 700;
+      list-style: none;
+    }
+    details.qa summary::-webkit-details-marker { display: none; }
+    details.qa summary::before { content: "+"; display: inline-block; width: 21px; color: var(--cyan); }
+    details.qa[open] summary::before { content: "−"; }
+    .answer { padding: 0 14px 14px 35px; color: var(--muted); }
+
+    .timeline { display: grid; gap: 0; }
+    .timeline-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: 105px minmax(0, 1fr);
+      gap: 17px;
+      padding: 0 0 23px;
+    }
+    .timeline-item::before {
+      content: "";
+      position: absolute;
+      left: 105px;
+      top: 5px;
+      bottom: -1px;
+      width: 1px;
+      background: var(--line);
+    }
+    .timeline-item:last-child::before { display: none; }
+    .timeline-label { color: var(--cyan); font: 700 12px/1.4 "Cascadia Code", monospace; }
+    .timeline-dot {
+      position: absolute;
+      left: 101px;
+      top: 2px;
+      width: 9px;
+      height: 9px;
+      border: 2px solid var(--bg);
+      border-radius: 50%;
+      background: var(--cyan);
+      z-index: 1;
+    }
+    .timeline-content { padding-left: 18px; }
+    .timeline-content strong { display: block; margin-bottom: 4px; }
+    .timeline-content span { color: var(--muted); font-size: 13px; }
+
+    .checklist {
+      display: grid;
+      gap: 8px;
+      margin-top: 9px;
+    }
+    .check {
+      display: flex;
+      gap: 9px;
+      align-items: flex-start;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .check::before { content: "✓"; flex: 0 0 auto; color: var(--green); font-weight: 800; }
+    .check.warn::before { content: "!"; color: var(--yellow); }
+    .check.danger::before { content: "×"; color: var(--red); }
+
+    .quote {
+      margin: 0;
+      padding: 17px 19px;
+      border: 1px solid rgba(103, 232, 249, .2);
+      border-radius: 12px;
+      color: var(--text);
+      background: linear-gradient(135deg, rgba(103, 232, 249, .08), rgba(112, 165, 255, .05));
+    }
+    .quote::before { content: "“"; color: var(--cyan); font-size: 28px; line-height: 0; vertical-align: -8px; margin-right: 4px; }
+
+    .role-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 13px; }
+    .role { padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
+    .role strong { display: block; margin-bottom: 5px; }
+    .role span { color: var(--muted); font-size: 13px; }
+
+    .footer {
+      margin-top: 75px;
+      padding-top: 18px;
+      color: var(--faint);
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+    }
+
+    .hide-on-search { display: none !important; }
+
+    @media (max-width: 1050px) {
+      .grid.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 760px) {
+      :root { --sidebar: 285px; }
+      .app { display: block; }
+      .sidebar {
+        position: fixed;
+        left: 0;
+        top: 0;
+        width: var(--sidebar);
+        box-shadow: var(--shadow);
+      }
+      .sidebar-collapsed .sidebar { width: 0; }
+      main { padding: 18px 15px 58px; }
+      .topbar { margin: -18px 0 17px; }
+      .topbar-status { display: none; }
+      .hero { padding: 27px 22px; border-radius: 18px; }
+      .grid.two, .grid.three, .grid.four, .role-grid { grid-template-columns: 1fr; }
+      .section { margin-top: 49px; }
+      .section-head { display: block; }
+      .section-note { margin-top: 9px; text-align: left; }
+      .pipeline { grid-template-columns: 1fr; }
+      .pipeline .arrow { transform: rotate(90deg); }
+      .timeline-item { grid-template-columns: 77px minmax(0, 1fr); gap: 12px; }
+      .timeline-item::before { left: 77px; }
+      .timeline-dot { left: 73px; }
+      .timeline-content { padding-left: 13px; }
+    }
+
+    @media print {
+      :root { --bg: #fff; --panel: #fff; --panel-2: #fff; --text: #111; --muted: #333; --line: #ccc; }
+      body { background: #fff; }
+      .sidebar, .topbar, .copy { display: none !important; }
+      .app { display: block; }
+      main { max-width: none; padding: 0; }
+      .hero, .card, .table-wrap, details.qa { box-shadow: none; break-inside: avoid; }
+      .hero { border: 1px solid #aaa; }
+      .section { margin-top: 35px; }
+      details.qa:not([open]) .answer { display: block; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">嵌</div>
+        <div>
+          <strong>嵌入式面试讲解</strong>
+          <small>两个比赛项目的源码化表达</small>
+        </div>
+      </div>
+
+      <div class="sidebar-tools">
+        <input class="search" id="search" type="search" placeholder="搜索：PID、二维码、颜色、舵机…">
+        <div class="tool-row">
+          <button class="tool-button" id="themeButton" type="button">切换主题</button>
+          <button class="tool-button" id="printButton" type="button">打印 / PDF</button>
+        </div>
+      </div>
+
+      <div class="nav-title">Contents</div>
+      <nav class="nav" id="nav">
+        <a class="nav-link" href="#home" data-scroll>首页：怎么使用</a>
+        <details open data-nav-group>
+          <summary>一、国赛寻宝｜STM32 赛场车</summary>
+          <div class="nav-level">
+            <a class="nav-link" href="#p1-position" data-scroll>1. 项目定位与讲法</a>
+            <details open data-nav-group>
+              <summary>系统与底层</summary>
+              <div class="nav-level">
+                <a class="nav-link" href="#p1-architecture" data-scroll>系统架构与数据流</a>
+                <a class="nav-link" href="#p1-hardware" data-scroll>硬件接口地图</a>
+                <a class="nav-link" href="#p1-motor" data-scroll>电机与编码器闭环</a>
+                <a class="nav-link" href="#p1-tracking" data-scroll>8 路循迹与控制模式</a>
+                <a class="nav-link" href="#p1-sensing" data-scroll>姿态、条件与安全传感</a>
+              </div>
+            </details>
+            <details open data-nav-group>
+              <summary>任务与面试</summary>
+              <div class="nav-level">
+                <a class="nav-link" href="#p1-mission" data-scroll>任务编排与二维码路由</a>
+                <a class="nav-link" href="#p1-obstacle" data-scroll>门、障碍与回退</a>
+                <a class="nav-link" href="#p1-script" data-scroll>60 秒讲稿</a>
+                <a class="nav-link" href="#p1-qa" data-scroll>高频追问</a>
+                <a class="nav-link" href="#p1-resume" data-scroll>简历表述</a>
+              </div>
+            </details>
+          </div>
+        </details>
+        <details open data-nav-group>
+          <summary>二、光电工程赛｜三车中的 3 号车</summary>
+          <div class="nav-level">
+            <a class="nav-link" href="#p2-position" data-scroll>1. 项目定位与讲法</a>
+            <details open data-nav-group>
+              <summary>感知与运动</summary>
+              <div class="nav-level">
+                <a class="nav-link" href="#p2-architecture" data-scroll>系统架构与当前入口</a>
+                <a class="nav-link" href="#p2-hardware" data-scroll>硬件与引脚</a>
+                <a class="nav-link" href="#p2-color" data-scroll>TCS3200 颜色识别</a>
+                <a class="nav-link" href="#p2-motion" data-scroll>前后循迹与定位</a>
+                <a class="nav-link" href="#p2-servo" data-scroll>PCA9685 与双钩机构</a>
+              </div>
+            </details>
+            <details open data-nav-group>
+              <summary>任务与面试</summary>
+              <div class="nav-level">
+                <a class="nav-link" href="#p2-task1" data-scroll>任务一：CAE 取放</a>
+                <a class="nav-link" href="#p2-task2" data-scroll>任务二：F/G 与 C/D/E 堆叠</a>
+                <a class="nav-link" href="#p2-script" data-scroll>60 秒讲稿</a>
+                <a class="nav-link" href="#p2-qa" data-scroll>高频追问</a>
+                <a class="nav-link" href="#p2-resume" data-scroll>简历表述</a>
+              </div>
+            </details>
+          </div>
+        </details>
+        <details open data-nav-group>
+          <summary>三、统一面试策略</summary>
+          <div class="nav-level">
+            <a class="nav-link" href="#compare" data-scroll>按岗位选择项目</a>
+            <a class="nav-link" href="#combined-script" data-scroll>组合自我介绍</a>
+            <a class="nav-link" href="#truth-boundary" data-scroll>真实性边界与补强</a>
+            <a class="nav-link" href="#source-map" data-scroll>源码证据索引</a>
+          </div>
+        </details>
+      </nav>
+    </aside>
+
+    <main>
+      <div class="topbar">
+        <div class="topbar-left">
+          <button class="top-button" id="sidebarButton" type="button">☰ 菜单</button>
+          <span class="topbar-status" id="sectionStatus">正在阅读：首页</span>
+        </div>
+        <div class="topbar-right">
+          <span class="pill cyan">standalone HTML</span>
+          <span class="pill">源码核对版</span>
+        </div>
+      </div>
+
+      <section class="hero section" id="home" data-title="首页：怎么使用">
+        <div class="eyebrow">Embedded Interview Portfolio</div>
+        <h1>把“做得简单”讲成<br><span class="accent">完整、可调试、可追问</span>的系统</h1>
+        <p class="lead">这份材料依据两个项目目录中的实际源码，整理成可直接用于嵌入式岗位面试的讲解页面。重点不是堆砌器件名称，而是把“传感器输入 → 控制算法 → 执行器输出 → 任务决策 → 异常回退”讲成一条完整数据链。</p>
+        <div class="hero-meta">
+          <span class="pill cyan">项目 1 · STM32F4 · 四轮闭环 · 寻宝路线</span>
+          <span class="pill green">项目 2 · Arduino 类平台 · 颜色识别 · 双钩堆叠</span>
+          <span class="pill yellow">适合：嵌入式软件 / 运动控制 / 机器人</span>
+        </div>
+      </section>
+
+      <section class="section" id="how-to-use" data-title="使用原则">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">START HERE</div>
+            <h2>先记住三条面试原则</h2>
+          </div>
+          <div class="section-note">左侧菜单可以逐层展开；代码中的函数名、变量名和参数保留原文，方便你回到工程核对。</div>
+        </div>
+        <div class="grid three">
+          <div class="card accent-cyan">
+            <h3>讲工程链路</h3>
+            <p class="muted">不要只说“用了 STM32、PID、传感器”。要说清楚输入在哪里采样、多久更新一次、怎样转成左右轮目标、怎样限幅、怎样停机。</p>
+          </div>
+          <div class="card accent-green">
+            <h3>讲真实边界</h3>
+            <p class="muted">源码能证明“实现了哪些机制”，但不能自动证明你的个人分工、比赛名次或成功率。没有数据就不编数据；没有主导就不说主导。</p>
+          </div>
+          <div class="card accent-orange">
+            <h3>讲一个难点</h3>
+            <p class="muted">每个项目至少准备一个“现象 → 定位 → 修改/调参 → 验证”的故事。面试官往往通过这个故事判断你是否真正上过车。</p>
+          </div>
+        </div>
+        <div class="callout warn"><strong>个人分工提示：</strong>我能从源码还原系统结构，但不能从目录判断你个人负责了哪些模块。下面的第一人称段落是可编辑模板：只有你确实做过的部分才用“我负责/我实现”，其余改成“我参与/我了解”。</div>
+      </section>
+
+      <section class="section" id="p1-position" data-title="项目 1：定位与讲法">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">PROJECT 01 · STM32F4</div>
+            <h2>国赛寻宝：四轮闭环 + 多传感器赛场车</h2>
+          </div>
+          <div class="section-note">推荐作为“嵌入式软件 / 运动控制 / 底层驱动”主项目。</div>
+        </div>
+        <div class="grid two">
+          <div class="card accent-cyan">
+            <h3>一句话定位</h3>
+            <p>这是一个基于 STM32F4 的场地任务车：通过 8 路激光/红外传感器循迹，通过四路编码器做独立车轮速度闭环，通过 JY901 姿态角辅助直行、坡面和转向，再由二维码平台信息和门状态决定路线。</p>
+            <div class="tag-row">
+              <span class="tag cyan">C</span><span class="tag cyan">STM32 StdPeriph</span><span class="tag cyan">PWM</span><span class="tag cyan">Encoder mode</span><span class="tag cyan">PID</span>
+            </div>
+            <span class="source">源码：D:\Projects\比赛\国赛寻宝\总程序\USER\main.c；HARDWARE\Encoder、Motor、Trailing、Mission</span>
+          </div>
+          <div class="card accent-green">
+            <h3>不要这样说</h3>
+            <p class="muted">“就是让小车沿黑线跑，然后到几个点停一下。”</p>
+            <h3 style="margin-top:16px">应该这样说</h3>
+            <p class="quote">我把系统拆成了实时运动控制层和上层任务层。运动控制层在固定周期采样编码器和传感器，生成四个车轮的 PWM；任务层把坡面、跷跷板、门、二维码路线等赛道元素封装成可组合的动作函数，并在门不可通行时回退到下一条路径。</p>
+          </div>
+        </div>
+        <div class="stats" style="margin-top:15px">
+          <div class="stat"><strong>4</strong><span>独立车轮编码器反馈通道</span></div>
+          <div class="stat"><strong>8</strong><span>循迹输入，支持多种权重模式</span></div>
+          <div class="stat"><strong>10 ms</strong><span>TIM9 速度控制更新周期</span></div>
+          <div class="stat"><strong>4 + 3</strong><span>门状态与平台二维码数据</span></div>
+        </div>
+      </section>
+
+      <section class="section" id="p1-architecture" data-title="项目 1：架构与数据流">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · ARCHITECTURE</div>
+            <h2>系统架构：两条节奏不同的执行链</h2>
+          </div>
+          <div class="section-note">面试时先画这个，再展开某一层；不要一上来背函数名。</div>
+        </div>
+        <div class="pipeline">
+          <div class="pipeline-box"><strong>实时采样</strong><span>8 路 Laser、碰撞、红外；TIM2–TIM5 编码器；USART3 接收 JY901。</span></div>
+          <div class="arrow">→</div>
+          <div class="pipeline-box"><strong>控制计算</strong><span><code>GoStraight_Ahead()</code> 算左右目标速度；<code>Pid_control()</code> 做四轮速度闭环。</span></div>
+          <div class="arrow">→</div>
+          <div class="pipeline-box"><strong>执行输出</strong><span>TIM1/TIM8 八路 PWM 驱动 H 桥；TIM10/11/13/14 控制舵机；OLED 显示状态。</span></div>
+        </div>
+        <div class="flow" style="margin-top:17px">
+          <div class="flow-step"><strong>任务层</strong><span><code>ALL()</code>、<code>pathX_Y()</code>、<code>part_door()</code>、<code>part_seesaw()</code></span></div>
+          <div class="flow-step"><strong>路线参数</strong><span><code>order_speed</code> + <code>order_detect</code>，切换速度和循迹模式</span></div>
+          <div class="flow-step"><strong>10 ms 定时中断</strong><span><code>GoStraight_Ahead()</code>、姿态刷新、OLED 刷新</span></div>
+          <div class="flow-step"><strong>底层闭环</strong><span>目标转速 → 误差 → 控制量 → PWM</span></div>
+        </div>
+        <div class="grid two" style="margin-top:15px">
+          <div class="card">
+            <h3>实时链：不能被任务逻辑打断</h3>
+            <p class="muted"><code>TIM9</code> 每 10 ms 读取四个编码器计数，清零/回中计数器，累计距离，并在 <code>PID_flag == 1</code> 时调用 <code>Pid_control()</code>。另一条 <code>TIM12</code> 中断调用 <code>GoStraight_Ahead()</code>，按当前模式把传感器状态变成左右轮目标速度。</p>
+            <span class="source">HARDWARE\Encoder\Encoder.c:148-200；HARDWARE\Routine\Routine.c:69-131</span>
+          </div>
+          <div class="card">
+            <h3>任务链：阻塞式动作的组合</h3>
+            <p class="muted"><code>Mission.c</code> 中很多动作通过 <code>wait_for_condition()</code>、<code>until_distance()</code> 和 <code>delay_ms()</code> 等待阶段完成，再切换 <code>order_speed/order_detect</code>。它很适合比赛快速迭代，但面试时要主动承认：这种写法对超时、取消和可测试性仍有改进空间。</p>
+            <span class="source">HARDWARE\Mission\Mission.c:31-220；Mission.c:2180-2270</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="p1-hardware" data-title="项目 1：硬件接口地图">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · HARDWARE MAP</div>
+            <h2>硬件接口：按“输入 / 控制器 / 输出”讲</h2>
+          </div>
+          <div class="section-note">端口号可以追问；先说功能，再给具体外设。</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>子系统</th><th>源码中的实现</th><th>面试可讲的工程意义</th><th>证据</th></tr></thead>
+            <tbody>
+              <tr><td><strong>主控</strong></td><td>STM32F4 标准外设库风格，工程包含 <code>system_stm32f4xx</code> 与 <code>stm32f4xx</code>。</td><td>裸机/中断驱动，直接配置 GPIO、TIM、USART、NVIC；适合讲寄存器外设理解。</td><td><span class="mono">USER\Template.uvprojx</span>、<span class="mono">USER\main.c</span></td></tr>
+              <tr><td><strong>四轮电机</strong></td><td>TIM1、TIM8 各 4 个比较通道；左右前后各一组 PWM1/PWM2 控制方向和占空比。</td><td>将正负速度统一成 H 桥两路互斥输出，并在 <code>Motor_control()</code> 内做限幅。</td><td><span class="mono">HARDWARE\Motor\Motor.c:17-160</span></td></tr>
+              <tr><td><strong>四路编码器</strong></td><td>TIM2、TIM3、TIM4、TIM5 配置为编码器接口模式，A/B 两相输入。</td><td>每个轮子独立反馈，补偿电机/轮胎/负载差异，而不是只给左右侧一个开环 PWM。</td><td><span class="mono">HARDWARE\Encoder\Encoder.c:57-145</span></td></tr>
+              <tr><td><strong>循迹与安全</strong></td><td>8 路 Laser；PF14/PF15 碰撞开关；PG14 红外挡板/障碍输入，均按低电平有效转换。</td><td>循迹、碰撞、起始挡板是不同语义的输入，分别进入运动控制和任务状态。</td><td><span class="mono">HARDWARE\Sensor\Sensor.c:7-90</span></td></tr>
+              <tr><td><strong>姿态</strong></td><td>USART3 PB10/PB11，115200，接收 JY901 的 0x55、11 字节数据帧。</td><td>用 <code>angle_z</code> 辅助直行/原地转向，用 <code>angle_x/angle_y</code> 判断坡面和跷跷板状态。</td><td><span class="mono">HARDWARE\Gyroscope\USART3\USART3.c:36-194</span></td></tr>
+              <tr><td><strong>扫码/调试</strong></td><td>USART1 读取扫码器或图片数字；USART2 接收蓝牙命令并输出调试帧；OLED 显示角度、速度、模式、门状态。</td><td>通信不只是“打印日志”：它承担路线输入、急停/复位和现场调参可视化。</td><td><span class="mono">HARDWARE\USART1\USART1.c:30-242</span>；<span class="mono">bluetooth.c:35-211</span></td></tr>
+              <tr><td><strong>机械舵机</strong></td><td>TIM10、TIM11、TIM13、TIM14 控制弯腰、摇头、左右摆臂。</td><td>把动作封装为 <code>bend_up()</code>、<code>Shaking_head()</code>、<code>Swing_arms()</code>，上层任务只调用语义函数。</td><td><span class="mono">HARDWARE\Steering\Steering.c:4-118</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="p1-motor" data-title="项目 1：电机与编码器闭环">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · MOTION CONTROL</div>
+            <h2>最值得展开的底层：四轮速度闭环</h2>
+          </div>
+          <div class="section-note">这是你从“会调用库”升级到“理解控制链”的核心。</div>
+        </div>
+        <div class="grid two">
+          <div class="card accent-blue">
+            <h3>1. PWM 输出</h3>
+            <ul class="clean muted">
+              <li><code>Motor_Init()</code> 开启 TIM1/TIM8 与 GPIOA/GPIOC 复用。</li>
+              <li>注释给出的通道映射：PA8–PA11 和 PC6–PC9，共 8 个比较通道。</li>
+              <li>预分频 <code>56 - 1</code>、周期 <code>300 - 1</code>，按源码注释对应约 10 kHz PWM。</li>
+              <li><code>Motor_control()</code> 先把输入限制在 <code>±PWM_limit</code>，再用正负号选择 H 桥方向通道。</li>
+            </ul>
+          </div>
+          <div class="card accent-cyan">
+            <h3>2. 10 ms 采样</h3>
+            <ul class="clean muted">
+              <li>TIM2–TIM5 工作在 encoder interface，计数器从 <code>HALF_ARR</code> 中点开始。</li>
+              <li>TIM9 预分频 <code>167</code>、周期 <code>9999</code>，源码按 168 MHz 定时为 10 ms 更新。</li>
+              <li>中断读取计数器相对中点的变化，左右轮根据安装方向做符号统一，然后立即把计数器回到中点。</li>
+              <li>这样得到的是“过去 10 ms 的脉冲变化”，而不是累计计数器溢出后的绝对值。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>3. 四个轮子分别算误差</h3>
+          <p class="muted">源码把目标速度换算成目标脉冲量，再减去实际脉冲对应量。以左前轮为例，代码形式是：</p>
+          <pre><button class="copy" data-copy>复制</button><code>error_left_front = left_speed * 44
+                    - Pulsedete_Left_front * 115.385;</code></pre>
+          <p class="muted">之后在 <code>REAL_PID</code> 分支中维护四个通道各自的 <code>integral[]</code>、<code>derivative[]</code>、上次误差和上次控制量：</p>
+          <pre><button class="copy" data-copy>复制</button><code>Control_i = Kp[i] * error_i
+          + Ki[i] * integral[i]
+          + Kd[i] * derivative[i]
+          + Control_i_last;</code></pre>
+          <div class="grid three" style="margin-top:15px">
+            <div class="role"><strong>为什么四路独立</strong><span>四个轮子的摩擦、负载、安装误差不完全相同；独立反馈可以让左右侧和前后轮的速度更一致。</span></div>
+            <div class="role"><strong>为什么要限幅</strong><span>控制量限制在源码的 ±10000，随后按 0.015 缩放成 PWM；避免积分/瞬态误差把输出推到不可控范围。</span></div>
+            <div class="role"><strong>低脉冲特殊处理</strong><span>当某轮脉冲绝对值小于 2，源码用比例补偿并清积分，减少静止/低速时积分累积。</span></div>
+          </div>
+          <span class="source">HARDWARE\Encoder\Encoder.h:9-71；HARDWARE\Encoder\Encoder.c:250-517</span>
+        </div>
+        <div class="card accent-green" style="margin-top:15px">
+          <h3>4. 距离闭环如何服务任务层</h3>
+          <p class="muted"><code>until_distance(exp)</code> 和 <code>can_go_distance(exp, timeout_ms)</code> 把四轮脉冲的平均值换算为距离。公式使用了源码中的 <code>52</code>、<code>44</code>、轮径 <code>10.4</code> 和 π。前者等待达到目标距离；后者额外检查超时和 <code>OBSTACLE</code>，返回成功/失败。任务层因此可以说“前进 55 cm 后判断门是否允许通过”，而不是只用固定延时。</p>
+          <span class="source">HARDWARE\Encoder\Encoder.c:327-386</span>
+        </div>
+        <div class="callout warn"><strong>面试追问的诚实答法：</strong>源码把控制计算放在中断里，且大量任务函数是阻塞式的。你可以说“比赛版本优先保证时序和快速调参；如果做产品化，我会把采样、控制、任务调度拆成明确周期任务，并增加积分抗饱和、超时、急停优先级和日志回放”。</div>
+      </section>
+
+      <section class="section" id="p1-tracking" data-title="项目 1：8 路循迹">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · LINE FOLLOWING</div>
+            <h2>8 路循迹不是一个函数，而是一组“控制模式”</h2>
+          </div>
+          <div class="section-note"><code>order_speed</code> 决定速度，<code>order_detect</code> 决定当前传感器解释方式。</div>
+        </div>
+        <div class="card">
+          <h3>共同计算骨架</h3>
+          <div class="flow">
+            <div class="flow-step"><strong>采样</strong><span><code>Laser_detect_Scan()</code> 读取 8 路，低电平有效并做 3 次 AND 采样。</span></div>
+            <div class="flow-step"><strong>加权</strong><span>检测到的通道累加 <code>Speed_differential[i]</code>。</span></div>
+            <div class="flow-step"><strong>差速</strong><span><code>left = order_speed - diff</code>；<code>right = order_speed + diff</code>。</span></div>
+            <div class="flow-step"><strong>闭环</strong><span>左右目标速度进入四轮 <code>Pid_control()</code>。</span></div>
+          </div>
+          <span class="source">HARDWARE\Trailing\Trailing.c:1-315</span>
+        </div>
+        <div class="table-wrap" style="margin-top:15px">
+          <table>
+            <thead><tr><th>模式</th><th>权重策略</th><th>适用场景</th><th>面试解释</th></tr></thead>
+            <tbody>
+              <tr><td><strong>State_Common</strong></td><td><code>140,90,40,10,-10,-40,-90,-140</code></td><td>普通直线/弯道</td><td>全 8 路参与，横向偏差分辨率高，适合常规循迹。</td></tr>
+              <tr><td><strong>State_Limit</strong></td><td>只强调中间附近的通道</td><td>平台、坡前、需要减少误触边线</td><td>通过缩小有效传感器区域，避免边缘线把车辆拉偏。</td></tr>
+              <tr><td><strong>State_AbLimit</strong></td><td>主要使用中心两路</td><td>窄路、特殊定位段</td><td>牺牲转弯灵敏度，换取中心保持。</td></tr>
+              <tr><td><strong>State_Left1/2</strong></td><td>提高左侧权重</td><td>小于/接近 90° 的左转段</td><td>让循迹控制提前朝目标分支收敛。</td></tr>
+              <tr><td><strong>State_Right1/2</strong></td><td>提高右侧权重</td><td>小于/接近 90° 的右转段</td><td>与左转模式对称，配合路线函数选择分支。</td></tr>
+              <tr><td><strong>State_Gyro_straight</strong></td><td>不依赖线偏差，使用 <code>angle_z</code></td><td>坡面、断线、需要保持航向的直行</td><td>角度误差变成左右轮差速，补偿车辆偏航。</td></tr>
+              <tr><td><strong>State_Up_seesaw</strong></td><td>使用 <code>angle_x</code>，系数 <code>K_angle_x=6</code></td><td>上跷跷板</td><td>利用姿态变化保持车身受力更稳定。</td></tr>
+              <tr><td><strong>State_no_detect</strong></td><td>左右同速</td><td>已知安全直线或动作过渡</td><td>关闭循迹修正，作为确定性动作的一部分。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid two" style="margin-top:15px">
+          <div class="card">
+            <h3>可直接说的控制细节</h3>
+            <p class="muted">“我的路线函数不是每一段都重新写一套电机控制，而是修改全局的速度目标和循迹模式。10 ms 中断统一读取当前模式，执行同一套差速和 PID，这样路线层只负责策略，控制层负责实时性。”</p>
+          </div>
+          <div class="card">
+            <h3>不要夸大的地方</h3>
+            <p class="muted">源码里是加权差速 + 四轮速度 PID，并没有看到完整的模型预测、卡尔曼滤波或视觉定位。可以说“多传感器融合了线、距离和姿态条件”，不要说成高级自主导航。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="p1-sensing" data-title="项目 1：姿态、条件与安全">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · SENSOR FUSION</div>
+            <h2>条件函数：把赛道几何变成可复用接口</h2>
+          </div>
+          <div class="section-note">这是“简单赛车”里很有价值的一层抽象。</div>
+        </div>
+        <div class="grid two">
+          <div class="card accent-cyan">
+            <h3>JY901 串口帧</h3>
+            <p class="muted"><code>USART3_IRQHandler()</code> 接收字节流，<code>CopeSerial2Data()</code> 先寻找 <code>0x55</code> 帧头，凑够 11 字节后按类型处理；<code>0x53</code> 帧复制角度结构，得到 <code>angle_x/angle_y/angle_z</code>。<code>angle_z_calibrate()</code> 把偏航角归一到 -180° 到 180°。</p>
+            <span class="source">HARDWARE\Gyroscope\USART3\USART3.c:36-194</span>
+          </div>
+          <div class="card accent-green">
+            <h3>可复用条件接口</h3>
+            <p class="muted">上层只需要调用 <code>wait_for_condition(UPHILL)</code>、<code>wait_for_condition(FLAT)</code>、<code>wait_for_condition(LINEINMIDDLE)</code> 或 <code>wait_for_condition(COLLISION)</code>，不必在每条路线里重复写传感器判断。条件实现分别依赖姿态角、激光组合、碰撞输入和中心线。</p>
+            <span class="source">HARDWARE\Condition\condition.h:6-44；condition.c:36-407</span>
+          </div>
+        </div>
+        <div class="table-wrap" style="margin-top:15px">
+          <table>
+            <thead><tr><th>条件</th><th>源码判定</th><th>工程含义</th></tr></thead>
+            <tbody>
+              <tr><td><strong>UPHILL</strong></td><td><code>angle_y &lt; -21.5f</code></td><td>进入上坡姿态后切换到上跷跷板/坡面控制。</td></tr>
+              <tr><td><strong>DOWNHILL</strong></td><td><code>angle_y &gt; 21.5f</code></td><td>检测下坡阶段，必要时降低速度或切换循迹。</td></tr>
+              <tr><td><strong>FLAT</strong></td><td><code>-4.5f &lt; angle_y &lt; 4.5f</code></td><td>姿态回到平面，结束特殊地形阶段。</td></tr>
+              <tr><td><strong>SEESAW</strong></td><td><code>angle_x - angle_y &gt; 5.0f</code></td><td>通过俯仰/横滚关系识别进入跷跷板。</td></tr>
+              <tr><td><strong>LEFT / RIGHT</strong></td><td>左右两侧传感器组合</td><td>路线函数用它识别分叉、直角和转弯对齐点。</td></tr>
+              <tr><td><strong>COLLISION</strong></td><td>两个碰撞开关之一有效</td><td><code>hit()</code> 用它判断车辆顶到门/障碍后停止并后退。</td></tr>
+              <tr><td><strong>红外</strong></td><td>PG14 低电平有效</td><td>起步前等待挡板移开，末尾也用于重新触发流程。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout danger"><strong>源码复核点：</strong><code>Sensor_Init()</code> 初始化 GPIOB 的 <code>PB4|PB5|PB6|PB7</code>，而 <code>Laser_detect_Scan()</code> 读取的是 <code>PB4、PB5、PB8、PB9</code>。这在面试中不要主动包装成“已完全验证”；如果你当时确实在硬件上修过或工程文件存在版本差异，应按真实情况说明，否则把它列为待复核项。</div>
+      </section>
+
+      <section class="section" id="p1-mission" data-title="项目 1：任务编排与二维码路由">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · MISSION PLANNER</div>
+            <h2>上层任务：把平台编号变成路线函数</h2>
+          </div>
+          <div class="section-note"><code>ALL()</code> 是总编排；<code>pathX_Y()</code> 是平台之间的局部路线。</div>
+        </div>
+        <div class="card">
+          <h3>当前 <code>main.c</code> 中的主执行顺序</h3>
+          <div class="timeline">
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">初始化</div><div class="timeline-content"><strong>外设、舵机、编码器、传感器、USART、PID</strong><span>依次初始化 OLED、JY901、舵机、四轮电机、编码器、传感器、USART2/USART1，并启动 TIM12 10 ms 状态刷新。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">启动</div><div class="timeline-content"><strong>等待红外挡板 → <code>ready()</code></strong><span>灯光、摇头、弯腰等动作提供起步准备与现场状态反馈。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">P1 → P2</div><div class="timeline-content"><strong><code>path1_2()</code> → <code>hit()</code> → 扫描第一个平台码</strong><span>到达平台后，图片/二维码识别结果写入 <code>platform_data[0]</code>，决定去 3 号平台还是 4 号平台。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">P2 → P3/4</div><div class="timeline-content"><strong><code>path2_3()</code> 或 <code>path2_4()</code></strong><span>完成坡面、平台和转弯组合，再到下一个平台读取 <code>platform_data[1]</code>。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">P3/4 → P5/6</div><div class="timeline-content"><strong>按上一平台和当前平台的组合选择路径</strong><span>例如 3→5、3→6、4→5、4→6 分别调用不同路线函数，门区根据 <code>door_flag[]</code> 选择可通行的门。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">P5/6 → P7/8</div><div class="timeline-content"><strong>再次扫码并选择 <code>path5_7()</code>、<code>path5_8()</code>、<code>path6_7()</code>、<code>path6_8()</code></strong><span>完成最后平台任务后，通过 <code>path7_1()</code> 或 <code>path8_1()</code> 回到起点侧。</span></div></div>
+          </div>
+          <span class="source">USER\main.c:70-156；HARDWARE\Mission\Mission.c:2180-2270</span>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>二维码路由的决策表</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>当前/上一次平台</th><th>输入</th><th>调用</th><th>讲法</th></tr></thead>
+              <tbody>
+                <tr><td>P2</td><td><code>platform_data[0] == 3</code></td><td><code>path2_3()</code></td><td>共享前段后按目标平台选择后段。</td></tr>
+                <tr><td>P2</td><td><code>platform_data[0] == 4</code></td><td><code>path2_4()</code></td><td>右侧分支、平台上行和定位参数不同。</td></tr>
+                <tr><td>P3/P4</td><td><code>Now_QR + Pre_QR</code></td><td>四个 <code>path3_5/path3_6/path4_5/path4_6</code></td><td>不仅看当前码，还看车辆从哪一个平台来。</td></tr>
+                <tr><td>P5/P6</td><td><code>Now_QR + Pre_QR</code></td><td>四个 <code>path5_7/path5_8/path6_7/path6_8</code></td><td>复用共同路径，再分开处理上坡/减速板/回转。</td></tr>
+                <tr><td>P7/P8</td><td><code>Pre_QR</code></td><td><code>path7_1()</code> 或 <code>path8_1()</code></td><td>根据最后平台选择不同回程路线。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="callout warn"><strong>当前入口的一个特殊点：</strong><code>main.c</code> 在第一次 <code>ALL()</code> 返回后还会执行 <code>turn_angle(-180, 70)</code>、<code>turn_angle(360, 80)</code>，等待红外状态后再次调用 <code>ALL()</code>。这看起来像第二轮/重新触发流程；面试时可以明确说“当前源码是这样编排的”，但不要自行解释成已经验证的比赛策略，除非你能结合赛题流程确认它的意图。</div>
+      </section>
+
+      <section class="section" id="p1-obstacle" data-title="项目 1：门、障碍与回退">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · ROBUSTNESS</div>
+            <h2>最能体现工程思维的地方：门状态和回退</h2>
+          </div>
+          <div class="section-note">不是“撞一下再试”，而是一次探测结果会影响后续路线。</div>
+        </div>
+        <div class="grid two">
+          <div class="card accent-orange">
+            <h3><code>door_flag[1..4]</code> 的三态语义</h3>
+            <ul class="clean muted">
+              <li><code>0</code>：未知，还没有验证。</li>
+              <li><code>1</code>：已验证可通行。</li>
+              <li><code>-1</code>：已验证不可通行。</li>
+            </ul>
+            <p class="muted">全局初值是 <code>{1,0,0,0,0}</code>，第 0 位未使用；函数通过实际尝试逐步填充门状态。</p>
+          </div>
+          <div class="card accent-green">
+            <h3><code>judge_left_door()</code> 的约束推理</h3>
+            <p class="muted">遍历 1–4 号门：如果已经确认 2 个可通行，则把剩余未知门推断为不可通行；如果已经确认 2 个不可通行，则把剩余未知门推断为可通行。这利用了赛题对门状态数量的约束，把一次试探结果转化成全局信息。</p>
+          </div>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3><code>part_door()</code> 的可讲流程</h3>
+          <div class="flow">
+            <div class="flow-step"><strong>进入门区</strong><span>切换到陀螺仪直行或限制循迹，降低路线不确定性。</span></div>
+            <div class="flow-step"><strong>接近门</strong><span>按 <code>calc_times(order_speed, 55.0f)</code> 估算通过窗口。</span></div>
+            <div class="flow-step"><strong>碰撞监测</strong><span>循环期间检测 <code>COLLISION</code>，碰撞则提前结束尝试。</span></div>
+            <div class="flow-step"><strong>结果更新</strong><span>无碰撞：标记 <code>1</code>；碰撞：标记 <code>-1</code> 并后退。</span></div>
+            <div class="flow-step"><strong>换门/汇合</strong><span>回退到分叉点，尝试下一扇门，最后进入共同路径。</span></div>
+          </div>
+          <span class="source">HARDWARE\Mission\Mission.c:217-289；Mission.c:343-369</span>
+        </div>
+        <div class="grid three" style="margin-top:15px">
+          <div class="card"><h4>坡面</h4><p class="muted small"><code>part_platform_down()</code>、<code>part_platform_up()</code> 根据平面/非平面、距离和姿态切换弯腰机构及循迹模式。</p></div>
+          <div class="card"><h4>跷跷板</h4><p class="muted small"><code>part_seesaw()</code> 先等待进入跷跷板，再用 <code>State_Up_seesaw</code> 和姿态条件越过最高点，最后回到平面。</p></div>
+          <div class="card"><h4>减速板/刀山</h4><p class="muted small"><code>part_airbrake()</code>、<code>part_knifehill()</code> 用特殊权重、速度和距离段，避免普通循迹参数直接冲过地形。</p></div>
+        </div>
+      </section>
+
+      <section class="section" id="p1-script" data-title="项目 1：60 秒讲稿">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · INTERVIEW SCRIPT</div>
+            <h2>国赛寻宝：60 秒版本</h2>
+          </div>
+          <div class="section-note">把括号中的个人分工改成真实版本后背熟。</div>
+        </div>
+        <div class="card">
+          <p class="quote">我参与开发过一个基于 STM32F4 的寻宝赛场地车控制系统，主要可以从运动控制和任务编排两层介绍。底层使用 TIM1/TIM8 输出四个电机的 H 桥 PWM，TIM2 到 TIM5 读取四路编码器，并由 TIM9 以 10 ms 周期更新四轮速度 PID，因此左右前后轮可以分别补偿。循迹部分有 8 路激光传感器，根据普通、限制、左右转和陀螺仪直行等模式生成左右目标速度；JY901 通过 USART3 输入姿态角，用于直行、坡面和跷跷板判断。上层把每一段赛道封装成 <code>pathX_Y()</code>，通过二维码得到平台序列，再结合 <code>door_flag</code> 的未知/可通行/不可通行三态决定过门路线；如果碰撞，就后退并切换下一扇门。我认为这个项目最有价值的地方是把传感器、闭环控制和比赛策略串成了一条完整链路。</p>
+          <div class="callout" style="margin-bottom:0"><strong>继续展开时：</strong>优先展开“10 ms 编码器闭环”或“门状态回退”其中一个，不要在 60 秒里把每个赛道障碍都念一遍。</div>
+        </div>
+      </section>
+
+      <section class="section" id="p1-qa" data-title="项目 1：高频追问">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · FOLLOW-UP QUESTIONS</div>
+            <h2>国赛寻宝：面试官可能继续问什么</h2>
+          </div>
+          <div class="section-note">回答结构：现象 → 原因 → 代码/参数 → 验证。</div>
+        </div>
+        <details class="qa" open><summary>为什么要四路独立 PID？左右侧一个 PID 不够吗？</summary><div class="answer">四个轮子的机械阻力和负载不一致，尤其在转弯、上坡、载荷变化时，前后轮的实际脉冲可能不同。源码分别保存四路 <code>error</code>、积分、微分和控制量，再统一映射到 PWM，能把每个轮子的速度误差单独压下去。左右侧差速是上层运动意图，四路 PID 是底层执行补偿，两者不是同一层。</div></details>
+        <details class="qa"><summary>为什么速度环用 10 ms？周期太快或太慢会怎样？</summary><div class="answer">10 ms 是源码里 TIM9 的固定更新周期，能在车辆运动变化和编码器脉冲分辨率之间取得折中。周期太快，低速时一个周期内脉冲太少，误差抖动明显；周期太慢，转弯和负载变化响应会滞后。实际调参还要结合编码器分辨率、最高车速和控制量饱和观察，而不是只背“10 ms 是标准答案”。</div></details>
+        <details class="qa"><summary>为什么既有激光循迹，又有陀螺仪？</summary><div class="answer">激光适合识别线的位置和路口，陀螺仪适合在坡面、断线、原地旋转或需要保持航向的阶段提供角度信息。源码通过 <code>State_Gyro_straight</code>、<code>turn_angle()</code> 和条件函数把两类输入放在不同阶段使用，不是简单把两者数值直接相加。</div></details>
+        <details class="qa"><summary>门判断是不是纯延时？</summary><div class="answer">不完全是。<code>part_door()</code> 会用 <code>calc_times()</code> 给出一个时间窗口，但窗口内持续检查碰撞；无碰撞就标记可通过，碰撞就标记不可通过、后退并尝试其他门。源码还用 <code>judge_left_door()</code> 根据已知的两开/两关约束推断剩余门状态。</div></details>
+        <details class="qa"><summary>这个项目的不足是什么？</summary><div class="answer">当前实现有明显的比赛型特征：任务函数里存在阻塞等待，部分等待条件没有显式超时；控制、显示和任务状态耦合较多；传感器初始化与读取端口存在需要复核的版本不一致。我会在产品化版本中引入显式状态机、统一的超时/取消/急停接口，把控制周期和任务周期解耦，并补充硬件在环日志。</div></details>
+      </section>
+
+      <section class="section" id="p1-resume" data-title="项目 1：简历表述">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P1 · RESUME BULLETS</div>
+            <h2>国赛寻宝：简历可用版本</h2>
+          </div>
+          <div class="section-note">“负责”请按真实分工选择；没有成绩数据就不要补百分比。</div>
+        </div>
+        <div class="card">
+          <h3>安全版：参与核心开发</h3>
+          <pre><button class="copy" data-copy>复制</button><code>国赛寻宝场地车（STM32F4）
+• 参与四轮运动控制软件开发：基于 TIM1/TIM8 输出 8 路 H 桥 PWM，TIM2–TIM5 配置编码器接口，TIM9 以 10 ms 周期采样四轮脉冲并执行独立速度 PID。
+• 完成 8 路激光循迹、JY901 姿态角、碰撞/红外输入的软件抽象，支持普通、限幅、左右转、陀螺仪直行和坡面等多种控制模式。
+• 将二维码平台序列、门状态探测、坡面/跷跷板/减速板等赛道动作封装为路线函数，实现门不可通行时的碰撞回退与备选路径选择。</code></pre>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>如果你确实主导底层，可改成</h3>
+          <pre><button class="copy" data-copy>复制</button><code>• 主导四轮闭环运动控制：完成编码器计数、10 ms 控制节拍、四路 PID、PWM 限幅与距离换算，并通过串口/OLED 支持现场调试。
+• 主导门状态三态管理和路线回退逻辑，依据碰撞结果更新 door_flag，并将平台二维码输入映射到 pathX_Y 路由。</code></pre>
+        </div>
+      </section>
+
+      <section class="section" id="p2-position" data-title="项目 2：定位与讲法">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">PROJECT 02 · OPTICAL ENGINEERING</div>
+            <h2>光电工程赛：三车中的 3 号车控制程序</h2>
+          </div>
+          <div class="section-note">推荐作为“机器人综合控制 / 传感器校准 / 机构协同”项目。</div>
+        </div>
+        <div class="grid two">
+          <div class="card accent-green">
+            <h3>一句话定位</h3>
+            <p>这是光电工程赛三车方案中的 3 号车单车控制程序：用前后两组循迹传感器完成差速运动和数线定位，用 TCS3200 采集 RGB 频率并做白平衡/阈值分类，再通过 PCA9685 驱动左右双钩、套筒等舵机完成取物和堆叠。</p>
+            <div class="tag-row"><span class="tag green">Arduino C++</span><span class="tag green">TCS3200</span><span class="tag green">PCA9685</span><span class="tag green">差速</span><span class="tag green">组合分支</span></div>
+            <span class="source">源码：D:\Projects\比赛\光电工程赛\THREE102577\三车\THREE102577\THREE102577.ino</span>
+          </div>
+          <div class="card accent-orange">
+            <h3>务必把身份说准确</h3>
+            <p class="muted">当前目录的源码开头明确写着“3号车”，且 <code>loop()</code> 是一个单车控制循环。除非你还有其他目录证明存在车间通信或统一调度，否则不要把它包装成“我实现了三车之间的协同通信”。</p>
+            <div class="callout warn"><strong>推荐说法：</strong>“我负责/参与的是三车方案中 3 号车的感知、运动和取放控制。”</div>
+          </div>
+        </div>
+        <div class="stats" style="margin-top:15px">
+          <div class="stat"><strong>5</strong><span>颜色编码：绿/白/红/黑/蓝</span></div>
+          <div class="stat"><strong>6</strong><span>PCA9685 舵机通道变量</span></div>
+          <div class="stat"><strong>2 套</strong><span>前进/后退循迹参数</span></div>
+          <div class="stat"><strong>2 + 2</strong><span>任务一 + 当前任务二流程</span></div>
+        </div>
+      </section>
+
+      <section class="section" id="p2-architecture" data-title="项目 2：架构与当前入口">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · ENTRY POINT</div>
+            <h2>先分清“写过的函数”和“当前真正执行的函数”</h2>
+          </div>
+          <div class="section-note">这是读这份单文件工程时最重要的边界。</div>
+        </div>
+        <div class="card">
+          <h3>当前 <code>setup()/loop()</code> 调用链</h3>
+          <div class="flow">
+            <div class="flow-step"><strong><code>setup()</code></strong><span>配置引脚、Serial、RGB_Init、PCA9685 50 Hz、Timer3 1 ms 和 Serial3。</span></div>
+            <div class="flow-step"><strong><code>task1()</code></strong><span>初始化钩子/套筒，执行 <code>putCAE()</code> 完成任务一。</span></div>
+            <div class="flow-step"><strong><code>task2plus()</code></strong><span>依次执行 <code>putFquAB()</code>、<code>putGquAB()</code>、<code>putFquCED()</code>、<code>putGquCED()</code>。</span></div>
+            <div class="flow-step"><strong><code>while(1)</code></strong><span>任务完成后停留，不再重复执行。</span></div>
+          </div>
+          <span class="source">THREE102577.ino:4803-4840</span>
+        </div>
+        <div class="grid two" style="margin-top:15px">
+          <div class="card accent-cyan">
+            <h3>当前有效的任务</h3>
+            <p class="muted"><code>task1()</code> 和 <code>task2plus()</code> 是 <code>loop()</code> 直接调用的函数。面试中应重点讲这两条链。</p>
+          </div>
+          <div class="card accent-orange">
+            <h3>源码中存在但当前未直接调用的任务</h3>
+            <p class="muted"><code>task2()</code> 仍在文件中，但当前 <code>loop()</code> 没有调用它；更后面的 <code>task2pro()</code> 位于一段升级代码注释边界附近，也不应当说成当前运行版本。</p>
+          </div>
+        </div>
+        <div class="callout warn"><strong>面试策略：</strong>如果被问“你们最后用的是哪套方案”，回答“当前入口是 <code>task1 + task2plus</code>；<code>task2</code> 是旧版/备用流程”会比把所有函数都说成已上线更可信。</div>
+      </section>
+
+      <section class="section" id="p2-hardware" data-title="项目 2：硬件与引脚">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · HARDWARE MAP</div>
+            <h2>第二个项目的硬件地图</h2>
+          </div>
+          <div class="section-note">引脚来自源码变量；具体开发板型号若没有硬件资料，不要强行断言。</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模块</th><th>源码事实</th><th>面试表达</th></tr></thead>
+            <tbody>
+              <tr><td><strong>主控与通信</strong></td><td>使用 <code>Serial</code>、<code>Serial3</code>，并使用 39、38、46、50、A15 等引脚。</td><td>“Arduino 平台类主控；从 <code>Serial3</code> 和引脚范围看是 Mega 类硬件，最终板卡名称按实际物料说明。”</td></tr>
+              <tr><td><strong>双电机差速</strong></td><td>左右轮各有 EN/PWM 与 IN1/IN2：45/43/41、46/42/44。</td><td><code>gogogo()</code> 前进、<code>gogogo1()</code> 后退，<code>stop_motor()</code> 滑行停、<code>Stop_motor()</code> 主动刹车。</td></tr>
+              <tr><td><strong>循迹传感器</strong></td><td>前方 <code>sensor_1..4</code> 为 11/10/9/8；后方 <code>sensor_5..8</code> 为 7/6/5/4；39/38 用于定位/数线。</td><td>前进和后退使用不同传感器组、不同误差方向和不同参数，避免倒车时控制符号直接复用出错。</td></tr>
+              <tr><td><strong>颜色传感器</strong></td><td>TCS3200：S0=27、S1=26、S2=24、S3=25、OUT=3；OUT 用外部中断计数。</td><td>通过滤波器选择 R/G/B，再按固定时间窗口统计频率，经过白平衡后分类。</td></tr>
+              <tr><td><strong>舵机驱动</strong></td><td>PCA9685 I²C 地址 <code>0x40</code>，使用通道 1/2/3/4/8/12；50 Hz。</td><td>用外部 12 bit PWM 扩展板把多个舵机控制从主控定时器中解耦，动作函数只关心角度命令。</td></tr>
+              <tr><td><strong>姿态串口</strong></td><td>Timer3 以 1 ms 调度 <code>readtherealangle()</code>，Serial3 接收 0x55/11 字节数据。</td><td>当前主要用来读 <code>real_angle[2]</code> 和辅助改参数；转向的角度纠正代码在源码中被注释掉，不能夸成闭环姿态转向。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="p2-color" data-title="项目 2：TCS3200 颜色识别">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · COLOR PIPELINE</div>
+            <h2>颜色识别：频率采样 → 白平衡 → 规则分类</h2>
+          </div>
+          <div class="section-note">这是一个很适合被问“怎么标定、怎么处理环境变化”的模块。</div>
+        </div>
+        <div class="pipeline">
+          <div class="pipeline-box"><strong>TCS3200 输出</strong><span>改变 S2/S3 选择滤波颜色，OUT 的上升沿进入外部中断，<code>g_count++</code>。</span></div>
+          <div class="arrow">→</div>
+          <div class="pipeline-box"><strong>时间片轮换</strong><span><code>TSC_Callback()</code> 依次记录 R/G/B，Timer3 阶段周期为源码设定的 250000 μs。</span></div>
+          <div class="arrow">→</div>
+          <div class="pipeline-box"><strong>分类与状态</strong><span><code>g_SF=255/g_array</code> 做白平衡；写入 <code>color[flag_1]</code>。</span></div>
+        </div>
+        <div class="grid two" style="margin-top:15px">
+          <div class="card accent-green">
+            <h3>白平衡的逻辑</h3>
+            <ol class="clean muted">
+              <li><code>RGB_Init()</code> 初始化 TCS3200、Timer3 和外部中断。</li>
+              <li>用白色基准分别得到 <code>g_array[0..2]</code>。</li>
+              <li>计算 <code>g_SF[0..2] = 255.0 / g_array[i]</code>。</li>
+              <li>后续测量将各通道频数乘比例因子，减少传感器通道增益差异。</li>
+            </ol>
+          </div>
+          <div class="card accent-orange">
+            <h3>当前源码的分类阈值</h3>
+            <ul class="clean muted">
+              <li>白：<code>R/G/B</code> 原始计数均大于 600。</li>
+              <li>蓝：<code>B-G &gt; 40</code> 且 <code>B-R &gt; 20</code>。</li>
+              <li>黑：三通道原始计数和小于 520。</li>
+              <li>红：<code>R ≥ G+200</code> 且 <code>R ≥ B+150</code>。</li>
+              <li>绿：<code>G ≥ B-30</code> 且 <code>G ≥ R</code>。</li>
+              <li>代码用数值 1–5 表示绿/白/红/黑/蓝，0 表示未检测到。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>面试时怎样说“我做过标定”</h3>
+          <p class="quote">我没有直接把 ADC 数值当成颜色，而是先利用 TCS3200 的频率输出，分时选择红绿蓝滤波器，统计固定时间内的脉冲数。初始化阶段用白色基准计算三个通道的比例因子，测量时再做归一化。最后根据白、蓝、黑、红、绿的通道差值和总量设阈值，并把识别结果写入 <code>color[]</code>，供后续取放路径使用。</p>
+          <span class="source">THREE102577.ino:58-354；THREE102577.ino:202-354</span>
+        </div>
+        <div class="callout danger"><strong>源码一致性提醒：</strong>当前文件把 <code>Scan_Color</code> 声明为 <code>void Scan_Color(int flag_1)</code>，函数末尾却写了 <code>return color_read;</code>；此外，注释中对“1 s/100 ms”的说明与当前 <code>250000</code> μs 参数有历史修改痕迹。面试可以说“采用了固定窗口与白平衡阈值”，不要说成已经完成了严格的统计分类器或温漂补偿，除非你有另一个最终版本证明。</div>
+      </section>
+
+      <section class="section" id="p2-motion" data-title="项目 2：循迹与定位">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · MOTION & POSITIONING</div>
+            <h2>前进/后退两套循迹 + 数线定位</h2>
+          </div>
+          <div class="section-note">动作准确性来自“传感器位置 + 参数 + 刹车补偿”的组合。</div>
+        </div>
+        <div class="grid two">
+          <div class="card accent-cyan">
+            <h3>前进 <code>trackingAHEAD()</code></h3>
+            <ul class="clean muted">
+              <li>把 4 路数字量拼成 4 bit 状态 <code>a</code>，对应左小偏、左中偏、左大偏、右侧对称情况。</li>
+              <li>误差使用 <code>errorxiao=2.3</code>、<code>errorzhong=2.5</code>、<code>errorda=3.0</code>。</li>
+              <li>当前参数为 <code>kp=46</code>、<code>ki=0</code>、<code>kd=45</code>，实际是比例 + 微分控制。</li>
+              <li>将 <code>pid</code> 限制在 ±250，再对左右基础速度做差速修正并限制到 PWM 范围。</li>
+            </ul>
+          </div>
+          <div class="card accent-blue">
+            <h3>后退 <code>trackingBACK()</code></h3>
+            <ul class="clean muted">
+              <li>使用后方 4 路传感器，误差方向和前进相反。</li>
+              <li>独立参数 <code>v3/v4=45</code>、<code>kp1=10</code>、<code>kd1=3</code>。</li>
+              <li>大偏差时调用 <code>turnright1()/turnleft1()</code>，小偏差时做差速调节。</li>
+              <li>原因是倒车时传感器相对车体的位置和运动方向改变，不能简单复用前进控制器。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>数线定位的标准动作</h3>
+          <div class="flow">
+            <div class="flow-step"><strong>预走</strong><span>先运行若干次循迹，避免从起点立即重复计数。</span></div>
+            <div class="flow-step"><strong>检测边沿</strong><span>用 <code>sensor_10</code> 或 <code>sensor_9</code> 判断线是否出现/离开。</span></div>
+            <div class="flow-step"><strong>计数</strong><span>每通过一根线，增加 <code>count</code>；再执行 45/50 次控制循环让传感器离开当前线。</span></div>
+            <div class="flow-step"><strong>末端补偿</strong><span>执行 <code>iii</code> 的继续运动，再用 <code>x</code> 时间的反向力刹车。</span></div>
+            <div class="flow-step"><strong>停车稳定</strong><span>调用主动/滑行停车并延时，给机构动作留下稳定时间。</span></div>
+          </div>
+          <p class="muted">因此 <code>count_line_ahead(line, iii, x)</code> 的三个参数分别可以解释为：数几根线、过最后一根后继续多久、反向刹车多久。这个函数把“走到某个物理位置”从纯延时升级成了可重复的传感器定位。</p>
+          <span class="source">THREE102577.ino:604-1225；THREE102577.ino:1285-1434</span>
+        </div>
+        <div class="card accent-orange" style="margin-top:15px">
+          <h3>45° 转向的真实实现</h3>
+          <p class="muted"><code>turnleft45(line, x)</code> / <code>turnright45(line, x)</code> 用差速电机原地转动，通过左右/前方定位传感器数线，达到目标线数后使用一段反向力刹车。函数还维护逻辑方向 <code>angle</code>，并根据 <code>real_angle[2]</code> 计算目标角；但源码中的陀螺仪误差纠正 while 循环被注释掉，所以当前版本更准确的表述是“数线 + 时间参数为主，陀螺仪帧用于读取/调参”，而不是“陀螺仪闭环 45° 转向”。</p>
+          <span class="source">THREE102577.ino:1548-1760；THREE102577.ino:604-650</span>
+        </div>
+      </section>
+
+      <section class="section" id="p2-servo" data-title="项目 2：PCA9685 与双钩机构">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · ACTUATORS</div>
+            <h2>机构控制：把多个舵机动作编成安全的动作序列</h2>
+          </div>
+          <div class="section-note">面试时重点讲“动作顺序和状态”，不要只报舵机角度。</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>逻辑对象</th><th>PCA9685 通道</th><th>源码动作</th><th>动作含义</th></tr></thead>
+            <tbody>
+              <tr><td><strong>左钩下臂</strong></td><td><code>servo_zuoxia = 8</code></td><td><code>zuonuokai()</code>、<code>zuonuohui()</code>、<code>zuogouzhuaqu()</code>、<code>zuogoufanghui()</code></td><td>向左展开、回到怀中、抓取、抬起放回。</td></tr>
+              <tr><td><strong>左钩上臂</strong></td><td><code>servo_zuoshang = 12</code></td><td>与左下臂配合</td><td>调节钩子高度/姿态，使物块贴近颜色传感器或面向堆叠点。</td></tr>
+              <tr><td><strong>右钩下臂</strong></td><td><code>servo_youxia = 2</code></td><td><code>younuokai()</code>、<code>younuohui()</code>、<code>yougouzhuaqu()</code>、<code>yougoufanghui()</code></td><td>与左钩镜像，但角度方向不同。</td></tr>
+              <tr><td><strong>右钩上臂</strong></td><td><code>servo_youshang = 3</code></td><td>与右下臂配合</td><td>控制右钩抬起、回收和贴近传感器。</td></tr>
+              <tr><td><strong>套筒夹持</strong></td><td><code>servo_taotong = 4</code></td><td><code>taotongdakai()</code>、<code>taotongzhongkai()</code>、<code>taotongxiaokai()</code>、<code>taotongshoujin()</code></td><td>大开/中开/小开/收紧，配合堆叠时释放或夹持。</td></tr>
+              <tr><td><strong>套筒升降</strong></td><td><code>servo_duopan = 1</code></td><td><code>taishengtaotong()</code>、<code>xiajiangtaotong()</code>、<code>duidietaisheng()</code></td><td>抬到抓取高度、下降释放、逐层堆叠。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid two" style="margin-top:15px">
+          <div class="card accent-cyan">
+            <h3>PCA9685 驱动链</h3>
+            <p class="muted"><code>writeServo(n, angle)</code> 先把角度换算成脉宽，再由 <code>setServoPulse()</code> 换算成 PCA9685 12 bit tick，最后调用 <code>setPWM()</code> 通过 I²C 写入通道寄存器。外部驱动板统一提供 50 Hz 多通道 PWM。</p>
+            <span class="source">THREE102577.ino:95-128；Adafruit_PWMServoDriver.cpp</span>
+          </div>
+          <div class="card accent-green">
+            <h3>动作安全</h3>
+            <p class="muted">抓取函数不是一次性同时写完所有舵机，而是分步设置并插入 <code>delay()</code>，给机构留出到位时间；放置函数又会先回收钩子、再定位、再释放套筒，避免运动中拖拽物块。</p>
+            <span class="source">THREE102577.ino:1782-2050；THREE102577.ino:2171-2300</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="p2-task1" data-title="项目 2：任务一 CAE 取放">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · TASK 1</div>
+            <h2>任务一：根据 C 的颜色决定 A/E 的取放顺序</h2>
+          </div>
+          <div class="section-note"><code>task1()</code> → <code>putCAE()</code> 是当前入口的一部分。</div>
+        </div>
+        <div class="card">
+          <h3>任务一的真实逻辑</h3>
+          <div class="timeline">
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">定位</div><div class="timeline-content"><strong><code>count_line_ahead(6, 50, 44)</code></strong><span>先按定位线数到达取物区域，使用最后继续时间和反向力做位置补偿。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">抓取 C</div><div class="timeline-content"><strong>左钩抓取 → <code>readcolor(3)</code></strong><span>颜色写入 <code>color[3]</code>，同时按颜色索引给 <code>defen[]</code> 增加任务一分值。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">分支</div><div class="timeline-content"><strong>按 C=1/2/3/4/5 选择路线</strong><span>C 的目标位置不同，会选择直接放置、先回退转向、或切换左右钩继续处理 A/E。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">补抓</div><div class="timeline-content"><strong><code>putA()</code>、<code>putE()</code>、<code>putAE()</code>、<code>putEA()</code></strong><span>如果目标颜色已在当前位置，直接放；否则回到中心/起点附近换向、换钩、再取另一个物块。</span></div></div>
+            <div class="timeline-item"><span class="timeline-dot"></span><div class="timeline-label">稳定回位</div><div class="timeline-content"><strong>放回钩子、数线回退</strong><span>每次放置后将钩子复位，再通过 <code>count_line_back()</code> 回到可继续执行的节点。</span></div></div>
+          </div>
+          <span class="source">THREE102577.ino:2300-2648；THREE102577.ino:2649-3050</span>
+        </div>
+        <div class="grid two" style="margin-top:15px">
+          <div class="card">
+            <h3>任务一可以体现的能力</h3>
+            <ul class="clean muted">
+              <li>传感器识别结果写入数组，后续运动决策不直接依赖一次函数返回值。</li>
+              <li>左右钩不是固定角色，依据当前物块位置/颜色切换。</li>
+              <li>用函数组合复用“抓取、读色、转向、定位、放回”，而不是把所有动作塞在 <code>loop()</code>。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>不要把它说成视觉算法</h3>
+            <p class="muted">这里是 TCS3200 频率传感器 + 规则阈值，不是摄像头图像识别。可以强调“光电传感器标定和抗通道差异”，不要使用 OpenCV、深度学习或视觉定位等不存在的关键词。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="p2-task2" data-title="项目 2：任务二 F/G 与 C/D/E">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · TASK 2PLUS</div>
+            <h2>任务二：F 区取物、G 区堆叠与颜色排序</h2>
+          </div>
+          <div class="section-note">当前 <code>loop()</code> 实际执行的版本。</div>
+        </div>
+        <div class="card">
+          <h3>当前主流程</h3>
+          <div class="flow">
+            <div class="flow-step"><strong><code>putFquAB()</code></strong><span>从 F 区抓取 AB，回到中心读色，记录 <code>AAA/BBB</code>，按颜色方向分别放入得分位置，增加 +10。</span></div>
+            <div class="flow-step"><strong><code>putGquAB()</code></strong><span>再次取 AB，校验先前的颜色记录，按颜色顺序用 <code>duidie()</code> 堆叠，增加 +100。</span></div>
+            <div class="flow-step"><strong><code>putFquCED()</code></strong><span>抓取 CE 组并利用 <code>color[3]/color[4]/color[5]</code> 与历史变量做排序/异常处理。</span></div>
+            <div class="flow-step"><strong><code>putGquCED()</code></strong><span>在 G 区按 D、C、E 的颜色顺序堆叠，处理全抓到、颜色重复、部分未抓到等情况。</span></div>
+          </div>
+          <span class="source">THREE102577.ino:3094-4451；THREE102577.ino:4452-4458</span>
+        </div>
+        <div class="grid two" style="margin-top:15px">
+          <div class="card accent-orange">
+            <h3>状态数据结构</h3>
+            <ul class="clean muted">
+              <li><code>color[1..5]</code>：A/B/C/D/E 物块当前识别到的颜色码。</li>
+              <li><code>defen[1..5]</code>：按颜色索引累计的分值，F 区加 10，G 区加 100。</li>
+              <li><code>AAA..EEE</code>：把前一阶段识别结果保存下来，后续 G 区校验/排序。</li>
+              <li><code>CCC/DDD/EEE</code>：C/D/E 组的历史颜色状态，支持部分抓取失败时继续决策。</li>
+            </ul>
+          </div>
+          <div class="card accent-green">
+            <h3>D 颜色的补全</h3>
+            <p class="muted">在 <code>putFquAB()</code> 中，源码使用 <code>color[4] = 15 - color[1] - color[2] - color[3] - color[5]</code> 做剩余颜色补全，并设置 <code>flag_rgb</code>。这依赖颜色编码 1–5 恰好各出现一次；面试应说“利用赛题颜色集合约束进行推断”，同时承认它依赖前提，产品代码应先验证输入合法性和唯一性。</p>
+          </div>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3><code>putFquAB()</code> 的分支讲法</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>情况</th><th>源码动作</th><th>工程解释</th></tr></thead>
+              <tbody>
+                <tr><td><strong>A/B 都抓到且颜色有序</strong></td><td>按较小颜色码到较大颜色码的方向转向，左右钩分别放置，分值各加 10。</td><td>把颜色码映射为场地方向，减少固定路线分支。</td></tr>
+                <tr><td><strong>A/B 都抓到但顺序相反</strong></td><td>先去 B，再去 A，交换左右钩动作和转角差值。</td><td>根据相对位置动态改变执行顺序。</td></tr>
+                <tr><td><strong>只抓到 A 或 B</strong></td><td>保留已抓到物块，单独放置；另一个路径不强行执行。</td><td>部分成功仍能获得可用结果，避免错误动作扩大损失。</td></tr>
+                <tr><td><strong>两个都未抓到</strong></td><td>复位并转向，准备后续路径。</td><td>失败分支有明确安全退出，而非继续使用未初始化颜色。</td></tr>
+                <tr><td><strong>颜色冲突</strong></td><td>进入“将错就错”分支，完成可执行的堆叠/回位。</td><td>在比赛约束下优先保住系统可运行性，但需要标注为降级策略。</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card accent-cyan" style="margin-top:15px">
+          <h3><code>duidie(defenshu)</code>：用组合状态选择机械动作</h3>
+          <p class="muted">它根据得分组合 <code>10</code>、<code>100</code>、<code>11</code>、<code>101</code>、<code>110</code>、<code>111</code> 选择不同的套筒升降/开合/释放方案。例如多层堆叠需要在每一层之间抬升套筒、检测物块状态、收紧、定位到目标线、释放，再回到起点。也就是说，<code>duidie()</code> 是一个小型动作调度器，而不是一个简单的 <code>switch</code>。</p>
+          <span class="source">THREE102577.ino:2171-2300；THREE102577.ino:4452-4458</span>
+        </div>
+        <div class="callout warn"><strong>更稳的面试表述：</strong>“我把物块颜色、当前钩子状态和已完成得分保存在数组/变量中，用条件分支决定取放顺序，并把堆叠动作按分值组合封装。”不要说“我做了通用规划器”或“用了最优路径算法”，当前源码体现的是基于规则和赛题约束的组合决策。</div>
+      </section>
+
+      <section class="section" id="p2-script" data-title="项目 2：60 秒讲稿">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · INTERVIEW SCRIPT</div>
+            <h2>光电工程赛：60 秒版本</h2>
+          </div>
+          <div class="section-note">把“三车中的 3 号车”和个人分工说准确。</div>
+        </div>
+        <div class="card">
+          <p class="quote">这是光电工程赛三车方案中的 3 号车控制程序。我参与的重点是单车的循迹、颜色识别和取放机构协同。运动部分使用前后两组四路传感器，前进和后退分别使用不同的 P+D 参数；<code>count_line_ahead/back</code> 通过数线和末端反向力补偿完成定位，45° 转向也主要靠传感器数线和时间参数实现。颜色部分使用 TCS3200，利用外部中断统计 RGB 滤波后的频率，启动时用白色基准计算比例因子，再用通道差值阈值区分绿、白、红、黑、蓝。机构部分通过 I²C 的 PCA9685 控制左右双钩、套筒开合和升降。任务一根据 C 的颜色决定 A/E 的取放顺序；当前任务二由 <code>putFquAB</code>、<code>putGquAB</code>、<code>putFquCED</code>、<code>putGquCED</code> 完成取物和堆叠，并用 <code>color[]</code>、<code>defen[]</code> 保存状态。这个项目最难的是传感器误差、机械动作到位时间和大量异常组合同时存在。</p>
+        </div>
+      </section>
+
+      <section class="section" id="p2-qa" data-title="项目 2：高频追问">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · FOLLOW-UP QUESTIONS</div>
+            <h2>光电工程赛：面试官可能继续问什么</h2>
+          </div>
+          <div class="section-note">重点准备标定、定位、机构时序和失败分支。</div>
+        </div>
+        <details class="qa" open><summary>TCS3200 为什么要做白平衡？只比较 R/G/B 大小不行吗？</summary><div class="answer">不同通道的传感器增益、光源和安装角度会造成基线不同，直接比较原始频数容易把通道差异当成颜色。源码用白色参考得到三个通道的比例因子，再做归一化。阈值仍然是规则阈值，所以现场还需要通过串口观察频数并重新校准。</div></details>
+        <details class="qa"><summary>为什么前进和后退要两套循迹参数？</summary><div class="answer">后退时传感器位于运动方向的另一侧，车辆对相同的横向偏差的响应方向不同；而且后方传感器的安装距离、线宽和电机低速特性也不同。源码分别维护 <code>v1/v2/kp/kd</code> 与 <code>v3/v4/kp1/kd1</code>，并在大偏差时使用不同的纠偏动作。</div></details>
+        <details class="qa"><summary>数线定位为什么还要时间和反向力？</summary><div class="answer">传感器检测到线时，车辆已经有速度和惯性，立即停会越过目标点；因此函数先数到目标线，再继续一个可调的 <code>iii</code> 时间，最后用 <code>x</code> 时间反向输出做刹车补偿。这个参数需要通过实车反复标定，换电池电压、地面摩擦或载荷后可能要重新调。</div></details>
+        <details class="qa"><summary>你们的 45° 转向是陀螺仪闭环吗？</summary><div class="answer">当前源码更准确的说法是“基于差速电机、定位传感器数线和反向刹车的开环/半闭环动作”。代码读取了 JY901 的 <code>real_angle[2]</code> 并计算目标角，但后续角度误差修正 while 循环被注释掉。我会把陀螺仪修正重新做成带角度误差、超时和最大修正次数的闭环，以解决打滑和地面变化导致的角度误差。</div></details>
+        <details class="qa"><summary>如果抓取失败，代码怎么避免整个任务崩掉？</summary><div class="answer">颜色 0 代表未检测到，<code>putFquAB/putGquAB/putFquCED/putGquCED</code> 分别处理双抓、只抓到一侧、全未抓到、颜色冲突等情况；钩子会复位，车辆通过数线回到可执行节点。改进时我会把这些隐式分支改成显式的 <code>GrabResult</code>、机构状态和超时状态，减少数组里 0 值被误当成有效颜色的风险。</div></details>
+        <details class="qa"><summary>这个项目代码有哪些需要改进的地方？</summary><div class="answer">当前是比赛迭代型单文件：全局变量多、重复动作多、阈值和舵机角度散落、部分函数注释写“有问题”，并且 <code>Scan_Color</code> 的返回类型与返回语句不一致。若产品化，我会拆成颜色传感器、运动控制、定位、机构状态机和任务规划模块，把参数集中到结构体并加入合法性校验、测试模式和故障超时。</div></details>
+      </section>
+
+      <section class="section" id="p2-resume" data-title="项目 2：简历表述">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">P2 · RESUME BULLETS</div>
+            <h2>光电工程赛：简历可用版本</h2>
+          </div>
+          <div class="section-note">强调“传感器校准 + 定位 + 机构协同”，不要泛写成“做小车”。</div>
+        </div>
+        <div class="card">
+          <h3>安全版：参与 3 号车核心开发</h3>
+          <pre><button class="copy" data-copy>复制</button><code>光电工程赛三车方案——3 号车控制程序
+• 参与双电机差速与循迹控制开发：针对前进/后退分别设计 P+D 纠偏参数，使用 4 路传感器状态判断偏差，并通过数线、末端延时和反向力完成赛道定位。
+• 完成 TCS3200 RGB 频率采集与白平衡流程：使用外部中断统计滤波器输出，计算通道比例因子，并基于通道差值/总量阈值识别绿、白、红、黑、蓝五类物块。
+• 基于 PCA9685 I²C PWM 扩展控制左右双钩、套筒开合和升降；将任务一 CAE 取放、任务二 F/G 取物与堆叠封装为按颜色和抓取结果分支的动作流程。</code></pre>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>如果你确实主导机构/任务逻辑，可补充</h3>
+          <pre><button class="copy" data-copy>复制</button><code>• 设计基于 color[]、defen[]、AAA..EEE 的状态保存方案，利用“颜色集合互不重复”约束补全 D 物块颜色，并对双抓/单抓/未抓到/颜色冲突分别设计降级路径。</code></pre>
+        </div>
+      </section>
+
+      <section class="section" id="compare" data-title="按岗位选择项目">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">STRATEGY · ROLE MATCHING</div>
+            <h2>不同岗位，主推不同项目</h2>
+          </div>
+          <div class="section-note">两个项目都讲，但主次要跟 JD 对齐。</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>岗位方向</th><th>主推项目</th><th>重点展开</th><th>关键词</th></tr></thead>
+            <tbody>
+              <tr><td><strong>MCU 底层 / 电机控制</strong></td><td>国赛寻宝</td><td>TIM、PWM、编码器、10 ms 中断、四路 PID、限幅、距离换算。</td><td>STM32、C、中断、定时器、闭环控制、UART</td></tr>
+              <tr><td><strong>机器人控制 / 运动规划</strong></td><td>国赛寻宝 + 三车</td><td>循迹模式、姿态条件、数线定位、路线分支、碰撞回退、机构动作。</td><td>差速、传感器融合、状态机、执行器协同</td></tr>
+              <tr><td><strong>传感器 / 光电</strong></td><td>三车</td><td>TCS3200 频率采集、白平衡、阈值标定、环境变化和误识别处理。</td><td>光电传感器、标定、外部中断、信号处理</td></tr>
+              <tr><td><strong>嵌入式应用 / 快速原型</strong></td><td>三车</td><td>PCA9685、I²C、舵机动作时序、任务组合和调参方法。</td><td>Arduino C++、I²C、PWM 扩展、机构控制</td></tr>
+              <tr><td><strong>嵌入式 Linux</strong></td><td>两者作为 MCU 项目</td><td>明确说这是 MCU/Arduino 项目，并主动补充 Linux、C++、进程线程、设备树、驱动的学习/实践。</td><td>不要把 MCU 项目冒充 Linux 驱动</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="combined-script" data-title="组合自我介绍">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">STRATEGY · COMBINED SCRIPT</div>
+            <h2>两个项目合在一起的 90 秒版本</h2>
+          </div>
+          <div class="section-note">适合“请介绍一个最有代表性的嵌入式项目”之后继续补充。</div>
+        </div>
+        <div class="card">
+          <p class="quote">我做过的比赛项目主要集中在嵌入式运动控制和机器人机构协同。一类是 STM32F4 四轮场地车：我接触了定时器 PWM、四路编码器、10 ms 速度 PID、8 路循迹和 JY901 姿态输入，并把平台二维码和门状态组织成路线决策。另一类是光电工程赛中的 3 号车：使用 TCS3200 做 RGB 频率采集和白平衡阈值识别，再通过 PCA9685 控制双钩和套筒完成取放堆叠。两个项目给我的最大收获不是把车跑起来，而是理解了硬件误差会怎样传到上层：编码器误差影响速度和距离，传感器阈值影响路线分支，舵机到位时间影响抓取成功率。因此我在调试时会先记录输入和中间状态，再调输出参数，而不是只盯着最终有没有走到终点。</p>
+        </div>
+        <div class="grid three" style="margin-top:15px">
+          <div class="card"><h3>第一句</h3><p class="muted">先说你做什么类型的系统，不要先报比赛名称。</p></div>
+          <div class="card"><h3>中间</h3><p class="muted">每个项目只选一个核心难点展开：P1 选闭环/回退，P2 选颜色/机构。</p></div>
+          <div class="card"><h3>最后</h3><p class="muted">说出你会如何产品化改进，体现工程反思但不要否定项目价值。</p></div>
+        </div>
+      </section>
+
+      <section class="section" id="truth-boundary" data-title="真实性边界与补强">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">STRATEGY · HONESTY & NEXT STEP</div>
+            <h2>源码能证明什么，不能证明什么</h2>
+          </div>
+          <div class="section-note">这部分是为了让你在被深挖时更稳。</div>
+        </div>
+        <div class="grid two">
+          <div class="card accent-green">
+            <h3>当前源码可以支持的说法</h3>
+            <div class="checklist">
+              <div class="check">STM32 项目有 PWM、编码器、定时中断、PID、循迹、姿态串口和路线函数。</div>
+              <div class="check">三车项目有 TCS3200 频率采集、白平衡、颜色阈值、前后循迹、数线定位、PCA9685 和双钩/套筒动作。</div>
+              <div class="check">两个项目都有把底层传感器状态传给上层动作决策的完整代码链路。</div>
+              <div class="check">代码里存在对抓取失败、门不可通行、碰撞和颜色不确定的分支处理。</div>
+            </div>
+          </div>
+          <div class="card accent-orange">
+            <h3>当前源码不能直接支持的说法</h3>
+            <div class="checklist">
+              <div class="check warn">个人一定主导了全部代码。</div>
+              <div class="check warn">已经达到某个成功率、定位精度或比赛名次。</div>
+              <div class="check warn">三车之间实现了通信协同。</div>
+              <div class="check warn">45° 转向已经是陀螺仪闭环。</div>
+              <div class="check warn">颜色识别已经有统计模型、温漂补偿或视觉算法。</div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>面试前最值得补的 5 个验证动作</h3>
+          <ol class="clean muted">
+            <li>把国赛寻宝的四路编码器、PID 误差、PWM 和 <code>calc_distance</code> 的单位在纸上推一遍，能解释每个常数来源。</li>
+            <li>把 8 路传感器的安装顺序画出来，确认 <code>Laser_detect[0..7]</code> 和实际左右方向一致，并复核 GPIOB 端口版本差异。</li>
+            <li>用一组实际 TCS3200 R/G/B 数据重新算一次白平衡和分类阈值，准备说明光照变化时怎么调。</li>
+            <li>从 <code>putCAE()</code> 选一条颜色分支，从 <code>putFquAB()</code> 选“只抓到一侧”分支，手动画出钩子和车辆的动作顺序。</li>
+            <li>把“一个真实 bug”准备成五句话：现象、怀疑点、观测方法、修改、验证结果；没有结果就明确说当时只定位到哪一步。</li>
+          </ol>
+        </div>
+        <div class="callout"><strong>如果面试官说“项目看起来比较简单”：</strong>回答“比赛目标确实是小车任务，但我把它拆成了实时控制、传感器条件、任务状态和机构时序四层。比如一个‘过门’动作，实际包含速度模式切换、距离窗口、碰撞输入、门状态记忆和回退路线。这个拆解方式也是我希望迁移到产品嵌入式开发中的能力。”</div>
+      </section>
+
+      <section class="section" id="source-map" data-title="源码证据索引">
+        <div class="section-head">
+          <div>
+            <div class="section-kicker">APPENDIX · SOURCE MAP</div>
+            <h2>源码证据索引</h2>
+          </div>
+          <div class="section-note">打开项目时可用这些文件和函数快速复习；路径保持 Windows 原文。</div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h3>项目 1 · 国赛寻宝</h3>
+            <ul class="clean small muted">
+              <li><span class="mono">D:\Projects\比赛\国赛寻宝\总程序\USER\main.c:70-156</span>：初始化、主流程、<code>ALL()</code> 调用。</li>
+              <li><span class="mono">...\HARDWARE\Motor\Motor.c</span>：TIM1/TIM8 PWM 与正负电机输出。</li>
+              <li><span class="mono">...\HARDWARE\Encoder\Encoder.c:57-517</span>：编码器、TIM9、距离、PID。</li>
+              <li><span class="mono">...\HARDWARE\Trailing\Trailing.c</span>：8 路加权循迹和姿态模式。</li>
+              <li><span class="mono">...\HARDWARE\Sensor\Sensor.c</span>：Laser、碰撞、红外采样。</li>
+              <li><span class="mono">...\HARDWARE\Condition\condition.c</span>：地形/路口/碰撞条件。</li>
+              <li><span class="mono">...\HARDWARE\Mission\Mission.c:217-289</span>：过门探测与回退；<span class="mono">:2180-2270</span>：总路线。</li>
+              <li><span class="mono">...\HARDWARE\Gyroscope\USART3\USART3.c</span>：JY901 串口帧和角度。</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>项目 2 · 光电工程赛三车</h3>
+            <ul class="clean small muted">
+              <li><span class="mono">D:\Projects\比赛\光电工程赛\THREE102577\三车\THREE102577\THREE102577.ino:1-354</span>：引脚、TCS3200、颜色识别。</li>
+              <li><span class="mono">...\THREE102577.ino:457-585</span>：电机前进/后退/转向输出。</li>
+              <li><span class="mono">...\THREE102577.ino:604-650</span>：Timer3 回调中的 Serial3 角度帧接收。</li>
+              <li><span class="mono">...\THREE102577.ino:604-1225</span>：前后循迹和数线。</li>
+              <li><span class="mono">...\THREE102577.ino:1285-1760</span>：满分定位和 45° 转向。</li>
+              <li><span class="mono">...\THREE102577.ino:1765-2300</span>：颜色写入、双钩、套筒、堆叠动作。</li>
+              <li><span class="mono">...\THREE102577.ino:2300-3050</span>：任务一 <code>putCAE()</code>。</li>
+              <li><span class="mono">...\THREE102577.ino:3094-4458</span>：当前任务二 <code>task2plus()</code>。</li>
+              <li><span class="mono">...\THREE102577.ino:4803-4840</span>：<code>setup()/loop()</code> 当前入口。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="card" style="margin-top:15px">
+          <h3>最后的复习顺序</h3>
+          <div class="flow">
+            <div class="flow-step"><strong>先背一句话</strong><span>项目目标 + 主控 + 核心链路。</span></div>
+            <div class="flow-step"><strong>再背一个难点</strong><span>P1：门回退；P2：颜色/机构。</span></div>
+            <div class="flow-step"><strong>再背三个数字</strong><span>P1：4 轮、8 路、10 ms；P2：5 色、6 舵机通道、50 Hz。</span></div>
+            <div class="flow-step"><strong>最后背改进</strong><span>状态机、超时、参数集中、日志/测试。</span></div>
+          </div>
+        </div>
+      </section>
+
+      <div class="footer">
+        独立展示文件：<span class="mono">embedded_project_interview_guide.html</span> · 内容依据用户提供的两个项目目录源码整理；未修改比赛项目源码或当前项目 <span class="mono">frontend/</span>。
+      </div>
+    </main>
+  </div>
+
+  <script>
+    (() => {
+      const body = document.body;
+      const search = document.getElementById("search");
+      const sidebarButton = document.getElementById("sidebarButton");
+      const themeButton = document.getElementById("themeButton");
+      const printButton = document.getElementById("printButton");
+      const status = document.getElementById("sectionStatus");
+      const links = [...document.querySelectorAll("[data-scroll]")];
+      const sections = [...document.querySelectorAll("section[data-title]")];
+
+      const savedTheme = localStorage.getItem("embedded-guide-theme");
+      if (savedTheme === "light") body.dataset.theme = "light";
+
+      sidebarButton.addEventListener("click", () => {
+        body.classList.toggle("sidebar-collapsed");
+      });
+
+      themeButton.addEventListener("click", () => {
+        const light = body.dataset.theme === "light";
+        if (light) {
+          delete body.dataset.theme;
+          localStorage.setItem("embedded-guide-theme", "dark");
+        } else {
+          body.dataset.theme = "light";
+          localStorage.setItem("embedded-guide-theme", "light");
+        }
+      });
+
+      printButton.addEventListener("click", () => window.print());
+
+      links.forEach((link) => {
+        link.addEventListener("click", (event) => {
+          const target = document.querySelector(link.getAttribute("href"));
+          if (!target) return;
+          event.preventDefault();
+          target.scrollIntoView({ behavior: "smooth", block: "start" });
+          history.replaceState(null, "", link.getAttribute("href"));
+          if (window.matchMedia("(max-width: 760px)").matches) body.classList.add("sidebar-collapsed");
+        });
+      });
+
+      const setActive = (id, title) => {
+        links.forEach((link) => link.classList.toggle("active", link.getAttribute("href") === "#" + id));
+        if (title) status.textContent = "正在阅读：" + title;
+      };
+
+      const observer = new IntersectionObserver((entries) => {
+        const visible = entries.filter((entry) => entry.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+        if (visible) setActive(visible.target.id, visible.target.dataset.title);
+      }, { rootMargin: "-18% 0px -70% 0px", threshold: [0, .2, .5, 1] });
+      sections.forEach((section) => observer.observe(section));
+
+      search.addEventListener("input", () => {
+        const query = search.value.trim().toLowerCase();
+        document.querySelectorAll("[data-nav-group]").forEach((group) => group.classList.remove("hide-on-search"));
+        links.forEach((link) => {
+          const match = !query || link.textContent.toLowerCase().includes(query);
+          link.classList.toggle("nav-item-hidden", !match);
+        });
+        if (!query) return;
+        document.querySelectorAll("[data-nav-group]").forEach((group) => {
+          const hasVisible = group.querySelector(".nav-link:not(.nav-item-hidden)");
+          group.classList.toggle("hide-on-search", !hasVisible);
+          if (hasVisible) group.open = true;
+        });
+      });
+
+      document.querySelectorAll("[data-copy]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          const code = button.parentElement.querySelector("code");
+          if (!code) return;
+          try {
+            await navigator.clipboard.writeText(code.innerText);
+            const old = button.textContent;
+            button.textContent = "已复制";
+            setTimeout(() => button.textContent = old, 1200);
+          } catch {
+            button.textContent = "请手动复制";
+            setTimeout(() => button.textContent = "复制", 1200);
+          }
+        });
+      });
+
+      const initialId = location.hash ? location.hash.slice(1) : "home";
+      const initial = document.getElementById(initialId);
+      if (initial) setTimeout(() => initial.scrollIntoView({ block: "start" }), 0);
+    })();
+  </script>
+</body>
+</html>
