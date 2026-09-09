@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="JobPostings 项目的面试技术栈与架构说明">
+  <title>JobPostings · 面试技术栈说明</title>
+  <style>
+    :root {
+      --ink: #17233c;
+      --muted: #5d6b83;
+      --paper: #f7f8fc;
+      --panel: rgba(255, 255, 255, .88);
+      --line: #dde3ee;
+      --blue: #4267e8;
+      --blue-dark: #2744ad;
+      --mint: #1c9f91;
+      --coral: #ed765d;
+      --gold: #c48b2c;
+      --shadow: 0 18px 50px rgba(36, 58, 105, .11);
+      --radius: 22px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 4% 1%, rgba(66, 103, 232, .14), transparent 28rem),
+        radial-gradient(circle at 96% 18%, rgba(28, 159, 145, .12), transparent 24rem),
+        var(--paper);
+      font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+      line-height: 1.72;
+    }
+
+    a { color: var(--blue-dark); }
+    code, .mono { font-family: "Cascadia Code", "Consolas", monospace; }
+    code {
+      padding: .12em .35em;
+      color: #243b83;
+      background: #eef2ff;
+      border-radius: 6px;
+      font-size: .92em;
+    }
+
+    .page { width: min(1180px, calc(100% - 40px)); margin: 0 auto; }
+    .hero {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(280px, .65fr);
+      gap: 36px;
+      align-items: end;
+      min-height: 510px;
+      padding: 80px 0 64px;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: 8%;
+      bottom: 34px;
+      width: 170px;
+      height: 170px;
+      border: 1px solid rgba(66, 103, 232, .18);
+      border-radius: 50%;
+      box-shadow: 0 0 0 20px rgba(66, 103, 232, .035), 0 0 0 42px rgba(66, 103, 232, .025);
+      pointer-events: none;
+    }
+    .eyebrow, .section-kicker {
+      margin: 0 0 10px;
+      color: var(--blue);
+      font-weight: 800;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+      font-size: .76rem;
+    }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      max-width: 760px;
+      margin-bottom: 20px;
+      font-size: clamp(2.55rem, 6vw, 5.25rem);
+      line-height: 1.08;
+      letter-spacing: -.055em;
+    }
+    h1 span { color: var(--blue); }
+    .hero-lead {
+      max-width: 710px;
+      margin-bottom: 25px;
+      color: var(--muted);
+      font-size: clamp(1.06rem, 2vw, 1.28rem);
+    }
+    .chips { display: flex; flex-wrap: wrap; gap: 9px; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 7px 12px;
+      color: #34425d;
+      background: rgba(255, 255, 255, .75);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: .86rem;
+      font-weight: 700;
+    }
+    .chip::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      background: var(--mint);
+      border-radius: 50%;
+    }
+    .hero-card, .card, .quote, .table-wrap, .flow-wrap {
+      background: var(--panel);
+      border: 1px solid rgba(221, 227, 238, .9);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+    .hero-card {
+      position: relative;
+      z-index: 1;
+      padding: 28px;
+      border-radius: 28px;
+      transform: rotate(1.3deg);
+    }
+    .hero-card strong { display: block; margin-bottom: 16px; color: var(--blue-dark); }
+    .hero-card p { margin-bottom: 0; color: #36435c; font-size: 1.05rem; }
+    .hero-card .mark {
+      display: inline-grid;
+      width: 42px;
+      height: 42px;
+      margin-bottom: 18px;
+      place-items: center;
+      color: #fff;
+      background: linear-gradient(145deg, var(--blue), var(--mint));
+      border-radius: 13px;
+      font-weight: 900;
+      font-size: 1.35rem;
+    }
+
+    .toc {
+      position: sticky;
+      z-index: 5;
+      top: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 70px;
+      padding: 10px;
+      background: rgba(247, 248, 252, .84);
+      border: 1px solid rgba(221, 227, 238, .95);
+      border-radius: 16px;
+      box-shadow: 0 8px 25px rgba(36, 58, 105, .07);
+      backdrop-filter: blur(18px);
+    }
+    .toc a, .toc button {
+      padding: 7px 12px;
+      color: var(--muted);
+      background: transparent;
+      border: 0;
+      border-radius: 10px;
+      font: inherit;
+      font-size: .86rem;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .toc a:hover, .toc button:hover { color: var(--blue-dark); background: #eaf0ff; }
+    .toc .print-button { margin-left: auto; color: #fff; background: var(--ink); }
+
+    .section { margin-bottom: 86px; scroll-margin-top: 88px; }
+    .section-head { max-width: 760px; margin-bottom: 25px; }
+    .section-head h2 { margin-bottom: 7px; font-size: clamp(1.8rem, 3vw, 2.7rem); line-height: 1.2; letter-spacing: -.035em; }
+    .section-head p { margin-bottom: 0; color: var(--muted); }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+    .card { padding: 24px; border-radius: var(--radius); }
+    .card h3 { margin-bottom: 8px; font-size: 1.08rem; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .card p, .card li { color: var(--muted); font-size: .96rem; }
+    .card ul { margin: 10px 0 0; padding-left: 1.2em; }
+    .accent-card { border-top: 4px solid var(--blue); }
+    .accent-card:nth-child(2) { border-top-color: var(--mint); }
+    .accent-card:nth-child(3) { border-top-color: var(--coral); }
+    .big-number { margin-bottom: 6px; color: var(--blue); font: 900 2.1rem/1 "Cascadia Code", "Consolas", monospace; }
+    .subtle { color: var(--muted); }
+
+    .flow-wrap { padding: 25px; border-radius: 26px; overflow: hidden; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(100px, 1fr));
+      gap: 14px;
+      align-items: stretch;
+    }
+    .flow-step { position: relative; min-height: 155px; padding: 16px 13px; background: #fff; border: 1px solid var(--line); border-radius: 17px; }
+    .flow-step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      top: 50%;
+      right: -22px;
+      z-index: 2;
+      color: var(--blue);
+      font-size: 1.3rem;
+      font-weight: 900;
+      transform: translateY(-50%);
+    }
+    .flow-step .step-no { color: var(--blue); font: 800 .77rem/1 "Cascadia Code", "Consolas", monospace; }
+    .flow-step h3 { margin: 12px 0 5px; font-size: .98rem; line-height: 1.35; }
+    .flow-step p { margin: 0; color: var(--muted); font-size: .82rem; line-height: 1.55; }
+    .flow-note { margin: 23px 0 0; padding-top: 18px; color: var(--muted); border-top: 1px dashed var(--line); font-size: .9rem; }
+
+    .stack-card { min-height: 223px; }
+    .stack-card .stack-label { display: flex; justify-content: space-between; gap: 15px; margin-bottom: 13px; }
+    .stack-card .stack-label span:first-child { color: var(--blue-dark); font-weight: 850; }
+    .stack-card .stack-label span:last-child { color: var(--muted); font: .72rem "Cascadia Code", "Consolas", monospace; }
+    .tech-list { display: flex; flex-wrap: wrap; gap: 7px; margin: 0 0 13px; padding: 0; list-style: none; }
+    .tech-list li { padding: 4px 9px; color: #324261; background: #f0f4ff; border-radius: 7px; font: 700 .78rem "Cascadia Code", "Consolas", monospace; }
+    .stack-card p { margin-bottom: 0; }
+
+    .timeline { display: grid; gap: 0; }
+    .timeline-item { display: grid; grid-template-columns: 48px 1fr; gap: 16px; position: relative; padding-bottom: 24px; }
+    .timeline-item:last-child { padding-bottom: 0; }
+    .timeline-item::before { content: ""; position: absolute; left: 23px; top: 45px; bottom: 0; width: 1px; background: #ccd6ee; }
+    .timeline-item:last-child::before { display: none; }
+    .timeline-icon { position: relative; z-index: 1; display: grid; width: 48px; height: 48px; place-items: center; color: var(--blue-dark); background: #e9efff; border: 1px solid #cbd8ff; border-radius: 15px; font: 900 .82rem "Cascadia Code", "Consolas", monospace; }
+    .timeline-copy h3 { margin: 1px 0 3px; font-size: 1.03rem; }
+    .timeline-copy p { margin: 0; color: var(--muted); font-size: .94rem; }
+
+    .question { display: grid; grid-template-columns: 34px 1fr; gap: 13px; padding: 20px; border-left: 3px solid var(--mint); }
+    .question:nth-child(2) { border-left-color: var(--coral); }
+    .question:nth-child(3) { border-left-color: var(--gold); }
+    .question:nth-child(4) { border-left-color: var(--blue); }
+    .q-mark { color: var(--mint); font: 900 1.4rem/1 "Cascadia Code", "Consolas", monospace; }
+    .question:nth-child(2) .q-mark { color: var(--coral); }
+    .question:nth-child(3) .q-mark { color: var(--gold); }
+    .question:nth-child(4) .q-mark { color: var(--blue); }
+    .question h3 { margin-bottom: 5px; font-size: 1rem; }
+    .question p { margin: 0; color: var(--muted); font-size: .93rem; }
+
+    .table-wrap { overflow: auto; border-radius: var(--radius); }
+    table { width: 100%; border-collapse: collapse; min-width: 680px; }
+    th, td { padding: 15px 17px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { color: #324b9b; background: #edf2ff; font-size: .86rem; }
+    td { color: var(--muted); font-size: .91rem; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { width: 22%; color: var(--ink); font-weight: 800; }
+
+    .quote { position: relative; padding: 28px 31px; border-left: 5px solid var(--blue); border-radius: 4px var(--radius) var(--radius) 4px; }
+    .quote::before { content: "“"; position: absolute; top: 0; left: 17px; color: #dce5ff; font: 900 5rem/1 Georgia, serif; }
+    .quote p { position: relative; margin: 0; color: #2d3b57; font-size: 1.1rem; }
+    .quote cite { display: block; margin-top: 12px; color: var(--muted); font-size: .84rem; font-style: normal; }
+    .copy-row { display: flex; justify-content: flex-end; margin-top: 13px; }
+    .copy-button { padding: 8px 13px; color: #fff; background: var(--blue); border: 0; border-radius: 9px; font: inherit; font-size: .82rem; cursor: pointer; }
+    .copy-button:hover { background: var(--blue-dark); }
+
+    .boundary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .boundary .card { box-shadow: none; }
+    .boundary h3 { display: flex; align-items: center; gap: 8px; }
+    .boundary h3::before { content: ""; width: 9px; height: 9px; background: var(--mint); border-radius: 50%; }
+    .boundary .card:nth-child(2) h3::before { background: var(--gold); }
+    .boundary .card:nth-child(3) h3::before { background: var(--coral); }
+
+    footer { margin: 90px 0 35px; padding-top: 20px; color: var(--muted); border-top: 1px solid var(--line); font-size: .84rem; }
+    footer p:last-child { margin-bottom: 0; }
+
+    @media (max-width: 900px) {
+      .hero { grid-template-columns: 1fr; min-height: auto; padding-top: 54px; }
+      .hero-card { max-width: 560px; }
+      .flow { grid-template-columns: repeat(2, 1fr); }
+      .flow-step:not(:last-child)::after { content: "↓"; top: auto; right: auto; bottom: -25px; left: 50%; transform: translateX(-50%); }
+      .flow-step:nth-child(2)::after, .flow-step:nth-child(4)::after, .flow-step:nth-child(6)::after { content: ""; }
+      .grid-3, .boundary { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 620px) {
+      .page { width: min(100% - 24px, 1180px); }
+      .hero { padding: 42px 0 48px; }
+      h1 { font-size: 2.7rem; }
+      .toc { top: 7px; margin-bottom: 55px; }
+      .toc .print-button { margin-left: 0; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .flow-step { min-height: auto; }
+      .flow-step:not(:last-child)::after { content: "↓"; top: auto; right: auto; bottom: -25px; left: 50%; transform: translateX(-50%); }
+      .flow-step:nth-child(2)::after, .flow-step:nth-child(4)::after, .flow-step:nth-child(6)::after { content: "↓"; }
+      .card, .flow-wrap { padding: 19px; }
+    }
+    @media print {
+      body { background: #fff; }
+      .page { width: 100%; }
+      .hero { min-height: auto; padding: 25px 0 35px; }
+      .hero::after, .toc, .copy-row { display: none; }
+      .hero-card, .card, .quote, .table-wrap, .flow-wrap { box-shadow: none; break-inside: avoid; }
+      .section { margin-bottom: 35px; }
+      a { color: inherit; text-decoration: none; }
+      footer { margin-top: 35px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Interview field guide · v0.1.0</p>
+        <h1>把招聘信息，<span>变成可行动的数据。</span></h1>
+        <p class="hero-lead">JobPostings 是一个运行在 Windows 本机的招聘信息聚合与求职进度管理系统。它把微信群、网页和文件里的非结构化信息，经过解析、模型识别、证据留存和人工审核，整理成企业、岗位、招聘事件和个人求职进度。</p>
+        <div class="chips" aria-label="项目关键词">
+          <span class="chip">Local-first</span>
+          <span class="chip">React + TypeScript</span>
+          <span class="chip">FastAPI + Python</span>
+          <span class="chip">SQLite</span>
+          <span class="chip">Codex / LLM</span>
+        </div>
+      </div>
+      <aside class="hero-card">
+        <span class="mark">J</span>
+        <strong>30 秒项目介绍</strong>
+        <p>“我做的是一个本地优先的招聘信息工作台。前端用 React 和 TypeScript，后端用 FastAPI，数据落在 SQLite。系统从 TraceMemo、公开 URL 和文件接收原始材料，经过队列、网页/文档解析、OCR 和 Codex 结构化，最后保存带来源证据的岗位目录，并通过 SSE 让前端实时刷新。”</p>
+      </aside>
+    </header>
+
+    <nav class="toc" aria-label="页面导航">
+      <a href="#overview">项目定位</a>
+      <a href="#architecture">架构链路</a>
+      <a href="#stack">技术栈</a>
+      <a href="#pipeline">处理流程</a>
+      <a href="#decisions">设计取舍</a>
+      <a href="#qa">面试问答</a>
+      <button class="print-button" type="button" onclick="window.print()">打印 / PDF</button>
+    </nav>
+
+    <section class="section" id="overview">
+      <div class="section-head">
+        <p class="section-kicker">01 · Positioning</p>
+        <h2>先把项目讲成一个产品问题</h2>
+        <p>面试官不需要先听依赖清单，先让对方明白：为什么要做、数据从哪里来、系统帮用户减少了什么麻烦。</p>
+      </div>
+      <div class="grid-3">
+        <article class="card accent-card">
+          <p class="big-number">01</p>
+          <h3>Local-first</h3>
+          <p>核心数据、附件和密钥默认保存在本机。没有单独部署 MySQL 或云数据库也能运行，更适合包含个人求职记录的场景。</p>
+        </article>
+        <article class="card accent-card">
+          <p class="big-number">02</p>
+          <h3>Evidence-first</h3>
+          <p>模型抽取出来的企业、岗位和活动不会脱离原始消息。系统保留来源、附件、版本和证据，遇到不确定内容进入人工审核。</p>
+        </article>
+        <article class="card accent-card">
+          <p class="big-number">03</p>
+          <h3>Human-in-the-loop</h3>
+          <p>模型适合做语义分类和结构化，但不负责替用户“猜事实”。低置信度、冲突和归并异常会留在审核边界内。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="architecture">
+      <div class="section-head">
+        <p class="section-kicker">02 · Architecture</p>
+        <h2>一张图看懂系统如何协作</h2>
+        <p>可以沿着箭头讲：输入先被保存，再异步处理，模型只负责语义判断，目录层负责稳定地写入和去重。</p>
+      </div>
+      <div class="flow-wrap">
+        <div class="flow">
+          <article class="flow-step"><span class="step-no">01 / INPUT</span><h3>消息与文件</h3><p>TraceMemo 群聊、文本、公开 URL、PDF/DOCX/XLSX、图片。</p></article>
+          <article class="flow-step"><span class="step-no">02 / API</span><h3>FastAPI 接入</h3><p>校验请求、鉴权、创建导入任务，统一 API 入口。</p></article>
+          <article class="flow-step"><span class="step-no">03 / QUEUE</span><h3>持久化队列</h3><p><code>processing_jobs</code> 记录状态、阶段日志、重试和取消。</p></article>
+          <article class="flow-step"><span class="step-no">04 / EXTRACT</span><h3>解析与 OCR</h3><p>BeautifulSoup、Playwright、文档解析、Codex OCR 与本地兜底。</p></article>
+          <article class="flow-step"><span class="step-no">05 / MODEL</span><h3>语义结构化</h3><p>Codex 或 OpenAI-compatible 模型输出严格 JSON。</p></article>
+          <article class="flow-step"><span class="step-no">06 / CATALOG</span><h3>目录与证据</h3><p>写入企业、岗位、事件、版本、证据和审核项。</p></article>
+          <article class="flow-step"><span class="step-no">07 / UI</span><h3>浏览器工作台</h3><p>React 页面读取 API，SSE 通知处理进度并刷新目录。</p></article>
+        </div>
+        <p class="flow-note"><strong>关键边界：</strong>解析器负责“把材料读出来”，模型负责“理解招聘语义”，目录层负责“保存、归并和去重”。这样可以避免把本地关键词规则误当成招聘事实。</p>
+      </div>
+    </section>
+
+    <section class="section" id="stack">
+      <div class="section-head">
+        <p class="section-kicker">03 · Stack</p>
+        <h2>技术栈：每一项都对应一个实际问题</h2>
+        <p>面试时不要只报名称，可以顺带说出“它在这里解决什么问题”。</p>
+      </div>
+      <div class="grid-2">
+        <article class="card stack-card">
+          <div class="stack-label"><span>浏览器前端</span><span>frontend/</span></div>
+          <ul class="tech-list"><li>React 19</li><li>TypeScript 5.9</li><li>Vite 7</li><li>Motion</li><li>Fetch / EventSource</li><li>CSS</li></ul>
+          <p>React 管理页面和交互状态，TypeScript 约束数据形状，Vite 负责开发服务器和生产构建。当前是手写 React/CSS，没有引入大型 UI 组件库；后端 API 通过 <code>fetch</code> 调用，进度通过原生 <code>EventSource</code> 接收 SSE。</p>
+        </article>
+        <article class="card stack-card">
+          <div class="stack-label"><span>后端 API 与运行时</span><span>backend/app/</span></div>
+          <ul class="tech-list"><li>Python 3.12+</li><li>FastAPI</li><li>Uvicorn</li><li>Pydantic 2</li><li>httpx</li><li>asyncio</li></ul>
+          <p>FastAPI 集中提供 REST API、鉴权和静态前端服务；Pydantic 做请求模型和配置校验；Uvicorn 负责运行。生命周期里启动 worker、同步、通知、备份等后台循环，阻塞型处理通过 <code>asyncio.to_thread</code> 移出事件循环。</p>
+        </article>
+        <article class="card stack-card">
+          <div class="stack-label"><span>数据存储</span><span>db.py + local storage</span></div>
+          <ul class="tech-list"><li>SQLite</li><li>sqlite3</li><li>Schema migration</li><li>Blob files</li><li>JSON fields</li></ul>
+          <p>SQLite 适配单机、低运维和隐私优先的目标。结构化数据在数据库中，原始附件放在本地 Blob 目录；<code>schema_meta</code> 和兼容性迁移保证旧数据库升级时不被直接丢弃。</p>
+        </article>
+        <article class="card stack-card">
+          <div class="stack-label"><span>解析、浏览器与文件</span><span>parsers.py / browser.py</span></div>
+          <ul class="tech-list"><li>BeautifulSoup</li><li>Playwright</li><li>openpyxl</li><li>PyMuPDF</li><li>python-docx</li><li>OpenCV</li></ul>
+          <p>静态网页用 BeautifulSoup 提取；遇到动态网页或懒加载图片时用 Playwright 渲染；XLSX、PDF、DOCX 走对应解析器，图片保留 OCR 和二维码结果。旧版 DOC/XLS 需要目标机额外安装转换器。</p>
+        </article>
+        <article class="card stack-card">
+          <div class="stack-label"><span>AI 与语义处理</span><span>codex_agent.py / model_provider.py</span></div>
+          <ul class="tech-list"><li>Local Codex CLI</li><li>OpenAI-compatible API</li><li>Markdown prompts</li><li>Strict JSON</li><li>Redaction</li><li>Token budget</li></ul>
+          <p>默认优先使用本地 Codex；也支持 Chat Completions 或 Responses API。任务 prompt 明确输入和输出 schema，模型做招聘分类、字段抽取和语义去重，结果再由后端校验并写入目录。</p>
+        </article>
+        <article class="card stack-card">
+          <div class="stack-label"><span>安全与桌面发布</span><span>security.py / desktop/</span></div>
+          <ul class="tech-list"><li>HttpOnly Cookie</li><li>Scope authorization</li><li>DPAPI</li><li>cryptography</li><li>PyInstaller</li><li>WebDAV</li></ul>
+          <p>后端权限依赖是安全边界，前端隐藏页面不是安全措施；敏感配置保存在本机安全存储，支持加密备份。Windows 通过桌面启动器、托盘和 PyInstaller 打包，可选 Inno Setup 生成安装器。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="pipeline">
+      <div class="section-head">
+        <p class="section-kicker">04 · Data flow</p>
+        <h2>按一次“导入”来讲完整处理流程</h2>
+        <p>这部分最适合回答“你具体负责了什么”或“一个招聘信息进来之后发生了什么”。</p>
+      </div>
+      <div class="card timeline">
+        <article class="timeline-item"><div class="timeline-icon">01</div><div class="timeline-copy"><h3>接收并保留原始材料</h3><p>TraceMemo 消息或手工导入先进入 <code>raw_messages</code>；文件进入 <code>artifacts</code>。通过外部消息 ID 或内容指纹避免重复接收。</p></div></article>
+        <article class="timeline-item"><div class="timeline-icon">02</div><div class="timeline-copy"><h3>创建可恢复的处理任务</h3><p>系统创建 <code>processing_jobs</code>，记录 queued、extracting、classifying、review、completed 等阶段，并保留日志、重试和取消状态。</p></div></article>
+        <article class="timeline-item"><div class="timeline-icon">03</div><div class="timeline-copy"><h3>提取正文、图片和元数据</h3><p>解析 URL、文件和消息内容；动态网页由 Playwright 渲染。图片默认走本地 Codex OCR，Codex 不可用或无可读文字时才使用可选的 RapidOCR 兜底。</p></div></article>
+        <article class="timeline-item"><div class="timeline-icon">04</div><div class="timeline-copy"><h3>让模型输出结构化结果</h3><p>后端用任务专用 prompt 调用 Codex 或通用模型，要求严格 JSON。输出区分企业、招聘批次、共享招聘条件、具体岗位、招聘事件和证据。</p></div></article>
+        <article class="timeline-item"><div class="timeline-icon">05</div><div class="timeline-copy"><h3>校验、归并、去重并写入目录</h3><p><code>catalog.py</code> 负责稳定写入和关联证据；岗位、企业和事件分别处理，不把“专业、福利或企业介绍”误写成岗位。冲突或低置信度结果进入审核。</p></div></article>
+        <article class="timeline-item"><div class="timeline-icon">06</div><div class="timeline-copy"><h3>通过 SSE 告知前端</h3><p>前端监听 <code>/api/v1/events</code> 的 <code>job.updated</code>、<code>processing.updated</code> 等事件，刷新页面数据，让用户看到任务状态而不是等待一个黑盒请求。</p></div></article>
+      </div>
+    </section>
+
+    <section class="section" id="decisions">
+      <div class="section-head">
+        <p class="section-kicker">05 · Trade-offs</p>
+        <h2>几个能体现工程思考的设计取舍</h2>
+      </div>
+      <div class="grid-2">
+        <article class="card question"><span class="q-mark">Q</span><div><h3>为什么选择 SQLite，而不是 PostgreSQL？</h3><p>产品是 Windows 本地优先，目标用户和并发规模都不要求独立数据库服务。SQLite 部署简单、数据文件可备份，能降低使用门槛；如果未来变成多用户高并发服务，再考虑迁移到服务型数据库。</p></div></article>
+        <article class="card question"><span class="q-mark">Q</span><div><h3>为什么不能只用关键词规则？</h3><p>招聘消息格式不稳定，企业介绍、福利、专业要求和岗位标题可能挨在一起。规则可以做格式和安全校验，但语义归类交给模型；这样减少“看见一个词就生成一个岗位”的误判。</p></div></article>
+        <article class="card question"><span class="q-mark">Q</span><div><h3>如何处理模型不确定或重复的结果？</h3><p>原始消息和证据始终保留；不确定字段使用空值或进入审核，不强行猜测。目录层维护实体关系、版本和去重逻辑，明确时间或地点冲突的事件不自动合并。</p></div></article>
+        <article class="card question"><span class="q-mark">Q</span><div><h3>为什么要做队列和 SSE？</h3><p>网页渲染、OCR、模型请求都可能耗时，不能让一次 HTTP 请求长时间卡住界面。队列让任务可重试、可取消、可观察；SSE 让前端及时获得状态变化，交互更可靠。</p></div></article>
+      </div>
+    </section>
+
+    <section class="section" id="data-model">
+      <div class="section-head">
+        <p class="section-kicker">06 · Data model</p>
+        <h2>数据不是一张“岗位表”，而是分层的事实链</h2>
+        <p>这种拆分既方便展示，也方便解释“模型判断”和“来源事实”之间的边界。</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>层次</th><th>保存什么</th><th>为什么单独保存</th></tr></thead>
+          <tbody>
+            <tr><td>来源层</td><td><code>raw_messages</code>、<code>artifacts</code>、TraceMemo 缓存、原始 URL</td><td>保留可追溯的事实和附件，不让后续模型结果覆盖原文。</td></tr>
+            <tr><td>处理层</td><td><code>processing_jobs</code>、<code>processing_logs</code>、<code>llm_calls</code></td><td>观察任务阶段、重试、Token 用量、失败原因和审核载荷。</td></tr>
+            <tr><td>招聘目录层</td><td><code>companies</code>、<code>jobs</code>、<code>recruitment_events</code>、<code>evidences</code></td><td>把企业、岗位、活动和证据拆开，支持版本、归并与去重。</td></tr>
+            <tr><td>用户层</td><td><code>user_job_states</code>、备注、标签、关注、通知、申请事件</td><td>把招聘事实和“我对这个岗位做了什么”分离，支持个人求职进度。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="security">
+      <div class="section-head">
+        <p class="section-kicker">07 · Safety</p>
+        <h2>隐私和安全：面试时要主动讲清楚</h2>
+      </div>
+      <div class="grid-3">
+        <article class="card accent-card"><h3>最小暴露</h3><p>默认本地保存数据和附件；使用云模型时可开启手机号、邮箱、微信号、QQ、身份证号的稳定占位符脱敏，原始消息不被覆盖。</p></article>
+        <article class="card accent-card"><h3>不可信输入</h3><p>网页正文和群聊内容始终按不可信数据处理，不能改变系统提示、权限或任务流程；公开 URL 还要经过安全校验。</p></article>
+        <article class="card accent-card"><h3>可恢复运维</h3><p>破坏性维护先备份，队列、失败原因和证据边界要保留。模型额度达到上限时暂停新请求，避免无控制地继续消耗。</p></article>
+      </div>
+    </section>
+
+    <section class="section" id="qa">
+      <div class="section-head">
+        <p class="section-kicker">08 · Interview kit</p>
+        <h2>可以直接练习的回答</h2>
+      </div>
+      <div class="quote" id="answer-text">
+        <p>这个项目解决的是招聘信息碎片化的问题。用户可能从微信群、网页、PDF 或图片里看到招聘内容，我把这些输入统一保存为原始来源，再通过 FastAPI 后端创建可恢复的处理任务。解析器负责提取正文和附件，Playwright 处理动态网页，Codex 负责招聘语义识别和严格 JSON 输出，最后由目录层分别保存企业、岗位、招聘事件和证据。前端用 React + TypeScript 展示结果，通过 SSE 获取处理进度。由于招聘信息包含个人隐私且项目主要是单机使用，所以选择 SQLite 和本地优先设计，并把不确定结果留给人工审核。</p>
+        <cite>适合 1–2 分钟的项目概述；可以按面试官追问再展开技术细节。</cite>
+        <div class="copy-row"><button class="copy-button" type="button" onclick="copyAnswer(this)">复制这段回答</button></div>
+      </div>
+      <div class="grid-2" style="margin-top: 16px">
+        <article class="card">
+          <h3>“你在这个项目中最看重什么？”</h3>
+          <p>我最看重的是数据可追溯性。模型可以提高非结构化文本的处理效率，但不能替代来源事实，所以系统把原始消息、附件、证据和版本保留下来，并把低置信度结果交给审核。</p>
+        </article>
+        <article class="card">
+          <h3>“如果规模扩大，你会怎么演进？”</h3>
+          <p>先把处理器和 API 的边界保持稳定，再把 SQLite 替换成 PostgreSQL，把本地队列拆成独立 worker，并把 Blob 放到对象存储；SSE 也可以根据部署形态改成消息总线或 WebSocket。</p>
+        </article>
+        <article class="card">
+          <h3>“如何验证项目质量？”</h3>
+          <p>前端运行 TypeScript 检查和 Vite build；后端按解析、TraceMemo、处理、API 等边界跑定向 pytest。外部 TraceMemo、模型、SMTP、AList 和安装流程还需要在目标环境做真实冒烟测试。</p>
+        </article>
+        <article class="card">
+          <h3>“项目有什么现实限制？”</h3>
+          <p>本地 Codex 需要目标机已安装并登录 CLI；旧版 DOC/XLS 需要额外转换器；开发版和安装版默认数据目录不同；Windows 临时目录权限也可能影响完整测试收尾。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="boundary">
+      <div class="section-head">
+        <p class="section-kicker">09 · Honest status</p>
+        <h2>面试表述边界：准确比夸大更重要</h2>
+      </div>
+      <div class="boundary">
+        <article class="card"><h3>当前已有</h3><p>浏览器工作台、权限、TraceMemo 同步、文本/URL/文件/图片导入、队列、Codex 与通用模型路径、目录/证据/审核、求职状态、导出、备份和 Windows 打包。</p></article>
+        <article class="card"><h3>依赖环境</h3><p>真实 TraceMemo、外部模型、SMTP、AList WebDAV、Cloudflare Tunnel 和桌面安装都需要在目标机器或服务环境中单独验证。</p></article>
+        <article class="card"><h3>验证口径</h3><p>前端 build 和后端定向测试已有验证；完整 pytest 在受管 Windows 临时目录权限下存在限制，因此不应表述为“全量测试无条件通过”。</p></article>
+      </div>
+    </section>
+
+    <footer>
+      <p><strong>源码对照入口：</strong> <a href="../README.md">README.md</a> · <a href="ARCHITECTURE.md">ARCHITECTURE.md</a> · <a href="STATUS.md">STATUS.md</a> · <a href="MODEL_AND_PRIVACY.md">MODEL_AND_PRIVACY.md</a> · <a href="../pyproject.toml">pyproject.toml</a> · <a href="../frontend/package.json">frontend/package.json</a></p>
+      <p>本文档是面试讲解辅助材料，技术事实以当前仓库源码和项目文档为准。生成日期：2026-09-09。</p>
+    </footer>
+  </main>
+
+  <script>
+    function copyAnswer(button) {
+      const text = document.querySelector('#answer-text > p').innerText;
+      const showFallback = () => {
+        button.innerText = '请手动选择文字';
+        setTimeout(() => { button.innerText = '复制这段回答'; }, 1800);
+      };
+      if (!navigator.clipboard) {
+        showFallback();
+        return;
+      }
+      navigator.clipboard.writeText(text).then(() => {
+        const original = button.innerText;
+        button.innerText = '已复制';
+        setTimeout(() => { button.innerText = original; }, 1500);
+      }).catch(showFallback);
+    }
+  </script>
+</body>
+</html>
