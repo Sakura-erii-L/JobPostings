@@ -15,6 +15,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
+from starlette.middleware.gzip import GZipMiddleware
 
 from .auth import authenticate_password, create_session, initial_admin_password_required, local_bootstrap_allowed, otp_login_enabled, public_user, request_code, require_admin, require_scope, require_user, set_initial_admin_password, set_user_password, verify_code
 from .backups import WebDAVClient, _backup_credentials, create_backup, list_backups, validate_remote_backup
@@ -649,7 +650,16 @@ async def lifespan(app: FastAPI):
     background_tasks.clear()
 
 
+class ImmutableAssetFiles(StaticFiles):
+    async def get_response(self, path: str, scope: dict[str, Any]):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        return response
+
+
 app = FastAPI(title="JobPostings", version="0.1.0", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 app.add_api_route("/api/v1/admin/tracememo/messages", tracememo_messages, methods=["GET"])
 app.add_api_route("/api/v1/admin/tracememo/messages/import", import_selected_tracememo_messages, methods=["POST"])
 
@@ -1891,7 +1901,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 DIST_DIR = _runtime_path("frontend", "dist")
 if (DIST_DIR / "assets").exists():
-    app.mount("/assets", StaticFiles(directory=DIST_DIR / "assets"), name="frontend-assets")
+    app.mount("/assets", ImmutableAssetFiles(directory=DIST_DIR / "assets"), name="frontend-assets")
 
 
 @app.get("/{path:path}", response_class=HTMLResponse, response_model=None)

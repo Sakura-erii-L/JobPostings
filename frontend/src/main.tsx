@@ -38,8 +38,19 @@ const SOURCE_TYPE_LABELS: Record<string, string> = { wechat_group: '微信群聊
 const ADMIN_ONLY_PAGES = new Set(['import', 'admin', 'queue', 'review'])
 type SettingsSection = 'account' | 'invitations' | 'connections' | 'processing' | 'storage'
 type CompanyViewMode = 'tiles' | 'list'
+type DataSection = 'companies' | 'jobs' | 'applications' | 'notifications' | 'timeline'
+type DataSectionStatus = { loading: boolean; error: string }
 
 const COMPANY_VIEW_MODE_STORAGE_KEY = 'jobpostings-company-view-mode'
+const DATA_SECTIONS: DataSection[] = ['companies', 'jobs', 'applications', 'notifications', 'timeline']
+const DEFERRED_DATA_SECTIONS: DataSection[] = ['jobs', 'applications', 'notifications', 'timeline']
+const INITIAL_DATA_STATUS: Record<DataSection, DataSectionStatus> = {
+  companies: { loading: true, error: '' },
+  jobs: { loading: false, error: '' },
+  applications: { loading: false, error: '' },
+  notifications: { loading: false, error: '' },
+  timeline: { loading: false, error: '' },
+}
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const isForm = options.body instanceof FormData
@@ -59,6 +70,7 @@ function App() {
   const [initialized, setInitialized] = useState<boolean | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [detailError, setDetailError] = useState('')
   const [page, setPage] = useState<'companies' | 'timeline' | 'applications' | 'import' | 'admin' | 'queue' | 'settings' | 'security' | 'review'>('companies')
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('account')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
@@ -69,27 +81,108 @@ function App() {
   const [timeline, setTimeline] = useState<RecruitmentEvent[]>([])
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<CompanyDetail | null>(null)
+  const [selectedCompanyId, setSelectedCompanyId] = useState<string | null>(null)
   const [notice, setNotice] = useState('')
   const [notifications, setNotifications] = useState<Notification[]>([])
+  const [dataStatus, setDataStatus] = useState<Record<DataSection, DataSectionStatus>>(INITIAL_DATA_STATUS)
   const [syncing, setSyncing] = useState(false)
   const [researching, setResearching] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [pendingNavigation, setPendingNavigation] = useState<{ page: typeof page; settingsSection?: SettingsSection } | null>(null)
   const [settingsSaveRequest, setSettingsSaveRequest] = useState(0)
+  const queryRef = useRef(query)
+  const sectionVersions = useRef<Record<DataSection, number>>({ companies: 0, jobs: 0, applications: 0, notifications: 0, timeline: 0 })
+  const sectionRequests = useRef<Partial<Record<DataSection, { key: string; promise: Promise<void> }>>>({})
+  const refreshTimer = useRef<number | null>(null)
+  const refreshRequest = useRef<Promise<void> | null>(null)
+  const refreshQueued = useRef(false)
+  const detailRequestVersion = useRef(0)
 
-  const loadData = async () => {
-    const [companyData, jobData, applicationData, notificationData, timelineData] = await Promise.all([
-      api<Company[]>(`/companies?q=${encodeURIComponent(query)}`),
-      api<Job[]>('/jobs'),
-      api<Application[]>('/me/applications'),
-      api<Notification[]>('/notifications'),
-      api<RecruitmentEvent[]>('/recruitment-events'),
-    ])
-    setCompanies(companyData)
-    setJobs(jobData)
-    setApplications(applicationData)
-    setNotifications(notificationData)
-    setTimeline(timelineData)
+  queryRef.current = query
+
+  const loadSection = (section: DataSection, companyQuery = queryRef.current): Promise<void> => {
+    const key = section === 'companies' ? companyQuery : section
+    const existing = sectionRequests.current[section]
+    if (existing?.key === key) return existing.promise
+    const version = sectionVersions.current[section] + 1
+    sectionVersions.current[section] = version
+    const updateStatus = (status: DataSectionStatus) => {
+      if (sectionVersions.current[section] !== version) return
+      setDataStatus(current => ({ ...current, [section]: status }))
+    }
+    updateStatus({ loading: true, error: '' })
+    const promise = (async () => {
+      try {
+        let data: Company[] | Job[] | Application[] | Notification[] | RecruitmentEvent[]
+        if (section === 'companies') data = await api<Company[]>(`/companies?q=${encodeURIComponent(companyQuery)}`)
+        else if (section === 'jobs') data = await api<Job[]>('/jobs')
+        else if (section === 'applications') data = await api<Application[]>('/me/applications')
+        else if (section === 'notifications') data = await api<Notification[]>('/notifications')
+        else data = await api<RecruitmentEvent[]>('/recruitment-events')
+        if (sectionVersions.current[section] !== version) return
+        if (section === 'companies') setCompanies(data as Company[])
+        if (section === 'jobs') setJobs(data as Job[])
+        if (section === 'applications') setApplications(data as Application[])
+        if (section === 'notifications') setNotifications(data as Notification[])
+        if (section === 'timeline') setTimeline(data as RecruitmentEvent[])
+        updateStatus({ loading: false, error: '' })
+      } catch (reason) {
+        updateStatus({ loading: false, error: (reason as Error).message })
+      } finally {
+        if (sectionVersions.current[section] === version && sectionRequests.current[section]?.key === key) delete sectionRequests.current[section]
+      }
+    })()
+    sectionRequests.current[section] = { key, promise }
+    return promise
+  }
+
+  const loadData = () => {
+    const refresh = async () => {
+      const reusedRequest = DATA_SECTIONS.some(section => Boolean(sectionRequests.current[section]))
+      await Promise.all(DATA_SECTIONS.map(section => loadSection(section)))
+      if (reusedRequest) await Promise.all(DATA_SECTIONS.map(section => loadSection(section)))
+    }
+    if (refreshRequest.current) {
+      refreshQueued.current = true
+      return refreshRequest.current
+    }
+    const promise = refresh().finally(() => {
+      refreshRequest.current = null
+      if (refreshQueued.current) {
+        refreshQueued.current = false
+        loadData()
+      }
+    })
+    refreshRequest.current = promise
+    return promise
+  }
+
+  const scheduleRefresh = () => {
+    if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current)
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null
+      void loadData()
+    }, 100)
+  }
+
+  const startSession = (nextUser: User) => {
+    setUser(nextUser)
+    setPage('companies')
+    setQuery('')
+    queryRef.current = ''
+    setError('')
+    setSelected(null)
+    setSelectedCompanyId(null)
+    setDetailError('')
+    setCompanies([])
+    setJobs([])
+    setApplications([])
+    setTimeline([])
+    setNotifications([])
+    setDataStatus(INITIAL_DATA_STATUS)
+    setLoading(true)
+    void Promise.all(DEFERRED_DATA_SECTIONS.map(section => loadSection(section)))
+    return loadSection('companies').finally(() => setLoading(false))
   }
 
   useEffect(() => {
@@ -97,9 +190,8 @@ function App() {
       api<{ user: User }>('/auth/me'),
       api<{ initialized: boolean }>('/bootstrap/status'),
     ]).then(([me, status]) => {
-      setUser(me.user)
       setInitialized(status.initialized)
-      return loadData()
+      return startSession(me.user)
     }).catch(async () => {
       const status = await api<{ initialized: boolean }>('/bootstrap/status').catch(() => ({ initialized: true }))
       setInitialized(status.initialized)
@@ -109,15 +201,21 @@ function App() {
   useEffect(() => {
     if (!user) return
     const source = new EventSource('/api/v1/events')
-    const refresh = () => loadData().catch(() => undefined)
+    const refresh = () => scheduleRefresh()
     source.addEventListener('job.created', refresh)
     source.addEventListener('job.updated', refresh)
     source.addEventListener('company.created', refresh)
     source.addEventListener('company.updated', refresh)
     source.addEventListener('sync.completed', refresh)
     source.addEventListener('processing.updated', refresh)
-    return () => source.close()
-  }, [user, query])
+    return () => {
+      source.close()
+      if (refreshTimer.current !== null) {
+        window.clearTimeout(refreshTimer.current)
+        refreshTimer.current = null
+      }
+    }
+  }, [user])
 
   useEffect(() => {
     if (user && user.role !== 'admin' && ADMIN_ONLY_PAGES.has(page)) {
@@ -178,11 +276,22 @@ function App() {
       }
       const companyId = window.history.state?.jobPostingsCompanyId
       if (!companyId) {
+        ++detailRequestVersion.current
         setSelected(null)
+        setSelectedCompanyId(null)
+        setDetailError('')
         setPage('companies')
         return
       }
-      api<CompanyDetail>(`/companies/${companyId}`).then(setSelected).catch(reason => setError((reason as Error).message))
+      setSelected(null)
+      setSelectedCompanyId(companyId)
+      setDetailError('')
+      const version = ++detailRequestVersion.current
+      api<CompanyDetail>(`/companies/${companyId}`).then(detail => {
+        if (detailRequestVersion.current === version) setSelected(detail)
+      }).catch(reason => {
+        if (detailRequestVersion.current === version) setDetailError((reason as Error).message)
+      })
     }
     window.addEventListener('popstate', handlePopState)
     return () => window.removeEventListener('popstate', handlePopState)
@@ -193,8 +302,8 @@ function App() {
     window.setTimeout(() => setNotice(''), 3000)
   }
 
-  if (loading) return <div className="loading-screen"><div className="spinner" />正在加载 JobPostings…</div>
-  if (!user) return initialized ? <Login onLoggedIn={setUser} /> : <Bootstrap onLoggedIn={setUser} />
+  if (loading) return <div className="loading-screen"><div className="spinner" />正在加载企业目录…</div>
+  if (!user) return initialized ? <Login onLoggedIn={nextUser => { void startSession(nextUser) }} /> : <Bootstrap onLoggedIn={nextUser => { void startSession(nextUser) }} />
 
   const isAdmin = user.role === 'admin'
   const canViewPage = isAdmin || !ADMIN_ONLY_PAGES.has(page)
@@ -225,14 +334,18 @@ function App() {
     } catch (e) { setError((e as Error).message) }
     finally { setResearching(false) }
   }
-  const openCompany = async (id: string) => {
-    try {
-      setSelected(await api<CompanyDetail>(`/companies/${id}`))
-      setPage('companies')
-      clearCompanyHistoryState()
-      window.history.pushState({ ...(window.history.state || {}), jobPostingsCompanyId: id }, '', window.location.href)
-    }
-    catch (e) { setError((e as Error).message) }
+  const openCompany = (id: string) => {
+    const version = ++detailRequestVersion.current
+    setSelected(null)
+    setSelectedCompanyId(id)
+    setDetailError('')
+    setPage('companies')
+    window.history.pushState({ ...(window.history.state || {}), jobPostingsCompanyId: id }, '', window.location.href)
+    void api<CompanyDetail>(`/companies/${id}`).then(detail => {
+      if (detailRequestVersion.current === version) setSelected(detail)
+    }).catch(reason => {
+      if (detailRequestVersion.current === version) setDetailError((reason as Error).message)
+    })
   }
   const clearCompanyHistoryState = () => {
     const nextState = { ...(window.history.state || {}) }
@@ -242,7 +355,10 @@ function App() {
   }
   const backFromCompany = () => {
     clearCompanyHistoryState()
+    ++detailRequestVersion.current
     setSelected(null)
+    setSelectedCompanyId(null)
+    setDetailError('')
     setPage('companies')
   }
   const updateCompany = async (company: CompanyDetail) => {
@@ -273,8 +389,11 @@ function App() {
 
   const completeNavigation = (nextPage: typeof page, nextSettingsSection?: SettingsSection) => {
     clearCompanyHistoryState()
+    ++detailRequestVersion.current
     setPage(nextPage)
     setSelected(null)
+    setSelectedCompanyId(null)
+    setDetailError('')
     if (nextSettingsSection) setSettingsSection(nextSettingsSection)
     setMobileNavOpen(false)
     window.setTimeout(() => menuButtonRef.current?.focus(), 0)
@@ -308,7 +427,7 @@ function App() {
       {notice && <div className="notice">{notice}</div>}
       {pendingNavigation && <div className="unsaved-dialog app-navigation-dialog" role="alertdialog" aria-live="assertive"><strong>当前设置有未保存修改</strong><span>离开前请选择保存、放弃或留在当前页。</span><div className="button-row"><button className="primary" onClick={() => setSettingsSaveRequest(value => value + 1)}>保存并离开</button><button className="secondary danger" onClick={() => { const next = pendingNavigation; setPendingNavigation(null); setSettingsDirty(false); completeNavigation(next.page, next.settingsSection) }}>放弃修改</button><button className="secondary" onClick={() => setPendingNavigation(null)}>留在当前页</button></div></div>}
       {!selected && notifications.filter(item => !item.read_at).slice(0, 3).map(item => <div className="notification-strip" key={item.id}><div><strong>{item.title}</strong><span>{item.body}</span></div><div className="notification-actions"><button onClick={() => markNotificationRead(item.id)}>知道了</button>{(item.kind === 'usage_warning' || item.kind?.startsWith('usage_warning_')) && <button onClick={() => snoozeNotificationForDay(item.id)}>今日不再提醒</button>}</div></div>)}
-      {selected ? <CompanyDetailShell company={selected} onBack={backFromCompany} onState={updateState} onFollow={followCompany} editable={isAdmin} onUpdated={updateCompany} /> : !canViewPage ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => loadData()} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} /> : page === 'timeline' ? <TimelinePage events={timeline} onOpenCompany={openCompany} /> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData(); navigate('queue') }} /> : page === 'queue' ? <CompactQueuePage onSync={sync} syncing={syncing} /> : page === 'review' ? <ReviewPage onResolved={async () => { await loadData() }} /> : <SettingsCenter isAdmin={isAdmin} section={page === 'admin' ? 'invitations' : page === 'security' ? 'account' : settingsSection} onSectionChange={setSettingsSection} onDirtyChange={setSettingsDirty} onSaved={flash} onSync={sync} syncing={syncing} externalSaveRequest={settingsSaveRequest} onExternalSaveHandled={ok => { if (!ok || !pendingNavigation) return; const next = pendingNavigation; setPendingNavigation(null); setSettingsDirty(false); completeNavigation(next.page, next.settingsSection) }} />}
+      {selected ? <CompanyDetailShell company={selected} onBack={backFromCompany} onState={updateState} onFollow={followCompany} editable={isAdmin} onUpdated={updateCompany} /> : selectedCompanyId ? <CompanyDetailState companyId={selectedCompanyId} error={detailError} onRetry={() => { setDetailError(''); const version = ++detailRequestVersion.current; void api<CompanyDetail>(`/companies/${selectedCompanyId}`).then(detail => { if (detailRequestVersion.current === version) setSelected(detail) }).catch(reason => { if (detailRequestVersion.current === version) setDetailError((reason as Error).message) }) }} onBack={backFromCompany} /> : !canViewPage ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => void loadSection('companies')} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} dataStatus={dataStatus} /> : page === 'companies' ? <CompaniesPage companies={companies} jobs={jobs} query={query} setQuery={setQuery} onSearch={() => void loadSection('companies')} onSync={isAdmin ? sync : undefined} syncing={syncing} onResearch={isAdmin ? researchCompanies : undefined} researching={researching} onOpen={openCompany} onExport={exportJobs} onImport={isAdmin ? () => navigate('import') : undefined} isAdmin={isAdmin} onChanged={loadData} dataStatus={dataStatus} /> : page === 'timeline' ? <><DataSectionNotice label="招聘时间轴" status={dataStatus.timeline} onRetry={() => void loadSection('timeline')} /><TimelinePage events={timeline} onOpenCompany={openCompany} status={dataStatus.timeline} onRetry={() => void loadSection('timeline')} /></> : page === 'applications' ? <ApplicationsPage applications={applications} onState={updateState} status={dataStatus.applications} onRetry={() => void loadSection('applications')} /> : page === 'import' ? <ImportPage onImported={async () => { flash('已加入处理队列'); await loadData(); navigate('queue') }} /> : page === 'queue' ? <CompactQueuePage onSync={sync} syncing={syncing} /> : page === 'review' ? <ReviewPage onResolved={async () => { await loadData() }} /> : <SettingsCenter isAdmin={isAdmin} section={page === 'admin' ? 'invitations' : page === 'security' ? 'account' : settingsSection} onSectionChange={setSettingsSection} onDirtyChange={setSettingsDirty} onSaved={flash} onSync={sync} syncing={syncing} externalSaveRequest={settingsSaveRequest} onExternalSaveHandled={ok => { if (!ok || !pendingNavigation) return; const next = pendingNavigation; setPendingNavigation(null); setSettingsDirty(false); completeNavigation(next.page, next.settingsSection) }} />}
     </main>
   </div>
 }
@@ -366,7 +485,16 @@ function Bootstrap({ onLoggedIn }: { onLoggedIn: (user: User) => void }) {
 
 function AuthFrame({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) { return <div className="auth-page"><div className="auth-glow" /><div className="auth-card"><div className="auth-logo"><span className="logo-mark">J</span>JobPostings</div><h1>{title}</h1><p>{subtitle}</p>{children}</div></div> }
 
-function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onResearch, researching, onOpen, onExport, onImport, isAdmin, onChanged }: { companies: Company[]; jobs: Job[]; query: string; setQuery: (value: string) => void; onSearch: () => void; onSync?: (force?: boolean) => void; syncing?: boolean; onResearch?: (force?: boolean) => void; researching?: boolean; onOpen: (id: string) => void; onExport: (format: 'xlsx' | 'csv' | 'json') => void; onImport?: () => void; isAdmin?: boolean; onChanged?: () => Promise<void> }) {
+function DataSectionNotice({ label, status, onRetry }: { label: string; status: DataSectionStatus; onRetry: () => void }) {
+  if (!status.loading && !status.error) return null
+  return <div className={`setting-help data-section-notice${status.error ? ' error' : ''}`} role={status.error ? 'alert' : 'status'}>{status.error ? <><span>{label}加载失败：{status.error}</span><button className="secondary" onClick={onRetry}>重试</button></> : <span>{label}加载中…</span>}</div>
+}
+
+function CompanyDetailState({ companyId, error, onRetry, onBack }: { companyId: string; error: string; onRetry: () => void; onBack: () => void }) {
+  return <><button className="back" onClick={onBack}>← 返回企业列表</button><div className="detail-card company-detail-state" role={error ? 'alert' : 'status'}>{error ? <><h2>企业详情加载失败</h2><p>{error}</p><button className="secondary" onClick={onRetry}>重试</button></> : <><div className="spinner" /><h2>正在加载企业详情</h2><p>岗位、招聘动态、来源证据和企业资料将完整显示。</p></>}</div></>
+}
+
+function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onResearch, researching, onOpen, onExport, onImport, isAdmin, onChanged, dataStatus }: { companies: Company[]; jobs: Job[]; query: string; setQuery: (value: string) => void; onSearch: () => void; onSync?: (force?: boolean) => void; syncing?: boolean; onResearch?: (force?: boolean) => void; researching?: boolean; onOpen: (id: string) => void; onExport: (format: 'xlsx' | 'csv' | 'json') => void; onImport?: () => void; isAdmin?: boolean; onChanged?: () => Promise<void>; dataStatus: Record<DataSection, DataSectionStatus> }) {
   const [selectionMode, setSelectionMode] = useState(false)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [busy, setBusy] = useState('')
@@ -421,7 +549,7 @@ function CompaniesPage({ companies, jobs, query, setQuery, onSearch, onResearch,
     } catch (e) { setManagementMessage((e as Error).message) }
     finally { setBusy('') }
   }
-  return <><PageHeader eyebrow="招聘知识库" title="企业与岗位" description="把分散在群聊、公众号和文件里的招聘信息，整理成可以行动的机会。">{isAdmin && <button className={selectionMode ? 'secondary' : 'filter'} onClick={selectionMode ? leaveSelectionMode : () => { setSelectionMode(true); setManagementMessage('') }}>{selectionMode ? '退出选择' : '选择企业'}</button>}{onResearch && <button className="secondary" disabled={researching || Boolean(busy)} onClick={() => onResearch()}>{researching ? '概览排队中…' : '⌕ 自动获取企业概览'}</button>}<button className="secondary" onClick={() => onExport('csv')}>导出 CSV</button><button className="secondary" onClick={() => onExport('xlsx')}>导出 Excel</button>{onImport && <button className="primary" onClick={onImport}>＋ 快速导入</button>}</PageHeader><div className="metrics"><Metric label="企业" value={companies.length} tone="blue" /><Metric label="岗位" value={jobs.length} tone="violet" /><Metric label="有效岗位" value={jobs.filter(j => j.status === 'active').length} tone="green" /><Metric label="最近更新" value={jobs[0]?.updated_at?.slice(5, 10) || '—'} tone="orange" /></div><div className="toolbar"><div className="search"><span>⌕</span><input className="search-input" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && onSearch()} placeholder="搜索企业、岗位、地点或专业" /></div><select className="filter" aria-label="筛选企业行业" value={industryFilter} onChange={event => setIndustryFilter(event.target.value)}><option value="">筛选：全部行业</option>{industryOptions.map(code => <option value={code} key={code}>{TAG_LABELS[code] || code}</option>)}</select><select className="filter" aria-label="企业排序" value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="updated_desc">排序：最近更新</option><option value="jobs_desc">排序：岗位最多</option><option value="name_asc">排序：企业名称</option><option value="updated_asc">排序：最早更新</option></select><CompanyViewToggle mode={viewMode} onToggle={() => setViewMode(current => current === 'tiles' ? 'list' : 'tiles')} /></div>{selectionMode && <div className="company-management-bar"><span>{selectedIds.length ? `已选择 ${selectedIds.length} 个企业；第一个为主企业` : '请选择企业；第一个选择将作为主企业'}</span><div className="company-management-actions"><button className="secondary" disabled={selectedIds.length < 2 || Boolean(busy)} onClick={() => void manageCompanies('merge')}>{busy === 'merge-impact' || busy === 'merge' ? '合并处理中…' : `合并${selectedIds.length >= 2 ? `（${selectedIds.length}）` : ''}`}</button><button className="secondary danger" disabled={!selectedIds.length || Boolean(busy)} onClick={() => void manageCompanies('delete')}>{busy === 'delete-impact' || busy === 'delete' ? '删除处理中…' : `删除${selectedIds.length ? `（${selectedIds.length}）` : ''}`}</button></div></div>}{managementMessage && <div className="setting-help company-management-message">{managementMessage}</div>}{visibleCompanies.length ? <div className={`company-grid company-grid-${viewMode}`}>{visibleCompanies.map(company => { const selectionOrder = selectedIds.indexOf(company.id) + 1; return <CompanyCard key={company.id} company={company} selectable={selectionMode} selected={selectionOrder > 0} selectionOrder={selectionOrder} motionEnabled={viewMode === 'tiles'} onClick={() => selectionMode ? toggleSelection(company.id) : onOpen(company.id)} /> })}</div> : <EmptyState />}</>
+  return <><PageHeader eyebrow="招聘知识库" title="企业与岗位" description="把分散在群聊、公众号和文件里的招聘信息，整理成可以行动的机会。">{isAdmin && <button className={selectionMode ? 'secondary' : 'filter'} onClick={selectionMode ? leaveSelectionMode : () => { setSelectionMode(true); setManagementMessage('') }}>{selectionMode ? '退出选择' : '选择企业'}</button>}{onResearch && <button className="secondary" disabled={researching || Boolean(busy)} onClick={() => onResearch()}>{researching ? '概览排队中…' : '⌕ 自动获取企业概览'}</button>}<button className="secondary" onClick={() => onExport('csv')}>导出 CSV</button><button className="secondary" onClick={() => onExport('xlsx')}>导出 Excel</button>{onImport && <button className="primary" onClick={onImport}>＋ 快速导入</button>}</PageHeader><DataSectionNotice label="企业目录" status={dataStatus.companies} onRetry={onSearch} /><DataSectionNotice label="岗位统计" status={dataStatus.jobs} onRetry={onChanged || (() => undefined)} /><div className="metrics"><Metric label="企业" value={companies.length} tone="blue" /><Metric label="岗位" value={dataStatus.jobs.loading ? '加载中…' : dataStatus.jobs.error ? '—' : jobs.length} tone="violet" /><Metric label="有效岗位" value={dataStatus.jobs.loading ? '加载中…' : dataStatus.jobs.error ? '—' : jobs.filter(j => j.status === 'active').length} tone="green" /><Metric label="最近更新" value={dataStatus.jobs.loading ? '加载中…' : dataStatus.jobs.error ? '—' : jobs[0]?.updated_at?.slice(5, 10) || '—'} tone="orange" /></div><div className="toolbar"><div className="search"><span>⌕</span><input className="search-input" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={e => e.key === 'Enter' && onSearch()} placeholder="搜索企业、岗位、地点或专业" /></div><select className="filter" aria-label="筛选企业行业" value={industryFilter} onChange={event => setIndustryFilter(event.target.value)}><option value="">筛选：全部行业</option>{industryOptions.map(code => <option value={code} key={code}>{TAG_LABELS[code] || code}</option>)}</select><select className="filter" aria-label="企业排序" value={sortBy} onChange={event => setSortBy(event.target.value as typeof sortBy)}><option value="updated_desc">排序：最近更新</option><option value="jobs_desc">排序：岗位最多</option><option value="name_asc">排序：企业名称</option><option value="updated_asc">排序：最早更新</option></select><CompanyViewToggle mode={viewMode} onToggle={() => setViewMode(current => current === 'tiles' ? 'list' : 'tiles')} /></div>{selectionMode && <div className="company-management-bar"><span>{selectedIds.length ? `已选择 ${selectedIds.length} 个企业；第一个为主企业` : '请选择企业；第一个选择将作为主企业'}</span><div className="company-management-actions"><button className="secondary" disabled={selectedIds.length < 2 || Boolean(busy)} onClick={() => void manageCompanies('merge')}>{busy === 'merge-impact' || busy === 'merge' ? '合并处理中…' : `合并${selectedIds.length >= 2 ? `（${selectedIds.length}）` : ''}`}</button><button className="secondary danger" disabled={!selectedIds.length || Boolean(busy)} onClick={() => void manageCompanies('delete')}>{busy === 'delete-impact' || busy === 'delete' ? '删除处理中…' : `删除${selectedIds.length ? `（${selectedIds.length}）` : ''}`}</button></div></div>}{managementMessage && <div className="setting-help company-management-message">{managementMessage}</div>}{visibleCompanies.length ? <div className={`company-grid company-grid-${viewMode}`}>{visibleCompanies.map(company => { const selectionOrder = selectedIds.indexOf(company.id) + 1; return <CompanyCard key={company.id} company={company} selectable={selectionMode} selected={selectionOrder > 0} selectionOrder={selectionOrder} motionEnabled={viewMode === 'tiles'} onClick={() => selectionMode ? toggleSelection(company.id) : onOpen(company.id)} /> })}</div> : <EmptyState />}</>
 }
 
 function Metric({ label, value, tone }: { label: string; value: string | number; tone: string }) { return <div className="metric"><div className={`metric-icon ${tone}`}>{tone === 'blue' ? '◈' : tone === 'violet' ? '▣' : tone === 'green' ? '✓' : '◷'}</div><div><small>{label}</small><strong>{value}</strong></div></div> }
@@ -634,7 +762,7 @@ function TimelineEventCard({ event, onOpenCompany }: { event: RecruitmentEvent; 
   return <details name="recruitment-event" className={`timeline-event ${event.status}`}><summary><time>{event.start_at ? formatEventDate(event.start_at, event.timezone) : '时间待确认'}</time><div><strong>{event.title}</strong><span>{event.company_name}{event.city ? ` · ${event.city}` : ''}{event.location ? ` · ${event.location}` : ''}</span></div><span className={`status ${event.status}`}>{statusLabel}</span></summary><div className="timeline-event-detail"><p>{event.notes || '暂无补充说明'}</p>{event.start_at && <span>活动时间：{formatEventDate(event.start_at, event.timezone)}{event.end_at ? ` 至 ${formatEventDate(event.end_at, event.timezone)}` : ''}</span>}{event.campus && <span>校区：{event.campus}</span>}{event.audience && <span>面向：{event.audience}</span>}{event.application_url && <a href={event.application_url} target="_blank" rel="noreferrer">打开网申/活动地址 ↗</a>}{onOpenCompany && <button className="secondary" onClick={() => onOpenCompany(event.company_id)}>查看企业</button>}</div></details>
 }
 
-function TimelinePage({ events, onOpenCompany }: { events: RecruitmentEvent[]; onOpenCompany: (id: string) => void }) {
+function TimelinePage({ events, onOpenCompany, status, onRetry }: { events: RecruitmentEvent[]; onOpenCompany: (id: string) => void; status: DataSectionStatus; onRetry: () => void }) {
   const [filter, setFilter] = useState('')
   const [viewMode, setViewMode] = useState<'list' | 'week'>('list')
   const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()))
@@ -663,7 +791,7 @@ function TimelinePage({ events, onOpenCompany }: { events: RecruitmentEvent[]; o
   return <><PageHeader eyebrow="招聘日程" title="招聘时间轴" description="集中查看宣讲、网申截止、笔试、面试和其他招聘节点。"><div className="timeline-view-switch"><button className={`filter${viewMode === 'list' ? ' active-filter' : ''}`} onClick={() => setViewMode('list')}>列表</button><button className={`filter${viewMode === 'week' ? ' active-filter' : ''}`} onClick={() => setViewMode('week')}>周视图</button></div></PageHeader><div className="toolbar"><select className="filter" value={filter} onChange={event => setFilter(event.target.value)}><option value="">全部事件</option>{types.map(value => <option value={value} key={value}>{value}</option>)}</select>{viewMode === 'week' && <div className="timeline-week-controls"><button className="secondary" onClick={() => setWeekStart(addDays(weekStart, -7))}>上一周</button><button className="secondary" onClick={() => setWeekStart(startOfWeek(new Date()))}>本周</button><button className="secondary" onClick={() => setWeekStart(addDays(weekStart, 7))}>下一周</button><span>{formatWeekRange(weekStart, weekDays[6])}</span></div>}</div>{viewMode === 'list' ? <div className="timeline-list">{visible.length ? sorted(visible).map(event => <TimelineEventCard event={event} onOpenCompany={onOpenCompany} key={event.id} />) : <div className="empty-state compact">暂无招聘时间事件</div>}</div> : <>{weekEvents.length ? <div className="timeline-week">{weekDays.map((day, index) => { const key = localDateKey(day); const dayEvents = sorted(weekEvents.filter(event => eventIntersectsDay(event, key))); return <section className={`timeline-day${key === todayKey ? ' today' : ''}`} key={key}><header><strong>{WEEKDAY_LABELS[index]}</strong>{key === todayKey && <span className="timeline-today">今天</span>}<time>{formatShortDate(day)}</time></header>{dayEvents.length ? dayEvents.map(event => <TimelineEventCard event={event} onOpenCompany={onOpenCompany} key={`${event.id}-${key}`} />) : <div className="timeline-day-empty">暂无活动</div>}</section>})}</div> : <div className="empty-state compact">本周暂无明确时间事件</div>}</>}</>
 }
 
-function ApplicationsPage({ applications, onState }: { applications: Application[]; onState: (id: string, state: string, favorite?: boolean) => void }) { const columns = [['interested', '感兴趣'], ['applied', '已投递'], ['interview', '面试中'], ['offer', 'Offer']] as const; const [activeState, setActiveState] = useState<string>('interested'); return <><PageHeader eyebrow="我的行动" title="求职进度" description="把感兴趣的岗位，从看到变成投递和面试。" /><div className="kanban-tabs" role="tablist" aria-label="求职进度状态">{columns.map(([state, title]) => <button key={state} role="tab" aria-selected={activeState === state} className={activeState === state ? 'active' : ''} onClick={() => setActiveState(state)}>{title}（{applications.filter(job => job.state === state).length}）</button>)}</div><div className="kanban" data-active-state={activeState}>{columns.map(([state, title]) => <ApplicationColumn key={state} title={title} state={state} jobs={applications.filter(job => job.state === state)} onState={onState} />)}</div>{!applications.length && <div className="empty-state compact"><div className="empty-icon">✓</div><h3>收藏岗位后，它们会出现在这里</h3><p>在企业详情中点击星标，即可开始记录求职进度。</p></div>}</> }
+function ApplicationsPage({ applications, onState, status, onRetry }: { applications: Application[]; onState: (id: string, state: string, favorite?: boolean) => void; status: DataSectionStatus; onRetry: () => void }) { const columns = [['interested', '感兴趣'], ['applied', '已投递'], ['interview', '面试中'], ['offer', 'Offer']] as const; const [activeState, setActiveState] = useState<string>('interested'); return <><PageHeader eyebrow="我的行动" title="求职进度" description="把感兴趣的岗位，从看到变成投递和面试。" /><DataSectionNotice label="求职进度" status={status} onRetry={onRetry} /><div className="kanban-tabs" role="tablist" aria-label="求职进度状态">{columns.map(([state, title]) => <button key={state} role="tab" aria-selected={activeState === state} className={activeState === state ? 'active' : ''} onClick={() => setActiveState(state)}>{title}（{applications.filter(job => job.state === state).length}）</button>)}</div><div className="kanban" data-active-state={activeState}>{columns.map(([state, title]) => <ApplicationColumn key={state} title={title} state={state} jobs={applications.filter(job => job.state === state)} onState={onState} />)}</div>{!applications.length && <div className="empty-state compact"><div className="empty-icon">✓</div><h3>收藏岗位后，它们会出现在这里</h3><p>在企业详情中点击星标，即可开始记录求职进度。</p></div>}</> }
 function ApplicationColumn({ title, state, jobs, onState }: { title: string; state: string; jobs: Job[]; onState: (id: string, state: string, favorite?: boolean) => void }) { return <div className="kanban-column"><div className="column-head"><strong>{title}</strong><span>{jobs.length}</span></div>{jobs.map(job => <button className="application-card" key={job.id} onClick={() => onState(job.id, state)}><strong>{job.canonical_title}</strong><small>{job.company_name}</small></button>)}<button className="add-card">＋ 添加岗位</button></div> }
 
 function AdminPage({ onNavigate }: { onNavigate: (page: 'settings' | 'review') => void }) {

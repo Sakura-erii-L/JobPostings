@@ -364,8 +364,89 @@ def business_display_check():
     print(f"PASS business writes={writes}", flush=True)
 
 
+def performance_check():
+    print("START performance loading", flush=True)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=CHROME)
+        page = browser.new_page(viewport={"width": 1440, "height": 900})
+        page.set_default_timeout(5000)
+        requests = []
+        page.add_init_script("""
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = (input, init) => {
+                const url = typeof input === 'string' ? input : input.url;
+                const slow = ['/jobs', '/me/applications', '/notifications', '/recruitment-events', '/companies/company-1'];
+                const path = new URL(url, window.location.href).pathname.replace('/api/v1', '');
+                return slow.includes(path)
+                    ? new Promise(resolve => setTimeout(() => resolve(originalFetch(input, init)), 800))
+                    : originalFetch(input, init);
+            };
+            class MockEventSource {
+                constructor() {
+                    this.listeners = {};
+                    setTimeout(() => ['job.updated', 'processing.updated', 'company.updated', 'processing.updated', 'sync.completed', 'job.updated'].forEach(type => (this.listeners[type] || []).forEach(listener => listener(new Event(type)))), 1200);
+                }
+                addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+                close() {}
+            }
+            window.EventSource = MockEventSource;
+        """)
+
+        def route(route):
+            request = route.request
+            if "/api/v1/" not in request.url:
+                route.continue_()
+                return
+            path = request.url.split("/api/v1", 1)[1].split("?", 1)[0]
+            if request.method == "GET":
+                requests.append(path)
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(business_mock_response(path, "member"), ensure_ascii=False))
+
+        page.route("**/*", route)
+        try:
+            page.goto("http://127.0.0.1:5173/", wait_until="domcontentloaded", timeout=10000)
+            page.wait_for_selector(".company-card", timeout=700)
+            assert requests.count("/companies") == 1
+            print("PASS company before deferred APIs", flush=True)
+
+            page.locator(".company-card").click()
+            page.wait_for_selector(".company-detail-state", timeout=300)
+            page.get_by_role("heading", name="示例科技").first.wait_for()
+            assert page.locator(".company-tabs button").first.inner_text() == "岗位"
+            assert page.get_by_text("数据工程师").count() >= 1
+            page.locator(".company-tabs button").nth(1).click()
+            assert page.get_by_text("春招宣讲会").count() >= 1
+            page.get_by_role("button", name="← 返回企业列表").click()
+            page.locator("#main-navigation .nav-button").nth(1).click()
+            page.get_by_role("heading", name="招聘时间轴").wait_for()
+            page.get_by_text("春招宣讲会").first.wait_for()
+            page.locator("#main-navigation .nav-button").nth(2).click()
+            page.get_by_role("heading", name="求职进度").wait_for()
+            page.get_by_text("数据工程师").first.wait_for()
+
+            page.wait_for_timeout(1100)
+            assert requests.count("/companies") == 2, requests
+            assert requests.count("/jobs") == 2, requests
+            assert requests.count("/me/applications") == 2, requests
+            assert requests.count("/recruitment-events") == 2, requests
+            counts = {path: requests.count(path) for path in set(requests)}
+            print(f"PASS SSE burst coalesced request_counts={counts}", flush=True)
+        except Exception:
+            screenshot = ARTIFACTS / "FAILED-performance-loading.png"
+            page.screenshot(path=str(screenshot), full_page=True)
+            print(f"FAIL performance screenshot={screenshot}", flush=True)
+            traceback.print_exc()
+            raise
+        finally:
+            page.close()
+            browser.close()
+
+
 if __name__ == "__main__":
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    if "--performance" in sys.argv:
+        performance_check()
+        sys.exit(0)
     if "--business" in sys.argv:
         business_display_check()
         sys.exit(0)
