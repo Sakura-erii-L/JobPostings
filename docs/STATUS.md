@@ -72,3 +72,29 @@
 2. 在目标机器完成 TraceMemo 全链路冒烟测试，记录真实字段和媒体行为。
 3. 解决测试环境临时目录的 Windows 权限问题，再重新运行完整 Python 测试。
 4. 在不泄露凭据的前提下验证 Cloudflare Tunnel、SMTP、AList 和安装版数据目录。
+
+## 6. 本地诊断操作复盘（2026-09-11）
+
+### PowerShell 管道语法
+
+- **问题：** 直接把管道接在 `if` 或 `foreach` 代码块后面，例如 `if (...) { ... } | Format-List` 或 `foreach (...) { ... } | Format-Table`，会报 `An empty pipe element is not allowed`。这类语法错误不会执行后续查询，但仍应明确记录为“未读取或修改任何数据”。
+- **解决：** 先把代码块结果保存到变量，再单独管道输出：`$out = if (...) { ... } else { ... }; $out | Format-List`，或 `$results = foreach (...) { ... }; $results | Format-Table`。
+
+### 账号数据与密码边界
+
+- **问题：** 开发启动脚本默认使用 `runtime/data/jobpostings.db`，安装版默认使用 `%LOCALAPPDATA%/JobPostings/data/jobpostings.db`；切换启动方式时，账号和数据可能完全不同。
+- **解决：** 查询账号前先确认实际进程和 `JOBPOSTINGS_DATA_DIR`，并在结果中记录数据库绝对路径。诊断用户表时只读取 `email`、`role`、`active` 和密码是否已配置，不输出 `password_hash`、Token 或 Secret Vault 内容。
+- **问题：** 管理员密码通过 `scrypt` 哈希保存，无法从数据库还原明文；已设置哈希的账号也不能当作“初始密码未设置”处理。
+- **解决：** 不进行密码猜测、暴力破解或直接改库；忘记密码时使用受控的本机密码重置流程，并在操作前确认目标数据库和备份边界。
+
+### Windows 文件读取权限
+
+- **问题：** 已存在的 `%LOCALAPPDATA%/JobPostings/data/jobpostings.db` 可能在当前受管执行环境中报 `sqlite3.OperationalError: unable to open database file`，这不等于数据库损坏。
+- **解决：** 先用 `Test-Path` 和文件属性确认目标，再使用精确的只读查询；若仍为权限拦截，申请一次明确说明范围的只读权限，不要绕过权限或改写数据库。
+
+### 服务与 Git 诊断
+
+- **问题：** `127.0.0.1:17879` 没有监听时，不能把静态数据库查询结果当作当前在线服务状态。
+- **解决：** 先检查端口监听和进程启动参数；没有监听器时只报告离线数据库结果，并明确数据目录。
+- **问题：** `git status --short` 可能因历史临时测试目录权限不足输出 `Permission denied` 警告。
+- **解决：** 将这类警告与实际工作区变更分开判断，不要删除未知临时目录；需要提交时仅处理本次明确修改的文件。
